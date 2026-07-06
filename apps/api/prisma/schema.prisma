@@ -1,0 +1,258 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Tenant {
+  id               Int               @id @default(autoincrement())
+  name             String
+  code             String?           @unique
+  status           String            @default("ACTIVE")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @default(now()) @updatedAt @map("updated_at")
+  users            User[]
+  courses          Course[]
+  classes          CourseClass[]
+  aiAgentSessions  AiAgentSession[]
+  aiAgentAuditLogs AiAgentAuditLog[]
+
+  @@map("tenants")
+}
+
+model User {
+  id                    Int                    @id @default(autoincrement())
+  tenantId              Int                    @map("tenant_id")
+  fullName              String                 @map("full_name")
+  email                 String?
+  phone                 String?
+  password              String?
+  role                  String                 @default("STUDENT")
+  status                String                 @default("ACTIVE")
+  address               String?
+  birthDate             DateTime?              @map("birth_date")
+  createdAt             DateTime               @default(now()) @map("created_at")
+  updatedAt             DateTime               @default(now()) @updatedAt @map("updated_at")
+  tenant                Tenant                 @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userCourses           UserCourse[]
+  classEnrollments      ClassEnrollment[]
+  assignmentSubmissions AssignmentSubmission[]
+  aiAgentSessions       AiAgentSession[]
+  aiAgentActions        AiAgentAction[]
+  aiAgentAuditLogs      AiAgentAuditLog[]
+
+  @@map("users")
+}
+
+model Course {
+  id          Int           @id @default(autoincrement())
+  tenantId    Int           @map("tenant_id")
+  courseCode  String        @map("course_code")
+  title       String
+  description String?
+  level       String?
+  status      String        @default("ACTIVE")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @default(now()) @updatedAt @map("updated_at")
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  classes     CourseClass[]
+  // Legacy relation kept during the course/class migration.
+  userCourses UserCourse[]
+
+  @@unique([tenantId, courseCode], name: "uq_course_tenant_code")
+  @@map("courses")
+}
+
+model CourseClass {
+  id          Int       @id @default(autoincrement())
+  tenantId    Int       @map("tenant_id")
+  courseId    Int       @map("course_id")
+  classCode   String    @map("class_code")
+  title       String
+  type        String    @default("WEEKLY")
+  description String?
+  teacherName String?   @map("teacher_name")
+  startDate   DateTime? @map("start_date")
+  endDate     DateTime? @map("end_date")
+  status      String    @default("ACTIVE")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  tenant      Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  course      Course            @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  enrollments ClassEnrollment[]
+  sessions    ClassSession[]
+  assignments ClassAssignment[]
+
+  @@unique([tenantId, classCode], name: "uq_class_tenant_code")
+  @@map("course_classes")
+}
+
+model ClassEnrollment {
+  id          Int       @id @default(autoincrement())
+  userId      Int       @map("user_id")
+  classId     Int       @map("class_id")
+  roleInClass String    @default("STUDENT") @map("role_in_class")
+  joinedAt    DateTime  @default(now()) @map("joined_at")
+  endedAt     DateTime? @map("ended_at")
+  status      String    @default("ACTIVE")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  courseClass CourseClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, classId], name: "uq_user_class")
+  @@map("class_enrollments")
+}
+
+model ClassSession {
+  id          Int       @id @default(autoincrement())
+  classId     Int       @map("class_id")
+  title       String?
+  dayOfWeek   Int?      @map("day_of_week")
+  startTime   String?   @map("start_time")
+  endTime     String?   @map("end_time")
+  sessionDate DateTime? @map("session_date")
+  room        String?
+  note        String?
+  status      String    @default("SCHEDULED")
+  createdAt   DateTime  @default(now()) @map("created_at")
+
+  courseClass CourseClass @relation(fields: [classId], references: [id], onDelete: Cascade)
+
+  @@map("class_sessions")
+}
+
+model ClassAssignment {
+  id          Int       @id @default(autoincrement())
+  classId     Int       @map("class_id")
+  title       String
+  type        String    @default("HOMEWORK")
+  description String?
+  contentUrl  String?   @map("content_url")
+  dueDate     DateTime? @map("due_date")
+  status      String    @default("ACTIVE")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @default(now()) @updatedAt @map("updated_at")
+
+  courseClass CourseClass            @relation(fields: [classId], references: [id], onDelete: Cascade)
+  submissions AssignmentSubmission[]
+
+  @@map("class_assignments")
+}
+
+model AssignmentSubmission {
+  id           Int      @id @default(autoincrement())
+  assignmentId Int      @map("assignment_id")
+  userId       Int      @map("user_id")
+  answerUrl    String?  @map("answer_url")
+  score        Float?
+  feedback     String?
+  status       String   @default("SUBMITTED")
+  submittedAt  DateTime @default(now()) @map("submitted_at")
+
+  assignment ClassAssignment @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([assignmentId, userId], name: "uq_assignment_user")
+  @@map("assignment_submissions")
+}
+
+model UserCourse {
+  id           Int       @id @default(autoincrement())
+  userId       Int       @map("user_id")
+  courseId     Int       @map("course_id")
+  roleInCourse String    @default("STUDENT") @map("role_in_course")
+  joinedAt     DateTime  @default(now()) @map("joined_at")
+  endedAt      DateTime? @map("ended_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  user         User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course       Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, courseId], name: "uq_user_course")
+  @@map("user_courses")
+}
+
+model AiAgentSession {
+  id        Int                     @id @default(autoincrement())
+  tenantId  Int                     @map("tenant_id")
+  userId    Int                     @map("user_id")
+  title     String?
+  status    String                  @default("ACTIVE")
+  state     Json                    @default("{}")
+  createdAt DateTime                @default(now()) @map("created_at")
+  updatedAt DateTime                @default(now()) @updatedAt @map("updated_at")
+  tenant    Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user      User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  AiAgentSessionMessage[]
+  actions   AiAgentAction[]
+  events    AiCopilotTurnEvent[]
+
+  @@map("ai_agent_sessions")
+}
+
+model AiAgentSessionMessage {
+  id        Int                  @id @default(autoincrement())
+  sessionId Int                  @map("session_id")
+  role      String
+  content   String
+  toolName  String?              @map("tool_name")
+  createdAt DateTime             @default(now()) @map("created_at")
+  session   AiAgentSession       @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  events    AiCopilotTurnEvent[]
+
+  @@map("ai_agent_session_messages")
+}
+
+model AiAgentAction {
+  id           Int            @id @default(autoincrement())
+  sessionId    Int            @map("session_id")
+  actorUserId  Int            @map("actor_user_id")
+  actionName   String         @map("action_name")
+  status       String         @default("PENDING")
+  inputJson    Json?          @map("input_json")
+  outputJson   Json?          @map("output_json")
+  errorMessage String?        @map("error_message")
+  startedAt    DateTime?      @map("started_at")
+  finishedAt   DateTime?      @map("finished_at")
+  createdAt    DateTime       @default(now()) @map("created_at")
+  session      AiAgentSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  actor        User           @relation(fields: [actorUserId], references: [id], onDelete: Cascade)
+
+  @@map("ai_agent_actions")
+}
+
+model AiAgentAuditLog {
+  id          Int      @id @default(autoincrement())
+  tenantId    Int      @map("tenant_id")
+  userId      Int?     @map("user_id")
+  eventType   String   @map("event_type")
+  entityType  String   @map("entity_type")
+  entityId    Int?     @map("entity_id")
+  oldDataJson Json?    @map("old_data_json")
+  newDataJson Json?    @map("new_data_json")
+  createdAt   DateTime @default(now()) @map("created_at")
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@map("ai_agent_audit_logs")
+}
+
+model AiCopilotTurnEvent {
+  id               Int                    @id @default(autoincrement())
+  sessionId        Int                    @map("session_id")
+  messageId        Int?                   @map("message_id")
+  eventType        String                 @map("event_type")
+  latencyMs        Int?                   @map("latency_ms")
+  promptTokens     Int                    @default(0) @map("prompt_tokens")
+  completionTokens Int                    @default(0) @map("completion_tokens")
+  totalTokens      Int                    @default(0) @map("total_tokens")
+  createdAt        DateTime               @default(now()) @map("created_at")
+  session          AiAgentSession         @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  message          AiAgentSessionMessage? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+
+  @@map("ai_copilot_turn_events")
+}
