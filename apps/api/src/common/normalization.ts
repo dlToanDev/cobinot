@@ -16,8 +16,8 @@ export function levenshteinDistance(a: string, b: string): number {
           matrix[i - 1][j - 1] + 1, // substitution
           Math.min(
             matrix[i][j - 1] + 1, // insertion
-            matrix[i - 1][j] + 1 // deletion
-          )
+            matrix[i - 1][j] + 1, // deletion
+          ),
         );
       }
     }
@@ -26,13 +26,43 @@ export function levenshteinDistance(a: string, b: string): number {
 }
 
 const GMAIL_TYPOS = new Set([
-  'gmai', 'gamil', 'gmial', 'gmaill', 'gmeil', 'gmeo', 'gmel', 'gmaul', 
-  'gmaiil', 'gma', 'gml', 'gimail', 'gmali', 'gmaili', 'gmam', 'gmaim'
+  'gmai',
+  'gamil',
+  'gmial',
+  'gmaill',
+  'gmeil',
+  'gmeo',
+  'gmel',
+  'gmaul',
+  'gmaiil',
+  'gma',
+  'gml',
+  'gimail',
+  'gmali',
+  'gmaili',
+  'gmam',
+  'gmaim',
 ]);
 
 const COMMON_NON_GMAIL_G_WORDS = new Set([
-  'goal', 'girl', 'game', 'good', 'gold', 'golf', 'gym', 'gum', 'gale',
-  'gilt', 'gill', 'gird', 'grim', 'grow', 'germ', 'give', 'gate', 'glad'
+  'goal',
+  'girl',
+  'game',
+  'good',
+  'gold',
+  'golf',
+  'gym',
+  'gum',
+  'gale',
+  'gilt',
+  'gill',
+  'gird',
+  'grim',
+  'grow',
+  'germ',
+  'give',
+  'gate',
+  'glad',
 ]);
 
 export function isCloseToGmail(word: string): boolean {
@@ -40,7 +70,7 @@ export function isCloseToGmail(word: string): boolean {
   if (w === 'gmail') return true;
   if (GMAIL_TYPOS.has(w)) return true;
   if (COMMON_NON_GMAIL_G_WORDS.has(w)) return false;
-  
+
   if (w.startsWith('g') && w.length >= 3 && w.length <= 7) {
     const dist = levenshteinDistance(w, 'gmail');
     return dist <= 2;
@@ -52,10 +82,13 @@ export function isCloseToGmail(word: string): boolean {
 export function normalizeGmail(text: string): string {
   if (!text) return '';
   // First, find and normalize emails
-  let normalized = text.replace(/\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g, (email) => {
-    return normalizeEmail(email);
-  });
-  
+  let normalized = text.replace(
+    /\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b/g,
+    (email) => {
+      return normalizeEmail(email);
+    },
+  );
+
   // Then, normalize standalone words close to gmail
   normalized = normalized.replace(/\b([a-zA-Z]{3,7})\b/g, (match) => {
     if (isCloseToGmail(match)) {
@@ -67,7 +100,7 @@ export function normalizeGmail(text: string): string {
     }
     return match;
   });
-  
+
   return normalized;
 }
 
@@ -75,7 +108,7 @@ export function normalizeGmail(text: string): string {
 export function normalizeEmail(email: string): string {
   if (!email) return '';
   let normalized = email.trim().toLowerCase();
-  
+
   normalized = normalized.replace(/@([a-z0-9.-]+)/gi, (match, domain) => {
     const parts = domain.split('.');
     if (parts.length > 0) {
@@ -130,22 +163,52 @@ export function normalizeSlugCode(value: string): string {
     .replace(/_+/g, '_');
 }
 
+/**
+ * Chuẩn hóa chuỗi để so khớp tìm kiếm: bỏ dấu tiếng Việt, đ->d, lowercase,
+ * gộp khoảng trắng. Dùng cho tìm kiếm KHÔNG phân biệt hoa thường và có/không dấu.
+ * Ví dụ: "Toàn" -> "toan", "Tiếng Bỉ 1" -> "tieng bi 1".
+ */
+export function toSearchKey(value: unknown): string {
+  if (value === null || value === undefined) return '';
+  return String(value)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/đ/g, 'd')
+    .replace(/Đ/g, 'D')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Trả true nếu một trong các field chứa keyword (so khớp không dấu, không phân
+ * biệt hoa thường). Nếu keyword rỗng thì luôn trả true (không lọc).
+ */
+export function matchesSearchKeyword(
+  fields: Array<unknown>,
+  keyword: string,
+): boolean {
+  const kw = toSearchKey(keyword);
+  if (!kw) return true;
+  return fields.some((field) => toSearchKey(field).includes(kw));
+}
+
 // "sđt thì 10 số"
 export function normalizePhone(phone: string): string {
   if (!phone) return '';
   let digits = phone.replace(/\D/g, '');
-  
+
   if (digits.startsWith('84') && digits.length > 10) {
     digits = '0' + digits.slice(2);
   }
-  
+
   if (digits.length === 10) {
     return digits;
   }
-  
+
   if (digits.length === 9 && !digits.startsWith('0')) {
     return '0' + digits;
   }
-  
+
   return digits;
 }

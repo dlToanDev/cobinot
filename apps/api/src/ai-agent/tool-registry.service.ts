@@ -1,11 +1,18 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+} from '@nestjs/common';
 import { ActorPayload } from '../common/decorators/get-actor.decorator';
 import { CoursesService } from '../courses/courses.service';
 import { EnrollmentsService } from '../enrollments/enrollments.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { UsersService } from '../users/users.service';
 import { AiToolName } from './decision.types';
-import { isWriteTool } from './tool-definitions';
+import {
+  assertToolAllowedInCurrentMode,
+  isWriteTool,
+} from './tool-definitions';
 
 @Injectable()
 export class ToolRegistryService {
@@ -26,6 +33,24 @@ export class ToolRegistryService {
       throw new BadRequestException(
         'Chỉ WRITE tool mới được thực thi qua confirm',
       );
+    }
+
+    assertToolAllowedInCurrentMode(toolName);
+
+    // Lớp bảo vệ backend: không cho update_student chạy khi user đang ở luồng
+    // TẠO học viên mới (tránh AI tự sửa học viên cũ khi email/SĐT trùng).
+    if (toolName === 'update_student') {
+      const sessionState = await this.getSessionStateIfAvailable(sessionId);
+      if (
+        sessionState?.last_intent === 'create_student' ||
+        sessionState?.duplicate_student_context?.intended_action === 'create'
+      ) {
+        throw new BadRequestException({
+          code: 'UPDATE_STUDENT_BLOCKED_FOR_CREATE_INTENT',
+          message:
+            'User đang muốn tạo học viên mới, không được tự cập nhật học viên cũ.',
+        });
+      }
     }
 
     const action = await this.prisma.aiAgentAction.create({
@@ -69,6 +94,20 @@ export class ToolRegistryService {
       });
 
       throw error;
+    }
+  }
+
+  private async getSessionStateIfAvailable(
+    sessionId: number,
+  ): Promise<any | null> {
+    try {
+      const session = await this.prisma.aiAgentSession.findUnique({
+        where: { id: sessionId },
+        select: { state: true },
+      });
+      return (session?.state as any) ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -159,14 +198,35 @@ export class ToolRegistryService {
           ids: this.optionalNumberArray(input.ids),
           all: input.all === true,
         });
-      case 'create_course':
+      case 'create_course': {
+        const title =
+          this.optionalString(input.title) ?? this.optionalString(input.name);
+        if (!title) {
+          throw new BadRequestException('Thiếu tên khóa học');
+        }
         return this.coursesService.createCourse(tenantId, {
-          title: this.requireString(input.title, 'title'),
-          courseCode: this.optionalString(input.courseCode),
+          title,
+          courseCode:
+            this.optionalString(input.courseCode) ??
+            this.optionalString(input.code),
           description: this.optionalString(input.description),
-          level: this.optionalString(input.level),
+          level:
+            this.optionalString(input.level) ?? this.optionalString(input.type),
+          status: this.optionalString(input.status),
+          // Ngày: nhận cả camelCase và snake_case, ngày kết thúc chấp nhận
+          // expireDate/endDate/expire_date.
+          startDate:
+            this.optionalDateString(input.startDate) ??
+            this.optionalDateString(input.start_date),
+          expireDate:
+            this.optionalDateString(input.expireDate) ??
+            this.optionalDateString(input.endDate) ??
+            this.optionalDateString(input.expire_date),
         });
+      }
       case 'update_course':
+        // optionalString/optionalDateString trả undefined cho chuỗi rỗng ->
+        // service bỏ qua field undefined, KHÔNG ghi đè giá trị cũ.
         return this.coursesService.updateCourse(
           tenantId,
           this.requireNumber(input.courseId, 'courseId'),
@@ -175,6 +235,11 @@ export class ToolRegistryService {
             courseCode: this.optionalString(input.courseCode),
             description: this.optionalString(input.description),
             level: this.optionalString(input.level),
+            status: this.optionalString(input.status),
+            startDate: this.optionalDateString(input.startDate),
+            expireDate: this.optionalDateString(
+              input.expireDate ?? input.endDate,
+            ),
           },
         );
       case 'delete_courses':
@@ -183,20 +248,16 @@ export class ToolRegistryService {
           all: input.all === true,
         });
       case 'create_class':
-        return this.coursesService.createClass(
-          tenantId,
-          this.requireNumber(input.courseId, 'courseId'),
-          {
-            title: this.requireString(input.title, 'title'),
-            classCode: this.optionalString(input.classCode),
-            type: this.requireString(input.classType, 'classType'),
-            description: this.optionalString(input.description),
-            teacherName: this.optionalString(input.teacherName),
-            startDate: this.optionalDateString(input.startDate),
-            endDate: this.optionalDateString(input.endDate),
-            enrollStudentId: this.optionalNumber(input.enrollStudentId),
-          },
-        );
+        return this.coursesService.createClass(tenantId, {
+          courseId: this.requireNumber(input.courseId, 'courseId'),
+          title: this.requireString(input.title, 'title'),
+          type: this.optionalString(input.type) ?? 'WEEKLY',
+          description: this.optionalString(input.description),
+          teacherName: this.optionalString(input.teacherName),
+          startDate: this.optionalDateString(input.startDate),
+          endDate: this.optionalDateString(input.endDate),
+          sessions: this.normalizeSessions(input.sessions),
+        });
       case 'update_class':
         return this.coursesService.updateClass(
           tenantId,
@@ -229,6 +290,8 @@ export class ToolRegistryService {
             joinedAt: this.optionalDateString(input.joinedAt),
           },
         );
+      case 'assign_student_to_course':
+        return this.assignStudentToCourse(tenantId, input);
       case 'remove_student_from_class':
         return this.coursesService.removeStudentFromClass(
           tenantId,
@@ -244,6 +307,134 @@ export class ToolRegistryService {
       default:
         throw new BadRequestException('WRITE tool không được hỗ trợ');
     }
+  }
+
+  /**
+   * Ghi danh học viên vào KHÓA (contract ngoài cho Agent/FE). Bên trong map sang
+   * class vì DB ghi danh theo class:
+   * validate học viên -> validate khóa -> check trùng ghi danh khóa ->
+   * tìm class ACTIVE của khóa -> 1 class thì ghi danh; nhiều/không có class thì
+   * trả lỗi có code rõ ràng cho CopilotService xử lý.
+   */
+  private async assignStudentToCourse(
+    tenantId: number,
+    input: Record<string, unknown>,
+  ) {
+    const userId = this.requireNumber(input.userId, 'userId');
+    const courseId = this.requireNumber(input.courseId, 'courseId');
+    const explicitClassId = this.optionalNumber(input.classId);
+    const joinedAt = this.optionalDateString(input.joinedAt);
+    const roleInClass = this.optionalString(input.roleInClass) || 'STUDENT';
+    const expireDate = this.optionalDateString(input.expireDate);
+    const allowLatePayment = this.optionalBoolean(input.allowLatePayment);
+    const note = this.optionalString(input.note);
+
+    // 1. Validate học viên
+    try {
+      await this.usersService.findOneStudent(tenantId, userId);
+    } catch {
+      throw new BadRequestException({
+        code: 'STUDENT_NOT_FOUND',
+        message: 'Không tìm thấy học viên cần ghi danh.',
+      });
+    }
+
+    // 2. Validate khóa
+    try {
+      await this.coursesService.findOneCourse(tenantId, courseId);
+    } catch {
+      throw new BadRequestException({
+        code: 'COURSE_NOT_FOUND',
+        message: 'Không tìm thấy khóa học cần ghi danh.',
+      });
+    }
+
+    // 3. Check học viên đã ghi danh khóa này chưa
+    const existingEnrollment = await this.findEnrollmentByStudentAndCourse(
+      tenantId,
+      userId,
+      courseId,
+    );
+    if (existingEnrollment) {
+      throw new ConflictException({
+        code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
+        message: 'Học viên này đã được ghi danh vào khóa học.',
+        studentId: userId,
+        courseId,
+      });
+    }
+
+    // 4. Xác định class đích trong khóa
+    let targetClassId = explicitClassId;
+    if (!targetClassId) {
+      const classes = await this.coursesService.findClassesForCourse(
+        tenantId,
+        courseId,
+      );
+      const activeClasses = classes.filter((c: any) =>
+        ['ACTIVE', 'OPEN', 'ONGOING'].includes(String(c.status)),
+      );
+
+      if (activeClasses.length === 0) {
+        throw new BadRequestException({
+          code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+          message:
+            'Khóa học này chưa có lớp đang hoạt động nên chưa thể ghi danh học viên.',
+          courseId,
+        });
+      }
+
+      if (activeClasses.length > 1) {
+        throw new BadRequestException({
+          code: 'COURSE_HAS_MULTIPLE_CLASSES',
+          message:
+            'Khóa học này có nhiều lớp. Vui lòng chọn lớp cụ thể để ghi danh.',
+          courseId,
+          classes: activeClasses.map((c: any) => this.toSafeClassOption(c)),
+        });
+      }
+
+      targetClassId = activeClasses[0].id;
+    }
+
+    // 5. Ghi danh vào class (dùng service nghiệp vụ, không gọi Prisma trực tiếp)
+    const enrollment = await this.coursesService.addStudentToClass(
+      tenantId,
+      targetClassId,
+      {
+        userId,
+        roleInClass,
+        joinedAt,
+      },
+    );
+
+    return {
+      id: enrollment.id,
+      enrollmentId: enrollment.id,
+      studentId: userId,
+      userId,
+      courseId,
+      classId: targetClassId,
+      roleInClass: enrollment.roleInClass,
+      joinedAt: enrollment.joinedAt,
+      expireDate: expireDate ?? null,
+      allowLatePayment: allowLatePayment ?? null,
+      note: note ?? null,
+      user: enrollment.user,
+      course: (enrollment as any).courseClass?.course,
+      courseClass: (enrollment as any).courseClass,
+    };
+  }
+
+  private toSafeClassOption(c: any) {
+    return {
+      id: Number(c.id),
+      value: Number(c.id),
+      label: String(c.title || c.classCode || `#${c.id}`),
+      classCode: c.classCode ?? null,
+      status: c.status ?? null,
+      courseId: c.courseId ?? null,
+    };
   }
 
   private async writeAuditLog(
@@ -275,6 +466,10 @@ export class ToolRegistryService {
       update_class: { eventType: 'UPDATE', entityType: 'COURSE_CLASS' },
       close_class: { eventType: 'CLOSE', entityType: 'COURSE_CLASS' },
       assign_student_to_class: {
+        eventType: 'ASSIGN',
+        entityType: 'CLASS_ENROLLMENT',
+      },
+      assign_student_to_course: {
         eventType: 'ASSIGN',
         entityType: 'CLASS_ENROLLMENT',
       },
@@ -341,11 +536,60 @@ export class ToolRegistryService {
     return parsed;
   }
 
+  private optionalBoolean(value: unknown): boolean | undefined {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'string') {
+      const text = value.trim().toLowerCase();
+      if (['true', '1', 'yes', 'co'].includes(text)) return true;
+      if (['false', '0', 'no', 'khong'].includes(text)) return false;
+    }
+    return undefined;
+  }
+
   private optionalNumberArray(value: unknown): number[] | undefined {
     if (!Array.isArray(value)) return undefined;
     return value
       .map((item) => this.optionalNumber(item))
       .filter((item): item is number => typeof item === 'number' && item > 0);
+  }
+
+  private normalizeSessions(value: unknown): Array<{
+    title?: string;
+    dayOfWeek?: number;
+    startTime?: string;
+    endTime?: string;
+    sessionDate?: string;
+    room?: string;
+    note?: string;
+  }> {
+    if (!Array.isArray(value)) return [];
+
+    const sessions: Array<{
+      title?: string;
+      dayOfWeek?: number;
+      startTime?: string;
+      endTime?: string;
+      sessionDate?: string;
+      room?: string;
+      note?: string;
+    }> = [];
+
+    for (const item of value) {
+      if (!item || typeof item !== 'object') continue;
+
+      const row = item as Record<string, unknown>;
+      sessions.push({
+        title: this.optionalString(row.title),
+        dayOfWeek: this.optionalNumber(row.dayOfWeek),
+        startTime: this.optionalString(row.startTime),
+        endTime: this.optionalString(row.endTime),
+        sessionDate: this.optionalDateString(row.sessionDate),
+        room: this.optionalString(row.room),
+        note: this.optionalString(row.note),
+      });
+    }
+
+    return sessions;
   }
 
   private toJson(value: unknown) {

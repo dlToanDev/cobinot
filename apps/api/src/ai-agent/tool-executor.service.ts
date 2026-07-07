@@ -2,7 +2,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { CoursesService } from '../courses/courses.service';
 import { UsersService } from '../users/users.service';
 import { AiToolName } from './decision.types';
-import { isReadTool } from './tool-definitions';
+import { assertToolAllowedInCurrentMode, isReadTool } from './tool-definitions';
 
 @Injectable()
 export class ToolExecutorService {
@@ -20,20 +20,24 @@ export class ToolExecutorService {
       throw new BadRequestException('Tool này không phải READ tool');
     }
 
+    assertToolAllowedInCurrentMode(toolName);
+
     switch (toolName) {
       case 'search_student':
-        return this.usersService.findAllStudents(tenantId, {
-          keyword: this.optionalString(args.keyword),
-        });
+        return this.usersService.searchStudents(
+          tenantId,
+          this.optionalString(args.keyword) || '',
+        );
       case 'get_student_detail':
         return this.usersService.getStudentDetail(
           tenantId,
           this.requireNumber(args.userId, 'userId'),
         );
       case 'search_course':
-        return this.coursesService.findAllCourses(tenantId, {
-          keyword: this.optionalString(args.keyword),
-        });
+        return this.coursesService.searchCourses(
+          tenantId,
+          this.optionalString(args.keyword) || '',
+        );
       case 'get_course_detail':
         return this.coursesService.getCourseDetail(
           tenantId,
@@ -45,12 +49,15 @@ export class ToolExecutorService {
           this.requireNumber(args.courseId, 'courseId'),
         );
       case 'search_class':
-        return this.coursesService.findAllClasses(tenantId, {
-          keyword: this.optionalString(args.keyword),
-          courseId: this.optionalNumber(args.courseId),
-          type: this.optionalString(args.classType),
-          status: this.optionalString(args.status),
-        });
+        return this.coursesService.searchClasses(
+          tenantId,
+          this.optionalString(args.keyword) || '',
+          {
+            courseId: this.optionalNumber(args.courseId),
+            type: this.optionalString(args.classType),
+            status: this.optionalString(args.status),
+          },
+        );
       case 'get_class_detail':
         return this.coursesService.getClassDetail(
           tenantId,

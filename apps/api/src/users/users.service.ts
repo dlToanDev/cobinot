@@ -13,6 +13,7 @@ import {
   normalizePhone,
   normalizeTitleCase,
   normalizeLocation,
+  matchesSearchKeyword,
 } from '../common/normalization';
 
 @Injectable()
@@ -32,19 +33,31 @@ export class UsersService {
       whereClause.status = filters.status;
     }
 
-    if (filters.keyword) {
-      whereClause.OR = [
-        { fullName: { contains: filters.keyword, mode: 'insensitive' } },
-        { email: { contains: filters.keyword, mode: 'insensitive' } },
-        { phone: { contains: filters.keyword, mode: 'insensitive' } },
-        { address: { contains: filters.keyword, mode: 'insensitive' } },
-      ];
-    }
-
-    return this.prisma.user.findMany({
+    const students = await this.prisma.user.findMany({
       where: whereClause,
       orderBy: { createdAt: 'desc' },
     });
+
+    const keyword = filters.keyword?.trim();
+    if (!keyword) return students;
+
+    // Lọc không phân biệt hoa thường VÀ có/không dấu (Prisma "insensitive" không
+    // bỏ dấu tiếng Việt nên "toan" sẽ không match "Toàn" nếu chỉ dùng DB).
+    return students.filter((student) =>
+      matchesSearchKeyword(
+        [student.fullName, student.email, student.phone, student.address],
+        keyword,
+      ),
+    );
+  }
+
+  /**
+   * Tìm học viên thuần backend/database, KHÔNG phụ thuộc AI/LLM. Không phân biệt
+   * hoa thường, hỗ trợ tiếng Việt có dấu và không dấu, giới hạn 20 bản ghi.
+   */
+  async searchStudents(tenantId: number, keyword: string) {
+    const students = await this.findAllStudents(tenantId, { keyword });
+    return students.slice(0, 20);
   }
 
   async findOneStudent(tenantId: number, id: number) {
@@ -132,38 +145,65 @@ export class UsersService {
     };
   }
 
+  /**
+   * Tìm học viên trùng theo email HOẶC số điện thoại trong cùng tenant.
+   * - Email được normalize (trim + lowercase), phone được normalize (bỏ khoảng
+   *   trắng, chỉ giữ số).
+   * - Chỉ match role STUDENT, không match teacher/admin.
+   * - Nếu cả email và phone đều thiếu thì trả null.
+   */
+  async findDuplicateStudentByEmailOrPhone(
+    tenantId: number,
+    input: { email?: string | null; phone?: string | null },
+  ) {
+    const email = input.email ? normalizeEmail(input.email) : null;
+    const phone = input.phone ? normalizePhone(input.phone) : null;
+
+    const orConditions = [
+      email ? { email } : null,
+      phone ? { phone } : null,
+    ].filter((condition): condition is { email: string } | { phone: string } =>
+      Boolean(condition),
+    );
+
+    if (orConditions.length === 0) return null;
+
+    return this.prisma.user.findFirst({
+      where: {
+        tenantId,
+        role: 'STUDENT',
+        OR: orConditions,
+      },
+    });
+  }
+
+  /** Payload an toàn để trả ra ngoài (không lộ password/hash/token). */
+  private toSafeStudentPayload(student: any) {
+    if (!student) return null;
+    return {
+      id: student.id,
+      fullName: student.fullName,
+      email: student.email ?? null,
+      phone: student.phone ?? null,
+    };
+  }
+
   async createStudent(tenantId: number, dto: CreateStudentDto) {
     const email = dto.email ? normalizeEmail(dto.email) : null;
     const phone = dto.phone ? normalizePhone(dto.phone) : null;
 
-    // Check duplicate email in same tenant
-    if (email) {
-      const existingEmail = await this.prisma.user.findFirst({
-        where: {
-          tenantId,
-          email,
-        },
+    // Lớp bảo vệ cuối cùng: chặn tạo trùng email/SĐT ở service layer, tránh
+    // bất kỳ API nào (kể cả AI Agent) tạo học viên trùng.
+    const duplicate = await this.findDuplicateStudentByEmailOrPhone(tenantId, {
+      email,
+      phone,
+    });
+    if (duplicate) {
+      throw new ConflictException({
+        code: 'STUDENT_DUPLICATE',
+        message: 'Email hoặc số điện thoại đã tồn tại.',
+        existingStudent: this.toSafeStudentPayload(duplicate),
       });
-      if (existingEmail) {
-        throw new ConflictException(
-          'Email đã được sử dụng trong trung tâm này',
-        );
-      }
-    }
-
-    // Check duplicate phone in same tenant
-    if (phone) {
-      const existingPhone = await this.prisma.user.findFirst({
-        where: {
-          tenantId,
-          phone,
-        },
-      });
-      if (existingPhone) {
-        throw new ConflictException(
-          'Số điện thoại đã được sử dụng trong trung tâm này',
-        );
-      }
     }
 
     return this.prisma.user.create({
@@ -183,8 +223,18 @@ export class UsersService {
   async updateStudent(tenantId: number, id: number, dto: UpdateStudentDto) {
     const student = await this.findOneStudent(tenantId, id);
 
-    const email = dto.email !== undefined ? (dto.email ? normalizeEmail(dto.email) : null) : undefined;
-    const phone = dto.phone !== undefined ? (dto.phone ? normalizePhone(dto.phone) : null) : undefined;
+    const email =
+      dto.email !== undefined
+        ? dto.email
+          ? normalizeEmail(dto.email)
+          : null
+        : undefined;
+    const phone =
+      dto.phone !== undefined
+        ? dto.phone
+          ? normalizePhone(dto.phone)
+          : null
+        : undefined;
 
     // Check email uniqueness if modified
     if (email !== undefined && email !== student.email) {
@@ -303,26 +353,27 @@ export class UsersService {
       throw new NotFoundException('Không tìm thấy học viên nào để xóa');
     }
 
-    const [submissions, classEnrollments, legacyEnrollments, students] = await this.prisma.$transaction([
-      this.prisma.assignmentSubmission.deleteMany({
-        where: {
-          user: studentWhere,
-        },
-      }),
-      this.prisma.classEnrollment.deleteMany({
-        where: {
-          user: studentWhere,
-        },
-      }),
-      this.prisma.userCourse.deleteMany({
-        where: {
-          user: studentWhere,
-        },
-      }),
-      this.prisma.user.deleteMany({
-        where: studentWhere,
-      }),
-    ]);
+    const [submissions, classEnrollments, legacyEnrollments, students] =
+      await this.prisma.$transaction([
+        this.prisma.assignmentSubmission.deleteMany({
+          where: {
+            user: studentWhere,
+          },
+        }),
+        this.prisma.classEnrollment.deleteMany({
+          where: {
+            user: studentWhere,
+          },
+        }),
+        this.prisma.userCourse.deleteMany({
+          where: {
+            user: studentWhere,
+          },
+        }),
+        this.prisma.user.deleteMany({
+          where: studentWhere,
+        }),
+      ]);
 
     return {
       deletedCount: students.count,

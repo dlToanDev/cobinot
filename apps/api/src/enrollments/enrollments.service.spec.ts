@@ -75,7 +75,9 @@ describe('EnrollmentsService', () => {
           },
         },
       ];
-      mockPrismaService.classEnrollment.findMany.mockResolvedValue(mockClassEnrollments);
+      mockPrismaService.classEnrollment.findMany.mockResolvedValue(
+        mockClassEnrollments,
+      );
 
       const result = await service.findAll(1, {});
 
@@ -136,7 +138,9 @@ describe('EnrollmentsService', () => {
             },
             {
               courseClass: {
-                course: { courseCode: { contains: 'John', mode: 'insensitive' } },
+                course: {
+                  courseCode: { contains: 'John', mode: 'insensitive' },
+                },
               },
             },
           ],
@@ -207,7 +211,11 @@ describe('EnrollmentsService', () => {
         where: { id: dto.courseId, tenantId: 1 },
       });
       expect(prisma.courseClass.findFirst).toHaveBeenCalledWith({
-        where: { courseId: dto.courseId, tenantId: 1, classCode: 'IELTS-DEFAULT' },
+        where: {
+          courseId: dto.courseId,
+          tenantId: 1,
+          classCode: 'IELTS-DEFAULT',
+        },
       });
       expect(prisma.classEnrollment.findFirst).toHaveBeenCalledWith({
         where: { userId: dto.userId, classId: 4 },
@@ -341,8 +349,12 @@ describe('EnrollmentsService', () => {
           course: { id: 3 },
         },
       };
-      mockPrismaService.classEnrollment.findFirst.mockResolvedValue(mockEnrollment);
-      mockPrismaService.classEnrollment.delete.mockResolvedValue(mockEnrollment);
+      mockPrismaService.classEnrollment.findFirst.mockResolvedValue(
+        mockEnrollment,
+      );
+      mockPrismaService.classEnrollment.delete.mockResolvedValue(
+        mockEnrollment,
+      );
 
       const result = await service.remove(1, 5);
 
@@ -477,8 +489,12 @@ describe('EnrollmentsService', () => {
           course: { id: 3 },
         },
       };
-      mockPrismaService.classEnrollment.findFirst.mockResolvedValue(mockEnrollment);
-      mockPrismaService.classEnrollment.delete.mockResolvedValue(mockEnrollment);
+      mockPrismaService.classEnrollment.findFirst.mockResolvedValue(
+        mockEnrollment,
+      );
+      mockPrismaService.classEnrollment.delete.mockResolvedValue(
+        mockEnrollment,
+      );
 
       const result = await service.removeByStudentAndCourse(1, 2, 3);
 

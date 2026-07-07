@@ -88,6 +88,66 @@ describe('AgentRunnerService', () => {
     );
   });
 
+  it('LLM gọi assign_student_to_course thì trả pending_write', async () => {
+    aiModel.callWithTools.mockResolvedValue({
+      type: 'tool_call',
+      toolCall: {
+        name: 'assign_student_to_course',
+        args: { userId: 1, courseId: 10 },
+        callId: 'call_write',
+      },
+    });
+
+    const result = await service.run(
+      baseRunInput({ userMessage: 'thêm học viên 1 vào khóa 10' }),
+    );
+
+    expect(toolExecutor.executeRead).not.toHaveBeenCalled();
+    expect(result.type).toBe('pending_write');
+    expect(result).toEqual(
+      expect.objectContaining({
+        pendingAction: expect.objectContaining({
+          tool_name: 'assign_student_to_course',
+          input: { userId: 1, courseId: 10 },
+          status: 'waiting_confirm',
+        }),
+      }),
+    );
+  });
+
+  it('LLM gọi create_course với ngày thì pending_write giữ nguyên startDate/expireDate', async () => {
+    aiModel.callWithTools.mockResolvedValue({
+      type: 'tool_call',
+      toolCall: {
+        name: 'create_course',
+        args: {
+          title: 'IELTS 6.5',
+          startDate: '2026-07-10',
+          expireDate: '2026-09-10',
+        },
+        callId: 'call_write',
+      },
+    });
+
+    const result = await service.run(
+      baseRunInput({ userMessage: 'tạo khóa IELTS 6.5 từ 10/07 đến 10/09' }),
+    );
+
+    expect(result.type).toBe('pending_write');
+    expect(result).toEqual(
+      expect.objectContaining({
+        pendingAction: expect.objectContaining({
+          tool_name: 'create_course',
+          input: expect.objectContaining({
+            title: 'IELTS 6.5',
+            startDate: '2026-07-10',
+            expireDate: '2026-09-10',
+          }),
+        }),
+      }),
+    );
+  });
+
   it('LLM gọi ask_clarification thì trả clarification và không execute gì', async () => {
     aiModel.callWithTools.mockResolvedValue({
       type: 'tool_call',
@@ -116,6 +176,83 @@ describe('AgentRunnerService', () => {
         }),
       }),
     );
+  });
+
+  it('format search_student không dump JSON thô', async () => {
+    aiModel.callWithTools
+      .mockResolvedValueOnce({
+        type: 'tool_call',
+        toolCall: {
+          name: 'search_student',
+          args: { keyword: 'An' },
+          callId: 'r',
+        },
+      })
+      .mockResolvedValueOnce({ type: 'text', content: '' });
+    toolExecutor.executeRead.mockResolvedValue([
+      { id: 12, fullName: 'Nguyễn Văn A', email: 'a@test.com', phone: '098' },
+      { id: 15, fullName: 'Nguyễn Văn An', email: 'an@test.com', phone: '097' },
+    ]);
+
+    const result = await service.run(baseRunInput({ userMessage: 'tìm An' }));
+
+    expect(result.type).toBe('text');
+    expect(result.message).toContain('Nguyễn Văn A');
+    expect(result.message).toContain('a@test.com');
+    expect(result.message).toContain('Bạn muốn chọn học viên nào?');
+    expect(result.message).not.toContain('{"');
+    expect(result.message).not.toContain('fullName');
+  });
+
+  it('format search_course không dump JSON thô', async () => {
+    aiModel.callWithTools
+      .mockResolvedValueOnce({
+        type: 'tool_call',
+        toolCall: {
+          name: 'search_course',
+          args: { keyword: 'IELTS' },
+          callId: 'r',
+        },
+      })
+      .mockResolvedValueOnce({ type: 'text', content: '' });
+    toolExecutor.executeRead.mockResolvedValue([
+      { id: 5, title: 'IELTS 6.5', courseCode: 'IELTS65' },
+      { id: 8, title: 'IELTS Foundation', courseCode: 'IELTS-F' },
+    ]);
+
+    const result = await service.run(
+      baseRunInput({ userMessage: 'tìm IELTS' }),
+    );
+
+    expect(result.message).toContain('IELTS 6.5');
+    expect(result.message).toContain('Bạn muốn chọn khóa nào?');
+    expect(result.message).not.toContain('{"');
+    expect(result.message).not.toContain('courseCode":');
+  });
+
+  it('format get_course_classes không dump JSON thô', async () => {
+    aiModel.callWithTools
+      .mockResolvedValueOnce({
+        type: 'tool_call',
+        toolCall: {
+          name: 'get_course_classes',
+          args: { courseId: 5 },
+          callId: 'r',
+        },
+      })
+      .mockResolvedValueOnce({ type: 'text', content: '' });
+    toolExecutor.executeRead.mockResolvedValue([
+      { id: 20, title: 'IELTS 6.5 Tối 2-4-6', status: 'ACTIVE' },
+      { id: 21, title: 'IELTS 6.5 Cuối tuần', status: 'ACTIVE' },
+    ]);
+
+    const result = await service.run(
+      baseRunInput({ userMessage: 'xem lớp khóa 5' }),
+    );
+
+    expect(result.message).toContain('IELTS 6.5 Tối 2-4-6');
+    expect(result.message).toContain('Bạn muốn chọn lớp nào?');
+    expect(result.message).not.toContain('{"');
   });
 
   it('LLM trả text thẳng thì trả type=text', async () => {

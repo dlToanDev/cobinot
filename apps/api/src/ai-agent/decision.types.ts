@@ -17,6 +17,7 @@ export type AiToolName =
   | 'update_class'
   | 'close_class'
   | 'assign_student_to_class'
+  | 'assign_student_to_course'
   | 'remove_student_from_class'
   | 'remove_student_from_course_classes'
   | 'ask_clarification';
@@ -61,6 +62,34 @@ export interface PendingClarification {
   missing_fields: string[];
   message?: string;
   entities?: Record<string, unknown>;
+}
+
+export interface DuplicateStudentContext {
+  searched_email?: string | null;
+  searched_phone?: string | null;
+  existing_student: EntityOption;
+  intended_action: 'create' | 'assign' | 'update';
+}
+
+export interface PendingEnrollmentContext {
+  userId: number;
+  courseId: number;
+  candidateClasses: EntityOption[];
+  expireDate?: string | null;
+  allowLatePayment?: boolean | null;
+}
+
+/**
+ * Đang chờ user trả lời TÊN LỚP để hoàn tất tạo lớp. Đã xác định được khóa học
+ * (courseId) nên lượt sau user chỉ cần nhập tên lớp là tạo preview ngay, KHÔNG
+ * hỏi thêm ngày/giáo viên/lịch học.
+ */
+export interface PendingClassCreationContext {
+  courseId: number;
+  courseTitle?: string | null;
+  courseCode?: string | null;
+  type: 'WEEKLY' | 'EXAM_PRACTICE';
+  title?: string | null;
 }
 
 export interface SuggestionAction {
@@ -117,6 +146,25 @@ export type CopilotResponse =
       suggestions?: ProactiveSuggestion[];
     }
   | {
+      type: 'student_create_form';
+      title?: string;
+      message: string;
+      intent: 'create_student';
+      /** Giá trị điền sẵn từ những gì user đã cung cấp (email/SĐT/ngày sinh). */
+      values?: Record<string, string>;
+      submit_label?: string;
+      suggestions?: ProactiveSuggestion[];
+    }
+  | {
+      type: 'course_create_form';
+      title?: string;
+      message: string;
+      intent: 'create_course';
+      values?: Record<string, string>;
+      submit_label?: string;
+      suggestions?: ProactiveSuggestion[];
+    }
+  | {
       type: 'preview_card';
       status?: PendingActionStatus;
       title?: string;
@@ -151,7 +199,6 @@ export type CopilotResponse =
 
 export interface DecisionContext {
   last_intent?: AiIntent | string | null;
-  last_entities?: Record<string, unknown>;
   selected_student_id?: number | null;
   selected_course_id?: number | null;
   selected_class_id?: number | null;
@@ -159,7 +206,6 @@ export interface DecisionContext {
   last_selected_course?: EntityOption | null;
   last_selected_class?: EntityOption | null;
   last_created_student?: EntityOption | null;
-  last_found_student?: EntityOption | null;
   last_created_course?: EntityOption | null;
   last_created_class?: EntityOption | null;
   last_candidates?: {
@@ -169,8 +215,9 @@ export interface DecisionContext {
   };
   pending_action?: PendingAction | null;
   pending_clarification?: PendingClarification | null;
-  current_focus?: unknown;
-  last_suggestions?: ProactiveSuggestion[];
+  duplicate_student_context?: DuplicateStudentContext | null;
+  pending_enrollment_context?: PendingEnrollmentContext | null;
+  pending_class_creation?: PendingClassCreationContext | null;
   [key: string]: unknown;
 }
 

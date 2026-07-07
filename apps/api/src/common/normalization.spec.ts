@@ -7,6 +7,8 @@ import {
   normalizePhone,
   levenshteinDistance,
   isCloseToGmail,
+  toSearchKey,
+  matchesSearchKeyword,
 } from './normalization';
 
 describe('Normalization Utilities', () => {
@@ -39,14 +41,20 @@ describe('Normalization Utilities', () => {
     it('should correct gmail spelling in text and email addresses', () => {
       expect(normalizeGmail('toan123@gmai.com')).toBe('toan123@gmail.com');
       expect(normalizeGmail('toan123@gamil.com')).toBe('toan123@gmail.com');
-      expect(normalizeGmail('Tài khoản Gmai của tôi')).toBe('Tài khoản Gmail của tôi');
-      expect(normalizeGmail('Gamil là dịch vụ email')).toBe('Gmail là dịch vụ email');
+      expect(normalizeGmail('Tài khoản Gmai của tôi')).toBe(
+        'Tài khoản Gmail của tôi',
+      );
+      expect(normalizeGmail('Gamil là dịch vụ email')).toBe(
+        'Gmail là dịch vụ email',
+      );
     });
   });
 
   describe('normalizeEmail', () => {
     it('should lower case emails and correct gmail typos', () => {
-      expect(normalizeEmail('ToanToan123@GMAI.COM')).toBe('toantoan123@gmail.com');
+      expect(normalizeEmail('ToanToan123@GMAI.COM')).toBe(
+        'toantoan123@gmail.com',
+      );
       expect(normalizeEmail('myemail@gamil.com')).toBe('myemail@gmail.com');
       expect(normalizeEmail('other@yahoo.com')).toBe('other@yahoo.com');
     });
@@ -55,9 +63,13 @@ describe('Normalization Utilities', () => {
   describe('normalizeTitleCase', () => {
     it('should title case names, courses, and classes', () => {
       expect(normalizeTitleCase('hoàng anh toàn')).toBe('Hoàng Anh Toàn');
-      expect(normalizeTitleCase('kHóa Học Toeic450+')).toBe('Khóa Học Toeic450+');
+      expect(normalizeTitleCase('kHóa Học Toeic450+')).toBe(
+        'Khóa Học Toeic450+',
+      );
       expect(normalizeTitleCase('lớp cơ bản 1')).toBe('Lớp Cơ Bản 1');
-      expect(normalizeTitleCase('  nGuYễN   vĂn   aNh ')).toBe('Nguyễn Văn Anh');
+      expect(normalizeTitleCase('  nGuYễN   vĂn   aNh ')).toBe(
+        'Nguyễn Văn Anh',
+      );
     });
   });
 
@@ -73,6 +85,29 @@ describe('Normalization Utilities', () => {
     it('should create lower snake case codes from Vietnamese class names', () => {
       expect(normalizeSlugCode('Tiếng Bỉ 2')).toBe('tieng_bi_2');
       expect(normalizeSlugCode('  Lớp   IELTS c2  ')).toBe('lop_ielts_c2');
+    });
+  });
+
+  describe('toSearchKey', () => {
+    it('bỏ dấu tiếng Việt, đ->d và lowercase', () => {
+      expect(toSearchKey('Toàn')).toBe('toan');
+      expect(toSearchKey('Tiếng Bỉ 1')).toBe('tieng bi 1');
+      expect(toSearchKey('ĐÀ NẴNG')).toBe('da nang');
+      expect(toSearchKey('  Nguyễn   Văn  An ')).toBe('nguyen van an');
+      expect(toSearchKey(null)).toBe('');
+    });
+  });
+
+  describe('matchesSearchKeyword', () => {
+    it('khớp không phân biệt hoa thường và có/không dấu', () => {
+      expect(matchesSearchKeyword(['Toàn'], 'toan')).toBe(true);
+      expect(matchesSearchKeyword(['Nguyễn Văn An'], 'van an')).toBe(true);
+      expect(matchesSearchKeyword(['a@gmail.com'], 'GMAIL')).toBe(true);
+      expect(matchesSearchKeyword(['Toàn'], 'binh')).toBe(false);
+    });
+
+    it('keyword rỗng thì luôn khớp (không lọc)', () => {
+      expect(matchesSearchKeyword(['Toàn'], '')).toBe(true);
     });
   });
 

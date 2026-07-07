@@ -4,19 +4,30 @@ import {
   ConflictException,
   BadRequestException,
 } from '@nestjs/common';
+import type { Course } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { BulkDeleteCoursesDto } from './dto/bulk-delete-courses.dto';
-import { CreateClassDto } from './dto/create-class.dto';
+import {
+  CreateClassDto,
+  CreateClassSessionDto,
+} from './dto/create-class.dto';
 import { UpdateClassDto } from './dto/update-class.dto';
 import { AddStudentToClassDto } from './dto/add-student-to-class.dto';
-import { normalizeTitleCase } from '../common/normalization';
 import {
-  generateClassCode,
+  normalizeTitleCase,
+  matchesSearchKeyword,
+} from '../common/normalization';
+import {
   generateCourseCode,
   normalizeGeneratedCode,
 } from '@hxstu/shared';
+
+export interface CreateClassInput extends CreateClassDto {
+  courseId: number;
+  sessions?: CreateClassSessionDto[];
+}
 
 @Injectable()
 export class CoursesService {
@@ -34,20 +45,30 @@ export class CoursesService {
       whereClause.status = filters.status;
     }
 
-    if (filters.keyword) {
-      whereClause.OR = [
-        { title: { contains: filters.keyword, mode: 'insensitive' } },
-        { courseCode: { contains: filters.keyword, mode: 'insensitive' } },
-      ];
-    }
-
-    return this.prisma.course.findMany({
+    const courses = await this.prisma.course.findMany({
       where: whereClause,
       orderBy: { createdAt: 'desc' },
       include: {
         _count: { select: { classes: true } },
       },
     });
+
+    const keyword = filters.keyword?.trim();
+    if (!keyword) return courses;
+
+    // Không phân biệt hoa thường + có/không dấu (xem findAllStudents).
+    return courses.filter((course) =>
+      matchesSearchKeyword([course.title, course.courseCode], keyword),
+    );
+  }
+
+  /**
+   * Tìm khóa học thuần backend/database, không phụ thuộc AI/LLM. Không phân biệt
+   * hoa thường, hỗ trợ tiếng Việt có/không dấu, giới hạn 20 bản ghi.
+   */
+  async searchCourses(tenantId: number, keyword: string) {
+    const courses = await this.findAllCourses(tenantId, { keyword });
+    return courses.slice(0, 20);
   }
 
   async findOneCourse(tenantId: number, id: number) {
@@ -67,13 +88,35 @@ export class CoursesService {
     return course;
   }
 
-  async createCourse(tenantId: number, dto: CreateCourseDto) {
+  async createCourse(
+    tenantId: number,
+    dto: CreateCourseDto & {
+      start_date?: string;
+      expire_date?: string;
+      endDate?: string;
+    },
+  ) {
     const title = dto.title ? normalizeTitleCase(dto.title) : dto.title;
     const baseCourseCode =
       normalizeGeneratedCode(dto.courseCode || '') || generateCourseCode(title);
 
     if (!baseCourseCode) {
       throw new BadRequestException('Không thể sinh mã khóa học từ tên này');
+    }
+
+    // Nhận cả camelCase và snake_case, ngày kết thúc chấp nhận expireDate/endDate.
+    const startDate = this.parseOptionalCourseDate(
+      dto.startDate ?? dto.start_date,
+    );
+    const expireDate = this.parseOptionalCourseDate(
+      dto.expireDate ?? dto.expire_date ?? dto.endDate,
+    );
+
+    if (startDate && expireDate && expireDate < startDate) {
+      throw new BadRequestException({
+        code: 'COURSE_INVALID_DATE_RANGE',
+        message: 'Ngày kết thúc khóa học phải sau hoặc bằng ngày bắt đầu.',
+      });
     }
 
     const courseCode = await this.generateUniqueCourseCode(
@@ -88,9 +131,25 @@ export class CoursesService {
         courseCode,
         description: dto.description || null,
         level: dto.level || null,
-        status: 'ACTIVE',
+        status: dto.status || 'ACTIVE',
+        startDate,
+        expireDate,
       },
     });
+  }
+
+  /** Parse ngày optional cho khóa học; ném lỗi thân thiện nếu sai định dạng. */
+  private parseOptionalCourseDate(value?: string | null): Date | null {
+    if (value === undefined || value === null || value === '') return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      throw new BadRequestException({
+        code: 'COURSE_INVALID_DATE',
+        message:
+          'Ngày bắt đầu hoặc ngày kết thúc không hợp lệ. Vui lòng nhập theo dạng ngày/tháng/năm hoặc YYYY-MM-DD.',
+      });
+    }
+    return date;
   }
 
   async updateCourse(tenantId: number, id: number, dto: UpdateCourseDto) {
@@ -116,14 +175,43 @@ export class CoursesService {
       }
     }
 
+    // Chỉ đụng tới ngày khi user gửi field đó; validate range với giá trị hiện có.
+    const startDate =
+      dto.startDate !== undefined
+        ? this.parseOptionalCourseDate(dto.startDate)
+        : undefined;
+    const expireDate =
+      dto.expireDate !== undefined
+        ? this.parseOptionalCourseDate(dto.expireDate)
+        : undefined;
+    const effectiveStart =
+      startDate !== undefined ? startDate : course.startDate;
+    const effectiveExpire =
+      expireDate !== undefined ? expireDate : course.expireDate;
+    if (effectiveStart && effectiveExpire && effectiveExpire < effectiveStart) {
+      throw new BadRequestException({
+        code: 'COURSE_INVALID_DATE_RANGE',
+        message: 'Ngày kết thúc khóa học phải sau hoặc bằng ngày bắt đầu.',
+      });
+    }
+
     return this.prisma.course.update({
       where: { id },
       data: {
-        title: dto.title !== undefined ? (dto.title ? normalizeTitleCase(dto.title) : '') : undefined,
+        title:
+          dto.title !== undefined
+            ? dto.title
+              ? normalizeTitleCase(dto.title)
+              : ''
+            : undefined,
         courseCode,
         description:
           dto.description !== undefined ? dto.description || null : undefined,
         level: dto.level !== undefined ? dto.level || null : undefined,
+        status:
+          dto.status !== undefined ? dto.status || undefined : undefined,
+        startDate,
+        expireDate,
       },
     });
   }
@@ -335,36 +423,12 @@ export class CoursesService {
   ) {
     const keyword = filters.keyword?.trim();
 
-    return this.prisma.courseClass.findMany({
+    const classes = await this.prisma.courseClass.findMany({
       where: {
         tenantId,
         ...(filters.courseId ? { courseId: filters.courseId } : {}),
         ...(filters.type ? { type: filters.type } : {}),
         ...(filters.status ? { status: filters.status } : {}),
-        ...(keyword
-          ? {
-              OR: [
-                { title: { contains: keyword, mode: 'insensitive' } },
-                { classCode: { contains: keyword, mode: 'insensitive' } },
-                {
-                  teacherName: { contains: keyword, mode: 'insensitive' },
-                },
-                {
-                  course: {
-                    OR: [
-                      { title: { contains: keyword, mode: 'insensitive' } },
-                      {
-                        courseCode: {
-                          contains: keyword,
-                          mode: 'insensitive',
-                        },
-                      },
-                    ],
-                  },
-                },
-              ],
-            }
-          : {}),
       },
       include: {
         course: true,
@@ -374,6 +438,38 @@ export class CoursesService {
       },
       orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
     });
+
+    if (!keyword) return classes;
+
+    // Không phân biệt hoa thường + có/không dấu, khớp cả tên khóa cha.
+    return classes.filter((courseClass) =>
+      matchesSearchKeyword(
+        [
+          courseClass.title,
+          courseClass.classCode,
+          courseClass.teacherName,
+          courseClass.course?.title,
+          courseClass.course?.courseCode,
+        ],
+        keyword,
+      ),
+    );
+  }
+
+  /**
+   * Tìm lớp học thuần backend/database, không phụ thuộc AI/LLM. Không phân biệt
+   * hoa thường, hỗ trợ tiếng Việt có/không dấu, giới hạn 20 bản ghi.
+   */
+  async searchClasses(
+    tenantId: number,
+    keyword: string,
+    filters: { courseId?: number; type?: string; status?: string } = {},
+  ) {
+    const classes = await this.findAllClasses(tenantId, {
+      ...filters,
+      keyword,
+    });
+    return classes.slice(0, 20);
   }
 
   async findOneClass(tenantId: number, id: number) {
@@ -396,54 +492,92 @@ export class CoursesService {
     return courseClass;
   }
 
-  async createClass(tenantId: number, courseId: number, dto: CreateClassDto & { enrollStudentId?: number }) {
-    const course = await this.findOneCourse(tenantId, courseId);
-    const normalizedTitle = dto.title ? normalizeTitleCase(dto.title) : dto.title;
-    const uniqueTitle = await this.generateUniqueClassTitle(tenantId, courseId, normalizedTitle);
-    const baseClassCode =
-      normalizeGeneratedCode(dto.classCode || '') ||
-      generateClassCode({
-        courseCode: course.courseCode,
-        courseTitle: course.title,
-        classTitle: uniqueTitle,
-        classType: dto.type,
-        includeClassType: Boolean(dto.type),
-        keepLopPrefix: this.shouldKeepLopPrefixInClassCode(),
-      });
-    const uniqueClassCode = await this.generateUniqueClassCode(
+  async createClass(
+    tenantId: number,
+    inputOrCourseId: CreateClassInput | number,
+    dto?: CreateClassDto,
+  ) {
+    const input: CreateClassInput =
+      typeof inputOrCourseId === 'number'
+        ? ({ ...(dto || {}), courseId: inputOrCourseId } as CreateClassInput)
+        : inputOrCourseId;
+
+    if (!input.courseId) {
+      throw new BadRequestException('Thiếu courseId');
+    }
+    if (!input.title?.trim()) {
+      throw new BadRequestException('Thiếu title');
+    }
+
+    const course = await this.prisma.course.findFirst({
+      where: {
+        id: input.courseId,
+        tenantId,
+      },
+    });
+
+    if (!course) {
+      throw new NotFoundException('Không tìm thấy khóa học phù hợp.');
+    }
+
+    const type = input.type || 'WEEKLY';
+    if (!['WEEKLY', 'EXAM_PRACTICE'].includes(type)) {
+      throw new BadRequestException('Loại lớp không hợp lệ.');
+    }
+
+    const title = normalizeTitleCase(input.title);
+    const baseClassCode = this.buildClassCode(course, title, type);
+    const classCode = await this.generateUniqueClassCode(
       tenantId,
       baseClassCode,
     );
-    this.validateClassDates(dto.startDate, dto.endDate);
 
-    const courseClass = await this.prisma.courseClass.create({
-      data: {
-        tenantId,
-        courseId,
-        classCode: uniqueClassCode,
-        title: uniqueTitle,
-        type: dto.type || 'WEEKLY',
-        description: dto.description || null,
-        teacherName: dto.teacherName ? normalizeTitleCase(dto.teacherName) : null,
-        startDate: dto.startDate ? new Date(dto.startDate) : null,
-        endDate: dto.endDate ? new Date(dto.endDate) : null,
-        status: 'ACTIVE',
-      },
-      include: { course: true },
-    });
+    this.validateClassDates(input.startDate, input.endDate);
 
-    if (dto.enrollStudentId) {
-      await this.prisma.classEnrollment.create({
+    return this.prisma.$transaction(async (tx) => {
+      const courseClass = await tx.courseClass.create({
         data: {
-          classId: courseClass.id,
-          userId: dto.enrollStudentId,
-          roleInClass: 'STUDENT',
+          tenantId,
+          courseId: input.courseId,
+          classCode,
+          title,
+          type,
+          description: input.description || null,
+          teacherName: input.teacherName
+            ? normalizeTitleCase(input.teacherName)
+            : null,
+          startDate: input.startDate ? new Date(input.startDate) : null,
+          endDate: input.endDate ? new Date(input.endDate) : null,
           status: 'ACTIVE',
         },
+        include: { course: true },
       });
-    }
 
-    return courseClass;
+      const sessions = input.sessions || [];
+      if (sessions.length) {
+        await tx.classSession.createMany({
+          data: sessions.map((session) => ({
+            classId: courseClass.id,
+            title: session.title || null,
+            dayOfWeek: session.dayOfWeek ?? null,
+            startTime: session.startTime || null,
+            endTime: session.endTime || null,
+            sessionDate: session.sessionDate
+              ? new Date(session.sessionDate)
+              : null,
+            room: session.room || null,
+            note: session.note || null,
+            status: 'SCHEDULED',
+          })),
+        });
+      }
+
+      return {
+        ...courseClass,
+        course: courseClass.course || course,
+        sessions,
+      };
+    });
   }
 
   async updateClass(tenantId: number, id: number, dto: UpdateClassDto) {
@@ -470,7 +604,12 @@ export class CoursesService {
       where: { id },
       data: {
         classCode,
-        title: dto.title !== undefined ? (dto.title ? normalizeTitleCase(dto.title) : '') : undefined,
+        title:
+          dto.title !== undefined
+            ? dto.title
+              ? normalizeTitleCase(dto.title)
+              : ''
+            : undefined,
         type: dto.type,
         description:
           dto.description !== undefined ? dto.description || null : undefined,
@@ -854,32 +993,60 @@ export class CoursesService {
     tenantId: number,
     baseCode: string,
   ): Promise<string> {
-    // Strip trailing _N suffix to get the real base
     const normalizedBase = normalizeGeneratedCode(baseCode);
-    const stripped = normalizedBase.replace(/_\d+$/, '');
-
-    if (!stripped) {
+    if (!normalizedBase) {
       throw new BadRequestException('Không thể sinh mã lớp học từ tên này');
     }
 
-    // Find all existing codes that start with this base in the same tenant
-    const existing = await this.prisma.courseClass.findMany({
-      where: {
-        tenantId,
-        classCode: { startsWith: stripped },
-      },
-      select: { classCode: true },
-    });
+    let code = normalizedBase;
+    let index = 2;
 
-    return this.nextUniqueCode(
-      stripped,
-      normalizedBase,
-      existing.map((courseClass) => courseClass.classCode),
-    );
+    while (
+      await this.prisma.courseClass.findFirst({
+        where: {
+          tenantId,
+          classCode: code,
+        },
+        select: { id: true },
+      })
+    ) {
+      code = `${normalizedBase}_${index}`;
+      index += 1;
+    }
+
+    return code;
   }
 
-  private nextUniqueCode(baseCode: string, preferredCode: string, codes: string[]) {
-    const existingCodes = new Set(codes.map((code) => normalizeGeneratedCode(code)));
+  private normalizeClassCodePart(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/Đ/g, 'D')
+      .toUpperCase()
+      .replace(/[^A-Z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '')
+      .replace(/_+/g, '_');
+  }
+
+  private buildClassCode(course: Course, title: string, type: string): string {
+    const coursePart = this.normalizeClassCodePart(
+      course.courseCode || course.title,
+    );
+    const classPart = this.normalizeClassCodePart(title);
+    const typePart = this.normalizeClassCodePart(type);
+
+    return `${coursePart}_${classPart}_${typePart}`;
+  }
+
+  private nextUniqueCode(
+    baseCode: string,
+    preferredCode: string,
+    codes: string[],
+  ) {
+    const existingCodes = new Set(
+      codes.map((code) => normalizeGeneratedCode(code)),
+    );
 
     if (!existingCodes.has(preferredCode)) {
       return preferredCode;
@@ -919,7 +1086,7 @@ export class CoursesService {
     // Extract base name and trailing number: "Ielts 1" → base="Ielts", num=1
     const match = title.match(/^(.+?)\s+(\d+)$/);
     const baseName = match ? match[1].trim() : title;
-    
+
     // Find all existing titles in the same course that start with the base name
     const existing = await this.prisma.courseClass.findMany({
       where: {
@@ -943,7 +1110,11 @@ export class CoursesService {
     let maxNum = 0;
     const baseNameLower = baseName.toLowerCase();
     for (const t of existingTitles) {
-      const m = t.match(new RegExp(`^${baseNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(\\d+)$`));
+      const m = t.match(
+        new RegExp(
+          `^${baseNameLower.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s+(\\d+)$`,
+        ),
+      );
       if (m) {
         maxNum = Math.max(maxNum, parseInt(m[1], 10));
       } else if (t === baseNameLower) {

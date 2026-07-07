@@ -40,6 +40,14 @@ export class CopilotController {
     return this.copilotService.findSessions(actor.tenantId, actor.userId);
   }
 
+  @Get('sessions/current')
+  getCurrentSession(@GetActor() actor: ActorPayload) {
+    return this.copilotService.getOrCreateCurrentSession(
+      actor.tenantId,
+      actor.userId,
+    );
+  }
+
   @Get('sessions/:id')
   findSession(
     @GetActor() actor: ActorPayload,

@@ -55,6 +55,8 @@ model Course {
   description String?
   level       String?
   status      String        @default("ACTIVE")
+  startDate   DateTime?     @map("start_date")
+  expireDate  DateTime?     @map("expire_date")
   createdAt   DateTime      @default(now()) @map("created_at")
   updatedAt   DateTime      @default(now()) @updatedAt @map("updated_at")
   tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)

@@ -28,11 +28,13 @@ import {
 } from "lucide-react";
 import { apiClient } from "@/lib/api-client";
 import {
-  clearCopilotActiveSession,
-  COPILOT_ACTIVE_SESSION_STORAGE_KEY,
+  getActiveCopilotSessionId,
+  setActiveCopilotSessionId,
 } from "@/lib/copilot-session-storage";
 import Navbar from "../../components/Navbar";
 import EditablePreviewCard from "./EditablePreviewCard";
+import StudentCreateForm from "./StudentCreateForm";
+import CourseCreateForm from "./CourseCreateForm";
 
 type CopilotSession = {
   id: number;
@@ -86,37 +88,10 @@ const buildPendingPreviewMessage = (
   }),
 });
 
-const getBrowserNavigationType = () => {
-  if (typeof window === "undefined") return "";
-  const navigation = performance.getEntriesByType("navigation")[0] as
-    | PerformanceNavigationTiming
-    | undefined;
-  return navigation?.type || "";
-};
-
-const readStoredActiveSessionId = () => {
-  if (typeof window === "undefined") return null;
-
-  if (getBrowserNavigationType() === "reload") {
-    clearCopilotActiveSession();
-    return null;
-  }
-
-  const storedId = sessionStorage.getItem(COPILOT_ACTIVE_SESSION_STORAGE_KEY);
-  const parsedId = Number(storedId);
-  return Number.isInteger(parsedId) && parsedId > 0 ? parsedId : null;
-};
+const readStoredActiveSessionId = () => getActiveCopilotSessionId();
 
 const storeActiveSessionId = (sessionId: number | null) => {
-  if (typeof window === "undefined") return;
-  if (sessionId) {
-    sessionStorage.setItem(
-      COPILOT_ACTIVE_SESSION_STORAGE_KEY,
-      String(sessionId),
-    );
-  } else {
-    clearCopilotActiveSession();
-  }
+  setActiveCopilotSessionId(sessionId);
 };
 
 type SelectionOption = {
@@ -205,6 +180,7 @@ const FIELD_LABELS: Record<string, string> = {
   birthDate: "Ngày sinh",
   startDate: "Ngày bắt đầu",
   endDate: "Ngày kết thúc",
+  expireDate: "Ngày kết thúc",
   joinedAt: "Ngày vào lớp",
   endedAt: "Ngày kết thúc",
   createdAt: "Ngày tạo",
@@ -629,7 +605,8 @@ function getStudentFromEnrollment(record: Record<string, unknown>) {
 function renderClassProfileCard(record: Record<string, unknown>, onSelect?: (msg: string) => void) {
   const title = String(record.title || "Chưa có tên");
   const classCode = String(record.classCode || "—");
-  const classType = record.type === "PRACTICE" ? "Luyện đề" : "Học theo tuần";
+  const classType =
+    record.type === "EXAM_PRACTICE" ? "Luyện đề" : "Học theo tuần";
   const teacher = String(record.teacherName || "Chưa có");
   const course = isRecord(record.course) ? record.course : null;
   const courseName = course ? String(course.title || course.courseCode || "") : "—";
@@ -1337,37 +1314,24 @@ const QUICK_SUGGESTIONS = [
 ];
 
 export default function CopilotPage() {
-  const [initialActiveSessionId] = useState(readStoredActiveSessionId);
-  const hasActiveSnapshot =
-    Boolean(initialActiveSessionId) &&
-    copilotClientSnapshot.activeSessionId === initialActiveSessionId;
-
-  const [sessions, setSessions] = useState<CopilotSession[]>(
-    () => (hasActiveSnapshot ? copilotClientSnapshot.sessions : []),
-  );
-  const [messages, setMessages] = useState<CopilotMessage[]>(
-    () => (hasActiveSnapshot ? copilotClientSnapshot.messages : []),
-  );
-  const [activeSessionId, setActiveSessionId] = useState<number | null>(
-    initialActiveSessionId,
-  );
-  const [input, setInput] = useState(() =>
-    hasActiveSnapshot ? copilotClientSnapshot.input : "",
-  );
+  // Render đầu tiên phải SSR-safe: KHÔNG đọc localStorage/snapshot ở đây (server
+  // luôn trả null) để tránh hydration mismatch. Khôi phục session được thực hiện
+  // trong useEffect sau khi hydrate (xem effect bootstrap bên dưới).
+  const [sessions, setSessions] = useState<CopilotSession[]>([]);
+  const [messages, setMessages] = useState<CopilotMessage[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
+  const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
-  const [loadingMessages, setLoadingMessages] = useState(
-    Boolean(initialActiveSessionId && !hasActiveSnapshot),
-  );
+  const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [pendingConfirmation, setPendingConfirmation] =
-    useState<PendingConfirmation | null>(() =>
-      hasActiveSnapshot ? copilotClientSnapshot.pendingConfirmation : null,
-    );
+    useState<PendingConfirmation | null>(null);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messagesScrollRef = useRef<HTMLDivElement>(null);
-  const shouldRestoreScrollRef = useRef(hasActiveSnapshot);
+  const shouldRestoreScrollRef = useRef(false);
+  const didBootstrapRef = useRef(false);
 
   const activateSession = useCallback((sessionId: number | null) => {
     setActiveSessionId(sessionId);
@@ -1421,9 +1385,13 @@ export default function CopilotPage() {
         apiClient.get(`/copilot/sessions/${sessionId}/messages`),
         apiClient.get(`/copilot/sessions/${sessionId}`),
       ]);
+      const sessionData = sessionRes.data as CopilotSession;
+      // Không dùng session đã CLOSED -> để caller bootstrap session mới.
+      if (sessionData?.status && sessionData.status !== "ACTIVE") {
+        return false;
+      }
       const nextMessages = messagesRes.data as CopilotMessage[];
-      const pendingAction = (sessionRes.data as CopilotSession)?.state
-        ?.pending_action;
+      const pendingAction = sessionData?.state?.pending_action;
       if (pendingAction) {
         const lastAssistant = [...nextMessages]
           .reverse()
@@ -1458,6 +1426,25 @@ export default function CopilotPage() {
     }
   }, []);
 
+  // Bootstrap an toàn khi reload: hỏi backend session ACTIVE hiện tại (tạo mới
+  // nếu chưa có). Không bao giờ dùng session đã CLOSED.
+  const bootstrapCurrentSession = useCallback(async () => {
+    try {
+      const res = await apiClient.get("/copilot/sessions/current");
+      const session = res.data as CopilotSession;
+      if (session?.id) {
+        setSessions((current) =>
+          current.some((item) => item.id === session.id)
+            ? current
+            : [session, ...current],
+        );
+        activateSession(session.id);
+      }
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể khởi tạo phiên chat"));
+    }
+  }, [activateSession]);
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void fetchSessions();
@@ -1466,35 +1453,112 @@ export default function CopilotPage() {
     return () => window.clearTimeout(timer);
   }, [fetchSessions]);
 
+  // Sau khi hydrate (chỉ chạy 1 lần ở client): đọc storage/snapshot rồi khôi phục
+  // session, hoặc bootstrap session ACTIVE mới. Đọc localStorage ở đây (không phải
+  // trong render) để tránh hydration mismatch.
+  useEffect(() => {
+    if (didBootstrapRef.current) return;
+    didBootstrapRef.current = true;
+
+    const storedId = readStoredActiveSessionId();
+    if (!storedId) {
+      void bootstrapCurrentSession();
+      return;
+    }
+
+    const snapshotMatches =
+      copilotClientSnapshot.activeSessionId === storedId &&
+      copilotClientSnapshot.messages.length > 0;
+    if (snapshotMatches) {
+      setSessions(copilotClientSnapshot.sessions);
+      setMessages(copilotClientSnapshot.messages);
+      setInput(copilotClientSnapshot.input);
+      setPendingConfirmation(copilotClientSnapshot.pendingConfirmation);
+      shouldRestoreScrollRef.current = true;
+    } else {
+      setLoadingMessages(true);
+    }
+    // fetchMessages effect sẽ chạy khi activeSessionId set; nếu session CLOSED/
+    // không hợp lệ -> fallback bootstrap.
+    setActiveSessionId(storedId);
+  }, [bootstrapCurrentSession]);
+
   useEffect(() => {
     if (activeSessionId) {
       const timer = window.setTimeout(() => {
         void fetchMessages(activeSessionId).then((loaded) => {
           if (!loaded) {
+            // Session không hợp lệ/đã đóng -> bootstrap session ACTIVE mới.
             activateSession(null);
             setMessages([]);
+            void bootstrapCurrentSession();
           }
         });
       }, 0);
 
       return () => window.clearTimeout(timer);
     }
-  }, [activeSessionId, activateSession, fetchMessages]);
+  }, [activeSessionId, activateSession, fetchMessages, bootstrapCurrentSession]);
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionId) || null,
     [sessions, activeSessionId],
   );
 
-  const startNewSession = useCallback(() => {
+  // Có thao tác WRITE đang chờ confirm/cancel (preview_card + pending_action)?
+  // Khi đó khóa composer như FluentGo (phase PREVIEW): user phải bấm Xác nhận /
+  // Hủy trước khi gửi tin nhắn mới. Các bước clarification (chọn lớp, nhập lại
+  // email...) trả về type khác nên KHÔNG rơi vào đây và vẫn nhập được bình thường.
+  const hasPendingPreview = useMemo(() => {
+    const lastAssistant = [...messages]
+      .reverse()
+      .find((message) => message.role === "assistant");
+    if (!lastAssistant) return false;
+    try {
+      const parsed = JSON.parse(lastAssistant.content);
+      return Boolean(
+        parsed?.type === "preview_card" && parsed?.pending_action,
+      );
+    } catch {
+      return false;
+    }
+  }, [messages]);
+  const composerLocked = sending || hasPendingPreview;
+
+  const startNewSession = useCallback(async () => {
     if (sending) return;
     setError("");
+    const previousId = activeSessionId;
+
+    // Đóng session cũ ở backend để clear pending_action/context nguy hiểm.
+    // Best-effort: dù đóng lỗi vẫn tạo session mới, không confirm pending cũ.
+    if (previousId) {
+      try {
+        await apiClient.patch(`/copilot/sessions/${previousId}/close`);
+      } catch {
+        // ignore
+      }
+    }
+
+    // Reset UI ngay để không thao tác nhầm pending cũ.
     activateSession(null);
     setMessages([]);
     setInput("");
     setPendingConfirmation(null);
     setLoadingMessages(false);
-  }, [activateSession, sending]);
+
+    try {
+      const res = await apiClient.post("/copilot/sessions", {});
+      const session = res.data as CopilotSession;
+      setSessions((current) => [
+        session,
+        ...current.filter((item) => item.id !== session.id),
+      ]);
+      activateSession(session.id);
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể tạo cuộc trò chuyện mới"));
+    }
+  }, [activeSessionId, activateSession, sending]);
 
   const selectSession = useCallback(
     (sessionId: number) => {
@@ -1544,7 +1608,7 @@ export default function CopilotPage() {
   const sendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
     const content = input.trim();
-    if (!content) return;
+    if (sending || !content || hasPendingPreview) return;
 
     let sessionId = activeSessionId;
     setSending(true);
@@ -1584,8 +1648,7 @@ export default function CopilotPage() {
         input: overrideInput || (pendingConfirmation?.input)
       });
       setPendingConfirmation(null);
-      await fetchMessages(activeSessionId);
-      await fetchSessions();
+      await Promise.all([fetchMessages(activeSessionId), fetchSessions()]);
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Không thể xác nhận thao tác"));
     } finally {
@@ -1600,8 +1663,7 @@ export default function CopilotPage() {
     try {
       await apiClient.post(`/copilot/sessions/${activeSessionId}/cancel`);
       setPendingConfirmation(null);
-      await fetchMessages(activeSessionId);
-      await fetchSessions();
+      await Promise.all([fetchMessages(activeSessionId), fetchSessions()]);
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Không thể hủy thao tác"));
     } finally {
@@ -1654,7 +1716,7 @@ export default function CopilotPage() {
             <button
               key={`quick-sug-${idx}`}
               type="button"
-              disabled={sending}
+              disabled={composerLocked}
               onClick={() => void applySuggestionDraft(s.draft)}
               className={`flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-semibold shadow-2xs transition-all duration-200 hover:scale-102 hover:shadow-xs active:scale-98 disabled:opacity-50 disabled:pointer-events-none cursor-pointer ${s.color}`}
             >
@@ -1782,7 +1844,7 @@ export default function CopilotPage() {
         return withSuggestions(
           <div className="space-y-3">
             <div className="font-semibold text-amber-700">Cần làm rõ thêm</div>
-            <p className="text-sm text-slate-700">{data.message}</p>
+            <p className="whitespace-pre-line text-sm text-slate-700">{data.message}</p>
             {data.clarification_type === "target_disambiguation" &&
               Array.isArray(data.options) &&
               data.options.length > 0 && (
@@ -1818,6 +1880,50 @@ export default function CopilotPage() {
               </div>
             )}
           </div>,
+          data.suggestions,
+        );
+      }
+
+      if (data.type === "student_create_form") {
+        return withSuggestions(
+          <StudentCreateForm
+            data={data}
+            sending={sending}
+            canAct={canAct}
+            onSubmit={(input) => {
+              const name = String(input.fullName || "").trim();
+              void applySuggestionDraft(
+                name ? `Tạo học viên: ${name}` : "Tạo học viên",
+                {
+                  type: "suggestion_action",
+                  action: "create_student",
+                  input,
+                },
+              );
+            }}
+          />,
+          data.suggestions,
+        );
+      }
+
+      if (data.type === "course_create_form") {
+        return withSuggestions(
+          <CourseCreateForm
+            data={data}
+            sending={sending}
+            canAct={canAct}
+            onSubmit={(input) => {
+              const title = String(input.title || "").trim();
+              void applySuggestionDraft(
+                title ? `Tạo khóa học: ${title}` : "Tạo khóa học",
+                {
+                  type: "suggestion_action",
+                  action: "create_course",
+                  input,
+                },
+              );
+            }}
+          />,
           data.suggestions,
         );
       }
@@ -1915,16 +2021,13 @@ export default function CopilotPage() {
       if (data.type === "tool_result") {
         const isEnrollmentResult =
           data.tool_name === "assign_student_to_course" ||
-          data.tool_name === "update_student_course_role" ||
-          data.tool_name === "remove_student_from_course" ||
           data.tool_name === "assign_student_to_class" ||
           data.tool_name === "update_student_class_role" ||
           data.tool_name === "remove_student_from_class";
         const enrollmentTitle =
-          data.tool_name === "update_student_course_role"
-            ? "Thông tin vai trò trong lớp"
-            : data.tool_name === "assign_student_to_course"
-              || data.tool_name === "assign_student_to_class"
+          data.tool_name === "assign_student_to_course"
+            ? "Thông tin ghi danh vào khóa học"
+            : data.tool_name === "assign_student_to_class"
               ? "Thông tin thêm vào lớp"
               : "Thông tin lớp học";
 
@@ -1933,7 +2036,7 @@ export default function CopilotPage() {
             <div className="text-sm font-semibold text-emerald-700">
               {data.status === "SUCCESS" ? "Đã thực hiện" : "Không thành công"}
             </div>
-            <p className="text-xs text-slate-700">{data.message}</p>
+            <p className="whitespace-pre-line text-xs text-slate-700">{data.message}</p>
             <div className="font-mono text-[10px] text-slate-400">
               {data.tool_name}
             </div>
@@ -2231,12 +2334,17 @@ export default function CopilotPage() {
                     type="text"
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
-                    className="h-12 w-full rounded-[20px] bg-transparent px-4 pr-14 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none"
-                    placeholder="Nhập yêu cầu..."
+                    disabled={composerLocked}
+                    className="h-12 w-full rounded-[20px] bg-transparent px-4 pr-14 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none disabled:cursor-not-allowed disabled:text-slate-400"
+                    placeholder={
+                      hasPendingPreview
+                        ? "Hãy Xác nhận hoặc Hủy thao tác đang chờ..."
+                        : "Nhập yêu cầu..."
+                    }
                   />
                   <button
                     type="submit"
-                    disabled={sending || !input.trim()}
+                    disabled={composerLocked || !input.trim()}
                     className="absolute right-3 top-1/2 flex h-9 w-9 -translate-y-1/2 items-center justify-center rounded-full bg-slate-950 text-white transition hover:bg-slate-700 disabled:bg-slate-200 disabled:text-slate-400 disabled:cursor-not-allowed"
                     aria-label="Gửi yêu cầu"
                   >
@@ -2247,6 +2355,13 @@ export default function CopilotPage() {
                     )}
                   </button>
                 </form>
+                {hasPendingPreview && (
+                  <p className="mx-auto mt-2 max-w-3xl px-2 text-center text-xs text-amber-600">
+                    Đang chờ bạn <strong>Xác nhận</strong> hoặc{" "}
+                    <strong>Hủy</strong> thao tác phía trên. Ô nhập tạm khóa để
+                    tránh thao tác nhầm.
+                  </p>
+                )}
               </div>
             </>
           )}

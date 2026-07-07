@@ -1,6 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { AiService } from '../ai/ai.service';
 import { AgentContextBuilderService } from './agent-context-builder.service';
-import { AiModelService } from './ai-model.service';
 import {
   AiIntent,
   AiToolName,
@@ -11,10 +11,12 @@ import {
 } from './decision.types';
 import { ToolExecutorService } from './tool-executor.service';
 import {
-  AGENT_TOOLS,
+  getConfiguredAgentTools,
+  isAgentMiniMode,
   isReadTool,
   isWriteTool,
 } from './tool-definitions';
+import { formatReadResultMessage } from './agent-formatters';
 
 export interface AgentRunInput {
   userMessage: string;
@@ -30,6 +32,8 @@ export type AgentRunResult =
       type: 'text';
       message: string;
       contextPatch?: Partial<DecisionContext>;
+      /** true nếu LLM không dùng được (quota/lỗi mạng) -> caller có thể fallback. */
+      llmUnavailable?: boolean;
     }
   | {
       type: 'clarification';
@@ -51,13 +55,16 @@ export class AgentRunnerService {
   private readonly logger = new Logger(AgentRunnerService.name);
 
   constructor(
-    private readonly aiModel: AiModelService,
+    private readonly aiModel: AiService,
     private readonly contextBuilder: AgentContextBuilderService,
     private readonly toolExecutor: ToolExecutorService,
-  ) {}
+  ) {
+    this.logger.log(`AI Agent mini mode enabled: ${isAgentMiniMode()}`);
+  }
 
   async run(input: AgentRunInput): Promise<AgentRunResult> {
     const systemPrompt = this.contextBuilder.buildSystemPrompt(input.context);
+    const tools = getConfiguredAgentTools();
     const messages: ChatMessage[] = [
       ...(input.sessionHistory || []).slice(-12),
       { role: 'user', content: input.userMessage },
@@ -68,7 +75,7 @@ export class AgentRunnerService {
       const modelResult = await this.aiModel.callWithTools(
         systemPrompt,
         messages,
-        AGENT_TOOLS,
+        tools,
       );
 
       if (modelResult.type === 'error') {
@@ -78,6 +85,7 @@ export class AgentRunnerService {
             modelResult.content?.trim() ||
             'Mình chưa xử lý được yêu cầu này. Bạn thử nói lại ngắn gọn hơn nhé.',
           contextPatch: {},
+          llmUnavailable: true,
         };
       }
 
@@ -128,14 +136,15 @@ export class AgentRunnerService {
           input: args,
           display_input: args,
           summary: this.summarizeWriteTool(toolName, args),
-          intent: toolName as AiIntent,
+          intent: toolName,
           status: 'waiting_confirm',
           severity: this.isDangerTool(toolName) ? 'danger' : 'default',
         };
         return {
           type: 'pending_write',
           pendingAction,
-          message: 'Mình đã chuẩn bị thao tác. Bạn kiểm tra lại rồi xác nhận nhé.',
+          message:
+            'Mình đã chuẩn bị thao tác. Bạn kiểm tra lại rồi xác nhận nhé.',
           contextPatch: {
             pending_action: pendingAction,
             pending_clarification: null,
@@ -143,12 +152,15 @@ export class AgentRunnerService {
         };
       }
 
-      this.logger.warn(`Model gọi tool không hỗ trợ: ${modelResult.toolCall.name}`);
+      this.logger.warn(
+        `Model gọi tool không hỗ trợ: ${modelResult.toolCall.name}`,
+      );
       const clarification: PendingClarification = {
         type: 'missing_fields',
         intent: 'unknown',
         missing_fields: ['tool'],
-        message: 'Mình chưa chắc thao tác cần làm. Bạn nói rõ hơn giúp mình nhé?',
+        message:
+          'Mình chưa chắc thao tác cần làm. Bạn nói rõ hơn giúp mình nhé?',
       };
       return {
         type: 'clarification',
@@ -165,15 +177,18 @@ export class AgentRunnerService {
     };
   }
 
-  private buildClarification(args: Record<string, unknown>): PendingClarification {
+  private buildClarification(
+    args: Record<string, unknown>,
+  ): PendingClarification {
     const missingFields = Array.isArray(args.missingFields)
-      ? args.missingFields.filter((item): item is string => typeof item === 'string')
+      ? args.missingFields.filter(
+          (item): item is string => typeof item === 'string',
+        )
       : [];
 
     return {
       type: 'missing_fields',
-      intent:
-        typeof args.intent === 'string' ? (args.intent as AiIntent) : 'unknown',
+      intent: typeof args.intent === 'string' ? args.intent : 'unknown',
       missing_fields: missingFields,
       message:
         typeof args.message === 'string' && args.message.trim()
@@ -187,6 +202,30 @@ export class AgentRunnerService {
     toolName: AiToolName,
     args: Record<string, unknown>,
   ): string {
+    if (toolName === 'assign_student_to_course') {
+      return `Ghi danh học viên #${args.userId ?? '?'} vào khóa học #${
+        args.courseId ?? '?'
+      }`;
+    }
+
+    if (toolName === 'create_course') {
+      const name = String(args.title ?? args.name ?? '').trim();
+      const parts = [`Tạo khóa học mới${name ? `: ${name}` : ''}`];
+      const startDate = args.startDate ?? args.start_date;
+      const expireDate = args.expireDate ?? args.endDate ?? args.expire_date;
+      if (startDate)
+        parts.push(`Ngày bắt đầu: ${this.formatDateVN(startDate)}`);
+      if (expireDate)
+        parts.push(`Ngày kết thúc: ${this.formatDateVN(expireDate)}`);
+      return parts.join('. ');
+    }
+
+    if (toolName === 'create_class') {
+      const title = String(args.title ?? '').trim();
+      const courseId = args.courseId ? ` trong khóa #${args.courseId}` : '';
+      return `Tạo lớp học mới${title ? `: ${title}` : ''}${courseId}`;
+    }
+
     const labels: Record<string, string> = {
       create_student: 'Tạo học viên mới',
       update_student: 'Cập nhật học viên',
@@ -198,8 +237,10 @@ export class AgentRunnerService {
       update_class: 'Cập nhật lớp học',
       close_class: 'Đóng lớp học',
       assign_student_to_class: 'Thêm học viên vào lớp',
+      assign_student_to_course: 'Ghi danh học viên vào khóa học',
       remove_student_from_class: 'Xóa học viên khỏi lớp',
-      remove_student_from_course_classes: 'Xóa học viên khỏi các lớp trong khóa',
+      remove_student_from_course_classes:
+        'Xóa học viên khỏi các lớp trong khóa',
       ask_clarification: 'Hỏi làm rõ',
       search_student: 'Tìm học viên',
       get_student_detail: 'Xem học viên',
@@ -213,19 +254,32 @@ export class AgentRunnerService {
     return `${labels[toolName] || toolName}: ${JSON.stringify(args)}`;
   }
 
+  private formatDateVN(value: unknown): string {
+    if (typeof value !== 'string' || !value.trim()) return String(value ?? '');
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value;
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    return `${day}/${month}/${date.getUTCFullYear()}`;
+  }
+
   private isDangerTool(toolName: AiToolName): boolean {
-    return ['delete_students', 'delete_courses', 'close_class'].includes(toolName);
+    return ['delete_students', 'delete_courses', 'close_class'].includes(
+      toolName,
+    );
   }
 
   private messageFromReadResult(lastReadResult: unknown): string {
     if (!lastReadResult) {
       return 'Mình đã nhận yêu cầu. Bạn muốn mình làm gì tiếp?';
     }
-    return `Mình đã lấy được dữ liệu:\nData: ${JSON.stringify(
-      (lastReadResult as { result?: unknown }).result,
-      null,
-      2,
-    )}`;
+    const { toolName, result } = lastReadResult as {
+      toolName?: string;
+      result?: unknown;
+    };
+    // Format tiếng Việt dễ đọc, KHÔNG dump JSON thô ra chat.
+    const formatted = formatReadResultMessage(toolName, result);
+    return formatted || 'Mình đã lấy được dữ liệu bạn cần.';
   }
 
   private contextPatchFromReadResult(

@@ -1,3 +1,4 @@
+import { BadRequestException } from '@nestjs/common';
 import { AiToolName } from './decision.types';
 
 export interface AgentToolDefinition {
@@ -30,6 +31,25 @@ const numberArrayField = (description: string) => ({
   items: { type: 'number' },
 });
 
+const classSessionArrayField = () => ({
+  type: 'array',
+  description: 'Danh sách buổi học/lịch học của lớp.',
+  items: {
+    type: 'object',
+    properties: {
+      title: stringField('Tên buổi học'),
+      dayOfWeek: numberField(
+        'Thứ trong tuần: chủ nhật=0, thứ 2=2, ..., thứ 7=7',
+      ),
+      startTime: stringField('Giờ bắt đầu dạng HH:mm'),
+      endTime: stringField('Giờ kết thúc dạng HH:mm'),
+      sessionDate: stringField('Ngày học cụ thể dạng YYYY-MM-DD nếu có'),
+      room: stringField('Phòng học'),
+      note: stringField('Ghi chú buổi học'),
+    },
+  },
+});
+
 export const READ_TOOL_NAMES: string[] = [
   'search_student',
   'get_student_detail',
@@ -52,11 +72,12 @@ export const WRITE_TOOL_NAMES: string[] = [
   'update_class',
   'close_class',
   'assign_student_to_class',
+  'assign_student_to_course',
   'remove_student_from_class',
   'remove_student_from_course_classes',
 ];
 
-export const AGENT_TOOLS: AgentToolDefinition[] = [
+export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
   {
     type: 'function',
     function: {
@@ -135,7 +156,7 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
         properties: {
           keyword: stringField('Từ khóa tìm kiếm lớp học'),
           courseId: numberField('Giới hạn trong khóa học ID này nếu đã biết'),
-          classType: stringField('Loại lớp', ['WEEKLY', 'PRACTICE']),
+          classType: stringField('Loại lớp', ['WEEKLY', 'EXAM_PRACTICE']),
           status: stringField('Trạng thái lớp'),
         },
       },
@@ -227,7 +248,8 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
     type: 'function',
     function: {
       name: 'create_course',
-      description: 'Tạo khóa học/chương trình đào tạo mới.',
+      description:
+        'Tạo khóa học mới. Nếu user cung cấp ngày bắt đầu/kết thúc, truyền startDate và expireDate dạng YYYY-MM-DD.',
       parameters: {
         type: 'object',
         properties: {
@@ -237,8 +259,10 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
           ),
           description: stringField('Mô tả khóa học'),
           level: stringField('Cấp độ khóa học'),
-          startDate: stringField('Ngày bắt đầu dạng YYYY-MM-DD'),
-          endDate: stringField('Ngày kết thúc dạng YYYY-MM-DD'),
+          startDate: stringField('Ngày bắt đầu khóa học, định dạng YYYY-MM-DD'),
+          expireDate: stringField(
+            'Ngày kết thúc/hết hạn khóa học, định dạng YYYY-MM-DD',
+          ),
         },
         required: ['title'],
       },
@@ -248,7 +272,8 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
     type: 'function',
     function: {
       name: 'update_course',
-      description: 'Cập nhật thông tin khóa học.',
+      description:
+        'Cập nhật thông tin khóa học đang chọn/vừa tạo. Chỉ truyền các field cần đổi; ngày dạng YYYY-MM-DD.',
       parameters: {
         type: 'object',
         properties: {
@@ -256,7 +281,13 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
           title: stringField('Tên khóa học mới'),
           courseCode: stringField('Mã khóa học mới'),
           description: stringField('Mô tả mới'),
-          level: stringField('Cấp độ mới'),
+          level: stringField('Cấp độ mới, ví dụ "Cấp độ 1", "Cơ bản"'),
+          status: stringField('Trạng thái mới nếu có'),
+          startDate: stringField('Ngày bắt đầu mới, định dạng YYYY-MM-DD'),
+          expireDate: stringField(
+            'Ngày kết thúc/hết hạn mới, định dạng YYYY-MM-DD',
+          ),
+          endDate: stringField('Bí danh của expireDate (YYYY-MM-DD)'),
         },
         required: ['courseId'],
       },
@@ -289,17 +320,14 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
         properties: {
           courseId: numberField('ID khóa học cha'),
           title: stringField('Tên lớp học'),
-          classCode: stringField(
-            'Mã lớp học. Có thể bỏ trống, hệ thống sẽ tự sinh từ mã khóa, tên lớp và loại lớp',
-          ),
-          classType: stringField('Loại lớp', ['WEEKLY', 'PRACTICE']),
+          type: stringField('Loại lớp', ['WEEKLY', 'EXAM_PRACTICE']),
           description: stringField('Mô tả lớp học'),
           teacherName: stringField('Tên giáo viên'),
           startDate: stringField('Ngày bắt đầu dạng YYYY-MM-DD'),
           endDate: stringField('Ngày kết thúc dạng YYYY-MM-DD'),
-          enrollStudentId: numberField('ID học viên cần thêm ngay khi tạo lớp'),
+          sessions: classSessionArrayField(),
         },
-        required: ['courseId', 'title', 'classType'],
+        required: ['courseId', 'title'],
       },
     },
   },
@@ -314,7 +342,7 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
           classId: numberField('ID lớp học'),
           title: stringField('Tên lớp học mới'),
           classCode: stringField('Mã lớp học mới'),
-          classType: stringField('Loại lớp', ['WEEKLY', 'PRACTICE']),
+          classType: stringField('Loại lớp', ['WEEKLY', 'EXAM_PRACTICE']),
           description: stringField('Mô tả mới'),
           teacherName: stringField('Tên giáo viên mới'),
           startDate: stringField('Ngày bắt đầu dạng YYYY-MM-DD'),
@@ -355,6 +383,31 @@ export const AGENT_TOOLS: AgentToolDefinition[] = [
           joinedAt: stringField('Ngày tham gia dạng YYYY-MM-DD'),
         },
         required: ['userId', 'classId'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'assign_student_to_course',
+      description:
+        'Ghi danh một học viên vào một khóa học. Dùng khi user nói thêm/ghi danh học viên vào khóa học (không nói rõ lớp cụ thể).',
+      parameters: {
+        type: 'object',
+        properties: {
+          userId: numberField('ID học viên cần ghi danh'),
+          courseId: numberField('ID khóa học cần ghi danh'),
+          expireDate: stringField(
+            'Ngày hết hạn học/ghi danh nếu user cung cấp, định dạng ISO yyyy-mm-dd',
+          ),
+          allowLatePayment: {
+            type: 'boolean',
+            description:
+              'Có cho phép thanh toán muộn không, nếu nghiệp vụ hỗ trợ',
+          },
+          note: stringField('Ghi chú thêm nếu có'),
+        },
+        required: ['userId', 'courseId'],
       },
     },
   },
@@ -416,4 +469,62 @@ export function isReadTool(name: unknown): name is AiToolName {
 
 export function isWriteTool(name: unknown): name is AiToolName {
   return typeof name === 'string' && WRITE_TOOL_NAMES.includes(name);
+}
+
+/**
+ * Danh sách tool được phép trong bản Copilot mini (3 nghiệp vụ):
+ * tạo học viên, tạo khóa học, ghi danh học viên vào khóa.
+ * READ đủ để tìm học viên/khóa và map course -> class.
+ */
+export const MINI_AGENT_TOOL_NAMES = [
+  'search_student',
+  'get_student_detail',
+  'search_course',
+  'get_course_detail',
+  'get_course_classes',
+  'create_student',
+  'create_course',
+  'update_course',
+  'create_class',
+  'assign_student_to_course',
+  'ask_clarification',
+] as const;
+
+export const MINI_AGENT_TOOLS: AgentToolDefinition[] = FULL_AGENT_TOOLS.filter(
+  (tool) =>
+    (MINI_AGENT_TOOL_NAMES as readonly string[]).includes(tool.function.name),
+);
+
+/**
+ * Mini mode bật khi AGENT_MINI_MODE khác 'false'. Mặc định true cho bản mini.
+ */
+export function isAgentMiniMode(): boolean {
+  return process.env.AGENT_MINI_MODE !== 'false';
+}
+
+export function isToolAllowedInMiniMode(name: unknown): boolean {
+  return (
+    typeof name === 'string' &&
+    (MINI_AGENT_TOOL_NAMES as readonly string[]).includes(name)
+  );
+}
+
+/** Trả về danh sách tool đúng theo mode hiện tại (đọc env lúc runtime). */
+export function getConfiguredAgentTools(): AgentToolDefinition[] {
+  return isAgentMiniMode() ? MINI_AGENT_TOOLS : FULL_AGENT_TOOLS;
+}
+
+/**
+ * Guard backend: chặn tool ngoài phạm vi mini mode (kể cả READ/WRITE gửi từ
+ * suggestion action hoặc pending_action cũ). Full mode thì không chặn.
+ */
+export function assertToolAllowedInCurrentMode(toolName: string): void {
+  if (!isAgentMiniMode()) return;
+  if (!isToolAllowedInMiniMode(toolName)) {
+    throw new BadRequestException({
+      code: 'TOOL_DISABLED_IN_MINI_MODE',
+      message: 'Tính năng này chưa được bật trong bản Copilot mini.',
+      toolName,
+    });
+  }
 }

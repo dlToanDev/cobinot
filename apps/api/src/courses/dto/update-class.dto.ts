@@ -10,8 +10,8 @@ export class UpdateClassDto {
   title?: string;
 
   @IsOptional()
-  @IsIn(['WEEKLY', 'PRACTICE'], {
-    message: 'Loại lớp chỉ được là WEEKLY hoặc PRACTICE',
+  @IsIn(['WEEKLY', 'EXAM_PRACTICE'], {
+    message: 'Loại lớp chỉ được là WEEKLY hoặc EXAM_PRACTICE',
   })
   type?: string;
 

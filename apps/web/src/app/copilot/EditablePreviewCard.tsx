@@ -1,9 +1,6 @@
 import React, { useState, useEffect } from "react";
 import { apiClient } from "@/lib/api-client";
-import {
-  generateClassCode,
-  normalizeGeneratedCode,
-} from "@hxstu/shared";
+import { normalizeGeneratedCode } from "@hxstu/shared";
 import {
   UserRound,
   Mail,
@@ -41,6 +38,7 @@ const FIELD_LABELS: Record<string, string> = {
   birthDate: "Ngày sinh",
   startDate: "Ngày bắt đầu",
   endDate: "Ngày kết thúc",
+  expireDate: "Ngày kết thúc",
   joinedAt: "Ngày vào lớp",
   endedAt: "Ngày kết thúc",
   createdAt: "Ngày tạo",
@@ -146,6 +144,12 @@ const ACTION_THEMES: Record<string, { label: string; icon: React.ReactNode; colo
     color: "from-violet-500 to-fuchsia-500",
     accent: "bg-violet-50 text-violet-700 border-violet-150",
   },
+  assign_student_to_course: {
+    label: "Ghi danh học viên vào khóa học",
+    icon: <Plus size={16} />,
+    color: "from-emerald-500 to-teal-500",
+    accent: "bg-emerald-50 text-emerald-700 border-emerald-150",
+  },
 };
 
 type EditablePreviewCardProps = {
@@ -193,23 +197,23 @@ type RelatedCoursePreviewItem = {
   level?: string | null;
 };
 
-const CLASS_TYPE_LABELS: Record<string, string> = {
-  WEEKLY: "Lớp học theo tuần",
-  PRACTICE: "Lớp luyện đề",
-};
-
 const isGeneratedClassCodeWithType = (value: string) =>
-  /(?:^|_)(?:WEEKLY|PRACTICE)(?:_|$)/.test(normalizeGeneratedCode(value));
+  /(?:^|_)(?:WEEKLY|EXAM_PRACTICE)(?:_|$)/.test(
+    normalizeGeneratedCode(value),
+  );
 
 const replaceClassTypeInCode = (value: string, nextType: string) => {
   const normalizedCode = normalizeGeneratedCode(value);
   const normalizedType = normalizeGeneratedCode(nextType);
-  if (!normalizedCode || !["WEEKLY", "PRACTICE"].includes(normalizedType)) {
+  if (
+    !normalizedCode ||
+    !["WEEKLY", "EXAM_PRACTICE"].includes(normalizedType)
+  ) {
     return normalizedCode;
   }
 
   return normalizedCode.replace(
-    /(^|_)(WEEKLY|PRACTICE)(?=_|$)/,
+    /(^|_)(WEEKLY|EXAM_PRACTICE)(?=_|$)/,
     `$1${normalizedType}`,
   );
 };
@@ -239,7 +243,13 @@ export default function EditablePreviewCard({
     ? data.missingFields
     : [];
   
-  const formInput = pendingAction.input || data.input || {};
+  const formInput =
+    data.tool_name === "create_class"
+      ? {
+          ...(pendingAction.display_input || data.display_input || {}),
+          ...(pendingAction.input || data.input || {}),
+        }
+      : pendingAction.input || data.input || {};
   const relatedCourses = Array.isArray(data.related_courses)
     ? data.related_courses
     : [];
@@ -278,7 +288,18 @@ export default function EditablePreviewCard({
 
   const isCourseMissing =
     missingFields.includes("courseId") && !Number(formData.courseId || 0);
-  const confirmDisabled = sending || !canAct || isCourseMissing;
+  // Field bắt buộc tối thiểu khi TẠO mới (để không confirm khi trống). Với thao
+  // tác cập nhật thì KHÔNG bắt buộc — chỉ đổi field user nhập, trống = giữ nguyên.
+  const requiredByTool: Record<string, string[]> = {
+    create_course: ["title"],
+    create_class: ["title"],
+    create_student: ["fullName"],
+  };
+  const requiredMissing = (requiredByTool[data.tool_name] || []).some(
+    (field) => !String(formData[field] ?? "").trim(),
+  );
+  const confirmDisabled =
+    sending || !canAct || isCourseMissing || requiredMissing;
 
   useEffect(() => {
     if (["create_class", "update_class", "assign_student_to_class"].includes(data.tool_name)) {
@@ -324,14 +345,16 @@ export default function EditablePreviewCard({
       selectedCourse?.title ||
       selectedCourseLabel ||
       String(input.courseName || "");
+    const normalizePart = (value: string) =>
+      normalizeGeneratedCode(value).replace(/^_+|_+$/g, "");
 
-    return generateClassCode({
-      courseCode,
-      courseTitle,
-      classTitle: String(input.title || ""),
-      classType: String(input.type || input.classType || ""),
-      includeClassType: Boolean(input.type || input.classType),
-    });
+    return [
+      normalizePart(courseCode || courseTitle),
+      normalizePart(String(input.title || "")),
+      normalizePart(String(input.type || input.classType || "WEEKLY")),
+    ]
+      .filter(Boolean)
+      .join("_");
   };
 
   const patchGeneratedClassCode = (
@@ -361,7 +384,6 @@ export default function EditablePreviewCard({
       return {
         ...next,
         classCode: nextClassCode,
-        classType: CLASS_TYPE_LABELS[nextType] || nextType,
       };
     }
 
@@ -409,6 +431,7 @@ export default function EditablePreviewCard({
     type = "text",
     required = false,
     options?: { value: string; label: string }[],
+    readOnly = false,
   ) => {
     const error = validationErrors[name];
     const rawValue = formData[name];
@@ -460,7 +483,8 @@ export default function EditablePreviewCard({
               name={name}
               value={fieldValue}
               onChange={handleChange}
-              className={inputClassName}
+              readOnly={readOnly}
+              className={`${inputClassName} ${readOnly ? "cursor-not-allowed text-slate-500" : ""}`}
             />
           )}
           {icon && (
@@ -483,7 +507,7 @@ export default function EditablePreviewCard({
             <div className="sm:col-span-2">
               {renderField("title", "Tên khóa học", "text", true)}
             </div>
-            {renderField("courseCode", "Mã khóa học", "text", true)}
+            {renderField("courseCode", "Mã khóa học (tự sinh nếu để trống)", "text", false)}
             {renderField("level", "Cấp độ", "select", false, [
               { value: "", label: "-- Chọn cấp độ --" },
               { value: "1", label: "Cấp độ 1" },
@@ -492,9 +516,17 @@ export default function EditablePreviewCard({
               { value: "4", label: "Cấp độ 4" },
               { value: "5", label: "Cấp độ 5" },
             ])}
+            {renderField("startDate", "Ngày bắt đầu", "date")}
+            {renderField("expireDate", "Ngày kết thúc", "date")}
             <div className="sm:col-span-2">
               {renderField("description", "Mô tả khóa học", "textarea")}
             </div>
+            {data.tool_name === "create_course" && (
+              <p className="sm:col-span-2 text-[11px] text-slate-400 px-1">
+                Chỉ cần tên khóa học là tạo được. Mã, cấp độ, mô tả, ngày bắt
+                đầu/kết thúc có thể để trống và cập nhật sau.
+              </p>
+            )}
           </div>
         );
       case "create_class":
@@ -540,12 +572,22 @@ export default function EditablePreviewCard({
                 </p>
               )}
             </div>
-            {renderField("classCode", "Mã lớp", "text", true)}
+            {renderField(
+              "classCode",
+              "Mã lớp dự kiến",
+              "text",
+              false,
+              undefined,
+              true,
+            )}
             {renderField("title", "Tên lớp", "text", true)}
             {renderField("type", "Loại lớp", "select", true, [
               { value: "", label: "-- Chọn loại lớp --" },
               { value: "WEEKLY", label: "Học theo tuần (WEEKLY)" },
-              { value: "PRACTICE", label: "Luyện đề (PRACTICE)" },
+              {
+                value: "EXAM_PRACTICE",
+                label: "Luyện đề (EXAM_PRACTICE)",
+              },
             ])}
             {renderField("teacherName", "Giáo viên phụ trách", "text")}
             {renderField("startDate", "Ngày bắt đầu", "date")}
@@ -553,6 +595,10 @@ export default function EditablePreviewCard({
             <div className="sm:col-span-2">
               {renderField("description", "Mô tả lớp học", "textarea")}
             </div>
+            <p className="sm:col-span-2 text-[11px] text-slate-400 px-1">
+              Chỉ cần khóa học và tên lớp là tạo được. Giáo viên, ngày và lịch
+              học có thể để trống và cập nhật sau.
+            </p>
           </div>
         );
       case "update_class":
@@ -565,7 +611,10 @@ export default function EditablePreviewCard({
             {renderField("classType", "Loại lớp", "select", true, [
               { value: "", label: "-- Chọn loại lớp --" },
               { value: "WEEKLY", label: "Học theo tuần (WEEKLY)" },
-              { value: "PRACTICE", label: "Luyện đề (PRACTICE)" },
+              {
+                value: "EXAM_PRACTICE",
+                label: "Luyện đề (EXAM_PRACTICE)",
+              },
             ])}
             {renderField("teacherName", "Giáo viên phụ trách", "text")}
             {renderField("startDate", "Ngày bắt đầu", "date")}
