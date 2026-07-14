@@ -270,6 +270,47 @@ describe('AgentRunnerService', () => {
     });
   });
 
+  it('LLM bịa "đã thêm ... thành công" không qua tool thì bị chặn, trả câu trung thực', async () => {
+    aiModel.callWithTools.mockResolvedValue({
+      type: 'text',
+      content:
+        'Đã thêm học viên vào lớp thành công.\n\n- Học viên: Tran Văn A\n- Lớp: Test 1 (ANH_VAN_TEST_1_WEEKLY)\n- Vai trò: STUDENT',
+    });
+
+    const result = await service.run(
+      baseRunInput({ userMessage: 'thêm Tran Văn A vào lớp Test 1' }),
+    );
+
+    expect(result.type).toBe('text');
+    expect(result.message).toContain('CHƯA thực hiện thao tác nào');
+    expect(result.message).not.toContain('thành công');
+  });
+
+  it('LLM bịa "Đã tạo học viên ... thành công" cũng bị chặn', async () => {
+    aiModel.callWithTools.mockResolvedValue({
+      type: 'text',
+      content: 'Đã tạo học viên Nguyễn Văn B thành công với ID 99.',
+    });
+
+    const result = await service.run(baseRunInput());
+
+    expect(result.type).toBe('text');
+    expect(result.message).toContain('CHƯA thực hiện thao tác nào');
+  });
+
+  it('text thường nhắc "thành công" nhưng không phải tuyên bố thao tác thì KHÔNG bị chặn', async () => {
+    aiModel.callWithTools.mockResolvedValue({
+      type: 'text',
+      content:
+        'Bạn muốn thêm học viên nào vào lớp? Sau khi bạn xác nhận, thao tác mới được thực hiện.',
+    });
+
+    const result = await service.run(baseRunInput());
+
+    expect(result.type).toBe('text');
+    expect(result.message).toContain('Bạn muốn thêm học viên nào vào lớp?');
+  });
+
   it('agentic loop 2 bước: search_student READ rồi assign_student_to_class WRITE', async () => {
     aiModel.callWithTools
       .mockResolvedValueOnce({

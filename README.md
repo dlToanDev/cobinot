@@ -27,7 +27,7 @@ Hxstu là hệ thống quản lý trung tâm đào tạo cho
 - Quản lý khóa học và trạng thái khóa học.
 - Quản lý lớp học thuộc khóa học, học viên trong lớp và trạng thái lớp.
 - Quản lý ghi danh học viên vào khóa học/lớp học.
-- AI Copilot mini hỗ trợ 5 nghiệp vụ: tạo học viên, tạo khóa học, cập nhật khóa học, tạo lớp học, ghi danh học viên vào khóa (mọi thao tác ghi đều qua preview → confirm).
+- AI Copilot mini hỗ trợ 4 nghiệp vụ: tạo học viên, tạo khóa học, tạo lớp học trong khóa (WEEKLY/EXAM_PRACTICE), thêm học viên vào lớp học (mọi thao tác ghi đều qua preview → confirm).
 - Lưu phiên chat, lịch sử tin nhắn, action log, audit log và turn event của Copilot.
 - Cô lập dữ liệu theo trung tâm thông qua `tenantId`.
 
@@ -277,13 +277,15 @@ pnpm --filter api exec prisma studio
 
 ## AI Copilot mini
 
-Copilot mini nhận yêu cầu tiếng Việt từ admin. Bản mini **chỉ hỗ trợ 5 nghiệp vụ**:
+Copilot mini nhận yêu cầu tiếng Việt từ admin. Bản mini **hỗ trợ 4 nghiệp vụ**:
 
 1. Tạo học viên
 2. Tạo khóa học
-3. Cập nhật khóa học (đổi tên, mã, cấp độ, mô tả, ngày bắt đầu/kết thúc của khóa đang chọn/vừa tạo)
-4. Tạo lớp học trong khóa (chỉ cần khóa + tên lớp, các field phụ để trống/cập nhật sau)
-5. Ghi danh học viên vào khóa
+3. Tạo lớp học trong khóa — 2 loại: `WEEKLY` (học theo tuần), `EXAM_PRACTICE` (luyện đề)
+4. Thêm/ghi danh học viên vào **lớp học** (`assign_student_to_class`)
+
+Ghi danh luôn thực hiện ở cấp LỚP; user nói "thêm vào khóa X" sẽ được hỏi lại
+lớp cụ thể (không tự chọn lớp).
 
 Xem chi tiết trong:
 
@@ -293,15 +295,21 @@ Xem chi tiết trong:
 
 ### Scope
 
-Trong mini mode (`AGENT_MINI_MODE=true`), các tool sửa/xóa/đóng (`update_student`,
-`delete_students`, `delete_courses`, `update_class`,
-`close_class`, `remove_student_from_*`) bị **ẩn khỏi LLM và bị chặn ở backend**.
+Trong mini mode (`AGENT_MINI_MODE=true`), mọi tool ngoài 4 nghiệp vụ trên
+(`update_student`, `update_course`, `delete_students`, `delete_courses`,
+`update_class`, `close_class`, `assign_student_to_course`,
+`remove_student_from_*`) bị **ẩn khỏi LLM và bị chặn ở backend** (cả khi tạo
+pending lẫn khi confirm). User yêu cầu ngoài phạm vi sẽ nhận câu trả lời
+"Chức năng này chưa được bật trong bản Copilot mini."
 
 ### Tool list (mini)
 
-- READ: `search_student`, `get_student_detail`, `search_course`, `get_course_detail`, `get_course_classes`
-- WRITE: `create_student`, `create_course`, `update_course`, `create_class`, `assign_student_to_course`
+- READ: `search_student`, `get_student_detail`, `search_course`, `get_course_detail`, `get_course_classes`, `search_class`, `get_class_detail`
+- WRITE: `create_student`, `create_course`, `create_class`, `assign_student_to_class`
 - Đặc biệt: `ask_clarification`
+
+Danh sách này khớp 1-1 với `MINI_AGENT_TOOL_NAMES` trong
+`apps/api/src/ai-agent/tool-definitions.ts`.
 
 ### Preview / Confirm flow
 
@@ -311,18 +319,21 @@ Mọi thao tác ghi dữ liệu đều đi qua:
 Tin nhắn người dùng
 -> Load session state + lịch sử chat
 -> AgentRunnerService gọi tool (READ tìm dữ liệu; WRITE tạo pending_write)
--> Backend lưu pending_action + trả preview_card (KHÔNG ghi DB ở /turns)
--> User bấm Xác nhận -> POST /confirm -> ToolRegistryService.execute -> service nghiệp vụ -> DB
+-> Backend lưu pending_action (kèm idempotency_key) + trả preview_card (KHÔNG ghi DB ở /turns)
+-> User bấm Xác nhận -> POST /confirm { idempotencyKey } -> ToolRegistryService.execute -> service nghiệp vụ -> DB
 -> User bấm Hủy -> POST /cancel -> clear pending_action, không ghi DB
 ```
 
-Agent **không bao giờ tự execute** WRITE trong `/turns`.
+Agent **không bao giờ tự execute** WRITE trong `/turns`. Confirm lặp lại với
+cùng `idempotencyKey` (double-click) không ghi DB lần 2. Khi có `pending_action`,
+FE khóa composer (phase `PREVIEW`) — user chỉ thao tác qua card Xác nhận/Hủy/sửa form.
 
 ### Session lifecycle
 
 - `POST /copilot/sessions`: tạo session mới, state sạch.
 - `GET /copilot/sessions/current`: lấy session ACTIVE mới nhất (tạo mới nếu chưa có / quá TTL).
 - `PATCH /copilot/sessions/:id/close`: đóng session và clear `pending_action`/context.
+- `PATCH /copilot/sessions/:id/title`: đổi tên phiên chat.
 - "Chat mới" ở FE gọi close session cũ + tạo session mới → context không carry-over.
 
 ### Mini mode & config

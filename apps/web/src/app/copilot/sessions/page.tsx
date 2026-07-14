@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import {
   LoaderCircle,
   MessageSquare,
+  Pencil,
   Plus,
   Trash2,
   XCircle,
@@ -25,14 +26,14 @@ type CopilotSession = {
 };
 
 function getErrorMessage(err: unknown, fallback: string): string {
-  if (
-    err &&
-    typeof err === 'object' &&
-    'response' in err &&
-    (err as any).response?.data?.message
-  ) {
-    const message = (err as any).response.data.message;
-    return Array.isArray(message) ? message.join(', ') : String(message);
+  if (err && typeof err === 'object' && 'response' in err) {
+    const response = (
+      err as { response?: { data?: { message?: string | string[] } } }
+    ).response;
+    const message = response?.data?.message;
+    if (message) {
+      return Array.isArray(message) ? message.join(', ') : String(message);
+    }
   }
   return fallback;
 }
@@ -71,7 +72,10 @@ export default function CopilotSessionsPage() {
   }, []);
 
   useEffect(() => {
-    void fetchSessions();
+    const timer = window.setTimeout(() => {
+      void fetchSessions();
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [fetchSessions]);
 
   const openSession = useCallback(
@@ -111,6 +115,37 @@ export default function CopilotSessionsPage() {
       );
     } catch (err: unknown) {
       setError(getErrorMessage(err, 'Không thể đóng phiên chat'));
+    } finally {
+      setBusyId(null);
+    }
+  }, []);
+
+  const renameSession = useCallback(async (session: CopilotSession) => {
+    const nextTitle =
+      typeof window !== 'undefined'
+        ? window.prompt('Tên mới cho phiên chat:', session.title || '')
+        : null;
+    if (nextTitle === null) return; // user bấm Hủy
+    const trimmed = nextTitle.trim();
+    if (!trimmed || trimmed === session.title) return;
+
+    setBusyId(session.id);
+    setError('');
+    try {
+      const res = await apiClient.patch(
+        `/copilot/sessions/${session.id}/title`,
+        { title: trimmed },
+      );
+      const updated = res.data as CopilotSession;
+      setSessions((current) =>
+        current.map((item) =>
+          item.id === session.id
+            ? { ...item, title: updated.title ?? trimmed }
+            : item,
+        ),
+      );
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Không thể đổi tên phiên chat'));
     } finally {
       setBusyId(null);
     }
@@ -231,6 +266,15 @@ export default function CopilotSessionsPage() {
                   </button>
 
                   <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() => renameSession(session)}
+                      disabled={isBusy}
+                      title="Đổi tên phiên"
+                      className="rounded-lg p-2 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                      <Pencil size={16} />
+                    </button>
                     {isActive && (
                       <button
                         type="button"

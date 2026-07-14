@@ -50,6 +50,19 @@ export type AgentRunResult =
 
 const MAX_TOOL_LOOPS = 5;
 
+/**
+ * Câu text thuần của model tự tuyên bố ĐÃ thực hiện xong một thao tác ghi.
+ * Agent runner KHÔNG BAO GIỜ tự execute write tool (mọi write đều phải qua
+ * preview + confirm ở CopilotService), nên câu khớp pattern này chắc chắn là
+ * kết quả bịa (hallucination) -> phải chặn trước khi trả về user.
+ */
+const FAKE_WRITE_SUCCESS_RE =
+  /(đã|vừa)\s+(được\s+)?(thêm|tạo|cập nhật|sửa|xóa|xoá|ghi danh|gán|đóng|hủy|huỷ|lưu|thực hiện)[\s\S]{0,160}?(thành công|hoàn tất)/iu;
+
+const FAKE_WRITE_SUCCESS_REPLACEMENT =
+  'Mình CHƯA thực hiện thao tác nào cả — mọi thao tác ghi dữ liệu đều cần bạn xác nhận trên thẻ xem trước trước khi chạy. ' +
+  'Bạn nói lại yêu cầu cụ thể (tên học viên, tên lớp/khóa...) để mình chuẩn bị thao tác nhé.';
+
 @Injectable()
 export class AgentRunnerService {
   private readonly logger = new Logger(AgentRunnerService.name);
@@ -93,7 +106,7 @@ export class AgentRunnerService {
         return {
           type: 'text',
           message:
-            modelResult.content?.trim() ||
+            this.sanitizeModelText(modelResult.content) ||
             this.messageFromReadResult(lastReadResult),
           contextPatch: this.contextPatchFromReadResult(lastReadResult),
         };
@@ -177,6 +190,22 @@ export class AgentRunnerService {
     };
   }
 
+  /**
+   * Chặn model bịa kết quả: text thuần tuyên bố "đã ... thành công" trong khi
+   * runner chưa hề execute write tool nào -> thay bằng câu trả lời trung thực.
+   */
+  private sanitizeModelText(content?: string): string {
+    const text = content?.trim() || '';
+    if (!text) return '';
+    if (FAKE_WRITE_SUCCESS_RE.test(text)) {
+      this.logger.warn(
+        `Chặn message bịa kết quả write từ model: "${text.slice(0, 120)}"`,
+      );
+      return FAKE_WRITE_SUCCESS_REPLACEMENT;
+    }
+    return text;
+  }
+
   private buildClarification(
     args: Record<string, unknown>,
   ): PendingClarification {
@@ -210,14 +239,7 @@ export class AgentRunnerService {
 
     if (toolName === 'create_course') {
       const name = String(args.title ?? args.name ?? '').trim();
-      const parts = [`Tạo khóa học mới${name ? `: ${name}` : ''}`];
-      const startDate = args.startDate ?? args.start_date;
-      const expireDate = args.expireDate ?? args.endDate ?? args.expire_date;
-      if (startDate)
-        parts.push(`Ngày bắt đầu: ${this.formatDateVN(startDate)}`);
-      if (expireDate)
-        parts.push(`Ngày kết thúc: ${this.formatDateVN(expireDate)}`);
-      return parts.join('. ');
+      return `Tạo khóa học mới${name ? `: ${name}` : ''}`;
     }
 
     if (toolName === 'create_class') {
@@ -252,15 +274,6 @@ export class AgentRunnerService {
       get_class_students: 'Xem học viên trong lớp',
     };
     return `${labels[toolName] || toolName}: ${JSON.stringify(args)}`;
-  }
-
-  private formatDateVN(value: unknown): string {
-    if (typeof value !== 'string' || !value.trim()) return String(value ?? '');
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) return value;
-    const day = String(date.getUTCDate()).padStart(2, '0');
-    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
-    return `${day}/${month}/${date.getUTCFullYear()}`;
   }
 
   private isDangerTool(toolName: AiToolName): boolean {

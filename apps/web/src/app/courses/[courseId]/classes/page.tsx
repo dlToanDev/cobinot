@@ -14,8 +14,12 @@ export default function CourseClassesPage() {
 
   const [course, setCourse] = useState<any>(null);
   const [classes, setClasses] = useState<any[]>([]);
+  const [allCourses, setAllCourses] = useState<
+    Array<{ id: number; title: string; courseCode?: string | null }>
+  >([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [saving, setSaving] = useState(false);
 
   // Modals & Sub-state
   const [showCreate, setShowCreate] = useState(false);
@@ -27,6 +31,8 @@ export default function CourseClassesPage() {
   const [classCodeTouched, setClassCodeTouched] = useState(false);
   const [title, setTitle] = useState("");
   const [type, setType] = useState("WEEKLY");
+  // Khóa học cha của lớp trong form sửa (cho phép chuyển lớp sang khóa khác).
+  const [formCourseId, setFormCourseId] = useState<number>(0);
   const [teacherName, setTeacherName] = useState("");
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
@@ -42,12 +48,16 @@ export default function CourseClassesPage() {
     setLoading(true);
     setError("");
     try {
-      const [courseRes, classesRes] = await Promise.all([
+      const [courseRes, classesRes, allCoursesRes] = await Promise.all([
         apiClient.get(`/courses/${courseId}`),
         apiClient.get(`/courses/${courseId}/classes`),
+        apiClient.get("/courses"),
       ]);
       setCourse(courseRes.data);
       setClasses(classesRes.data);
+      setAllCourses(
+        Array.isArray(allCoursesRes.data) ? allCoursesRes.data : [],
+      );
     } catch (err: any) {
       setError(
         err.response?.data?.message || "Không thể tải dữ liệu lớp học"
@@ -69,6 +79,7 @@ export default function CourseClassesPage() {
   const handleCreateClass = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setSaving(true);
     try {
       const normalizedClassCode =
         normalizeGeneratedCode(classCode) || buildClassCode(title, type);
@@ -87,16 +98,22 @@ export default function CourseClassesPage() {
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi tạo lớp học";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleUpdateClass = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setSaving(true);
     try {
       const normalizedClassCode =
         normalizeGeneratedCode(classCode) || buildClassCode(title, type);
+      const movedToOtherCourse =
+        formCourseId > 0 && formCourseId !== courseId;
       await apiClient.patch(`/classes/${showEdit.id}`, {
+        courseId: formCourseId > 0 ? formCourseId : undefined,
         classCode: normalizedClassCode,
         title,
         type,
@@ -108,9 +125,19 @@ export default function CourseClassesPage() {
       setShowEdit(null);
       resetClassForm();
       await refreshClasses();
+      if (movedToOtherCourse) {
+        const targetCourse = allCourses.find(
+          (item) => Number(item.id) === formCourseId,
+        );
+        alert(
+          `Lớp đã được chuyển sang khóa "${targetCourse?.title || `#${formCourseId}`}".`,
+        );
+      }
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi cập nhật lớp học";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -134,16 +161,27 @@ export default function CourseClassesPage() {
     setStartDate("");
     setEndDate("");
     setDescription("");
+    setFormCourseId(courseId);
   };
 
-  const buildClassCode = (nextTitle: string, nextType: string) =>
-    generateClassCode({
-      courseCode: course?.courseCode,
-      courseTitle: course?.title,
+  // Sinh mã lớp theo khóa đang chọn trong form (mặc định là khóa của trang).
+  const resolveFormCourse = (nextCourseId: number = formCourseId) =>
+    allCourses.find((item) => Number(item.id) === nextCourseId) || course;
+
+  const buildClassCode = (
+    nextTitle: string,
+    nextType: string,
+    nextCourseId: number = formCourseId,
+  ) => {
+    const formCourse = resolveFormCourse(nextCourseId);
+    return generateClassCode({
+      courseCode: formCourse?.courseCode,
+      courseTitle: formCourse?.title,
       classTitle: nextTitle,
       classType: nextType,
       includeClassType: Boolean(nextType),
     });
+  };
 
   const handleClassTitleChange = (value: string) => {
     setTitle(value);
@@ -156,6 +194,15 @@ export default function CourseClassesPage() {
     setType(value);
     if (!classCodeTouched) {
       setClassCode(buildClassCode(title, value));
+    }
+  };
+
+  const handleClassCourseChange = (value: string) => {
+    const nextCourseId = Number(value) || 0;
+    setFormCourseId(nextCourseId);
+    // User chưa chỉnh tay mã lớp -> sinh lại theo khóa mới + tên + loại lớp.
+    if (!classCodeTouched) {
+      setClassCode(buildClassCode(title, type, nextCourseId));
     }
   };
 
@@ -299,11 +346,18 @@ export default function CourseClassesPage() {
                           </Link>
                           <button
                             onClick={() => {
+                              const clsCourseId = Number(cls.courseId) || courseId;
                               setShowEdit(cls);
                               setClassCode(cls.classCode);
-                              setClassCodeTouched(true);
+                              // Mã đang đúng dạng tự sinh -> cho phép sinh lại khi
+                              // đổi khóa/tên/loại; mã đã chỉnh tay -> giữ nguyên.
+                              setClassCodeTouched(
+                                cls.classCode !==
+                                  buildClassCode(cls.title, cls.type, clsCourseId),
+                              );
                               setTitle(cls.title);
                               setType(cls.type);
+                              setFormCourseId(clsCourseId);
                               setTeacherName(cls.teacherName || "");
                               setStartDate(cls.startDate ? cls.startDate.substring(0, 10) : "");
                               setEndDate(cls.endDate ? cls.endDate.substring(0, 10) : "");
@@ -370,8 +424,8 @@ export default function CourseClassesPage() {
                     onChange={(e) => handleClassTypeChange(e.target.value)}
                     className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
                   >
-                    <option value="WEEKLY">WEEKLY</option>
-                    <option value="PRACTICE">PRACTICE</option>
+                    <option value="WEEKLY">Học theo tuần (WEEKLY)</option>
+                    <option value="EXAM_PRACTICE">Luyện đề (EXAM_PRACTICE)</option>
                   </select>
                 </div>
                 <div>
@@ -425,9 +479,10 @@ export default function CourseClassesPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Lưu lớp học
+                  {saving ? "Đang lưu..." : "Lưu lớp học"}
                 </button>
               </div>
             </form>
@@ -443,6 +498,25 @@ export default function CourseClassesPage() {
               Chỉnh Sửa Lớp Học
             </h3>
             <form onSubmit={handleUpdateClass} className="space-y-4">
+              <div>
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">
+                  Khóa học <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={formCourseId || ""}
+                  onChange={(e) => handleClassCourseChange(e.target.value)}
+                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                  required
+                >
+                  {allCourses.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.courseCode
+                        ? `${item.title} (${item.courseCode})`
+                        : item.title}
+                    </option>
+                  ))}
+                </select>
+              </div>
               <div className="grid grid-cols-2 gap-4">
                 <div>
                   <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Mã lớp học *</label>
@@ -473,8 +547,8 @@ export default function CourseClassesPage() {
                     onChange={(e) => handleClassTypeChange(e.target.value)}
                     className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
                   >
-                    <option value="WEEKLY">WEEKLY</option>
-                    <option value="PRACTICE">PRACTICE</option>
+                    <option value="WEEKLY">Học theo tuần (WEEKLY)</option>
+                    <option value="EXAM_PRACTICE">Luyện đề (EXAM_PRACTICE)</option>
                   </select>
                 </div>
                 <div>
@@ -526,9 +600,10 @@ export default function CourseClassesPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Cập nhật
+                  {saving ? "Đang lưu..." : "Cập nhật"}
                 </button>
               </div>
             </form>

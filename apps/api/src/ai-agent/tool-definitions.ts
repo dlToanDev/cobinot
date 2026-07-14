@@ -249,7 +249,7 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
     function: {
       name: 'create_course',
       description:
-        'Tạo khóa học mới. Nếu user cung cấp ngày bắt đầu/kết thúc, truyền startDate và expireDate dạng YYYY-MM-DD.',
+        'Tạo khóa học mới. Khóa học KHÔNG có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học (create_class).',
       parameters: {
         type: 'object',
         properties: {
@@ -259,10 +259,6 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
           ),
           description: stringField('Mô tả khóa học'),
           level: stringField('Cấp độ khóa học'),
-          startDate: stringField('Ngày bắt đầu khóa học, định dạng YYYY-MM-DD'),
-          expireDate: stringField(
-            'Ngày kết thúc/hết hạn khóa học, định dạng YYYY-MM-DD',
-          ),
         },
         required: ['title'],
       },
@@ -273,7 +269,7 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
     function: {
       name: 'update_course',
       description:
-        'Cập nhật thông tin khóa học đang chọn/vừa tạo. Chỉ truyền các field cần đổi; ngày dạng YYYY-MM-DD.',
+        'Cập nhật thông tin khóa học đang chọn/vừa tạo. Chỉ truyền các field cần đổi. Khóa học KHÔNG có ngày — muốn đổi ngày hãy dùng update_class.',
       parameters: {
         type: 'object',
         properties: {
@@ -283,11 +279,6 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
           description: stringField('Mô tả mới'),
           level: stringField('Cấp độ mới, ví dụ "Cấp độ 1", "Cơ bản"'),
           status: stringField('Trạng thái mới nếu có'),
-          startDate: stringField('Ngày bắt đầu mới, định dạng YYYY-MM-DD'),
-          expireDate: stringField(
-            'Ngày kết thúc/hết hạn mới, định dạng YYYY-MM-DD',
-          ),
-          endDate: stringField('Bí danh của expireDate (YYYY-MM-DD)'),
         },
         required: ['courseId'],
       },
@@ -472,9 +463,12 @@ export function isWriteTool(name: unknown): name is AiToolName {
 }
 
 /**
- * Danh sách tool được phép trong bản Copilot mini (3 nghiệp vụ):
- * tạo học viên, tạo khóa học, ghi danh học viên vào khóa.
- * READ đủ để tìm học viên/khóa và map course -> class.
+ * Danh sách tool được phép trong bản Copilot mini — 7 nghiệp vụ:
+ * tạo học viên, tạo khóa học, tạo lớp học trong khóa (WEEKLY/EXAM_PRACTICE),
+ * thêm học viên vào LỚP học (assign_student_to_class),
+ * và sửa thông tin học viên/khóa học/lớp học (update_*).
+ * Ghi danh cấp khóa (assign_student_to_course) KHÔNG expose để LLM không gọi nhầm;
+ * mọi tool xóa/đóng/gỡ vẫn bị chặn.
  */
 export const MINI_AGENT_TOOL_NAMES = [
   'search_student',
@@ -482,11 +476,15 @@ export const MINI_AGENT_TOOL_NAMES = [
   'search_course',
   'get_course_detail',
   'get_course_classes',
+  'search_class',
+  'get_class_detail',
   'create_student',
   'create_course',
-  'update_course',
   'create_class',
-  'assign_student_to_course',
+  'update_student',
+  'update_course',
+  'update_class',
+  'assign_student_to_class',
   'ask_clarification',
 ] as const;
 

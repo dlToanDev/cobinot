@@ -4,6 +4,7 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import {
   AgentRunnerService,
   AgentRunResult,
@@ -17,6 +18,7 @@ import {
   EntityOption,
   PendingAction,
   PendingEnrollmentContext,
+  ProactiveSuggestion,
   SuggestionAction,
 } from '../ai-agent/decision.types';
 import { ToolRegistryService } from '../ai-agent/tool-registry.service';
@@ -129,6 +131,36 @@ export class CopilotService {
     });
   }
 
+  /**
+   * Mở lại phiên đã đóng để user nhắn tiếp trong đoạn chat cũ. State đã được
+   * reset sạch lúc close nên không có pending_action cũ nào sống lại — an toàn.
+   */
+  async reopenSession(tenantId: number, userId: number, id: number) {
+    const session = await this.findSession(tenantId, userId, id);
+    if (session.status === 'ACTIVE') return session;
+    return this.prisma.aiAgentSession.update({
+      where: { id },
+      data: { status: 'ACTIVE' },
+    });
+  }
+
+  async renameSession(
+    tenantId: number,
+    userId: number,
+    id: number,
+    title: string,
+  ) {
+    await this.findSession(tenantId, userId, id);
+    const trimmed = title.trim();
+    if (!trimmed) {
+      throw new BadRequestException('Tên phiên chat không được để trống');
+    }
+    return this.prisma.aiAgentSession.update({
+      where: { id },
+      data: { title: trimmed },
+    });
+  }
+
   async deleteSession(tenantId: number, userId: number, id: number) {
     await this.findSession(tenantId, userId, id);
     return this.prisma.aiAgentSession.delete({ where: { id } });
@@ -200,18 +232,18 @@ export class CopilotService {
       return this.cancel(actor, sessionId);
     }
 
-    // Đang chờ user trả lời sau khi phát hiện trùng học viên.
+    // Đang chờ user trả lời sau khi phát hiện trùng học viên: state machine xử lý
+    // TRỌN VẸN ở backend (1/2/3, nhập thẳng email/SĐT mới, câu không hiểu) —
+    // KHÔNG rơi xuống model để tránh lặp lại cảnh báo trùng.
     if (state.duplicate_student_context) {
       const handled = await this.handleDuplicateStudentReply(
+        actor,
         sessionId,
         state,
         content,
         userMessage.id,
         startedAt,
       );
-      // Case A (hủy) / Case C (dùng học viên có sẵn) đã được xử lý xong.
-      // Case B (nhập email/SĐT khác) trả null -> để agent xử lý tiếp create_student
-      // với duplicate_student_context vẫn còn để dẫn hướng prompt.
       if (handled) return handled;
     }
 
@@ -245,6 +277,14 @@ export class CopilotService {
     // giống flow chat thường (lưu pending_action rồi trả preview_card).
     const suggestionPending = this.pendingActionFromSuggestion(action);
     if (suggestionPending) {
+      if (state.pending_action) {
+        return this.blockNewWriteWhilePending(
+          sessionId,
+          state,
+          userMessage.id,
+          startedAt,
+        );
+      }
       return this.savePendingWriteTurn({
         actor,
         sessionId,
@@ -253,6 +293,57 @@ export class CopilotService {
         userMessageId: userMessage.id,
         startedAt,
       });
+    }
+
+    if (state.pending_action) {
+      const draftPatch = this.extractPendingDraftPatch(
+        state.pending_action.tool_name,
+        content,
+      );
+      if (draftPatch) {
+        return this.saveDraftUpdateTurn({
+          sessionId,
+          state,
+          pending: state.pending_action,
+          inputPatch: draftPatch,
+          userMessageId: userMessage.id,
+          startedAt,
+        });
+      }
+
+      // Bản nháp create_student + user chat thông tin KHÔNG kèm marker
+      // ("Hoang Van A, hva@gmail.com, 0987..., 12/03/2000, Ninh Bình")
+      // -> parse deterministic rồi merge vào bản nháp thay vì chặn lại.
+      // Chỉ nhận khi có tín hiệu cứng (email/sđt/ngày sinh) để câu chat
+      // thường không bị hiểu nhầm thành tên.
+      if (state.pending_action.tool_name === 'create_student') {
+        const parsed = this.deterministic.parseStudentInfo(content);
+        if (parsed.email || parsed.phone || parsed.birthDate) {
+          const studentPatch: Record<string, unknown> = {};
+          if (parsed.fullName) studentPatch.fullName = parsed.fullName;
+          if (parsed.email) studentPatch.email = parsed.email;
+          if (parsed.phone) studentPatch.phone = parsed.phone;
+          if (parsed.birthDate) studentPatch.birthDate = parsed.birthDate;
+          if (parsed.address) studentPatch.address = parsed.address;
+          return this.saveDraftUpdateTurn({
+            sessionId,
+            state,
+            pending: state.pending_action,
+            inputPatch: studentPatch,
+            userMessageId: userMessage.id,
+            startedAt,
+          });
+        }
+      }
+
+      if (this.isNewWriteIntentWhilePending(content)) {
+        return this.blockNewWriteWhilePending(
+          sessionId,
+          state,
+          userMessage.id,
+          startedAt,
+        );
+      }
     }
 
     // Lớp xử lý deterministic TRƯỚC khi gọi LLM: tìm kiếm / tạo học viên / ghi
@@ -304,6 +395,14 @@ export class CopilotService {
     }
 
     if (result.type === 'pending_write') {
+      if (state.pending_action) {
+        return this.blockNewWriteWhilePending(
+          sessionId,
+          state,
+          userMessage.id,
+          startedAt,
+        );
+      }
       // WRITE tool: KHÔNG execute ngay. Với create_student còn phải kiểm tra
       // trùng email/SĐT trước khi cho preview (xem savePendingWriteTurn).
       return this.savePendingWriteTurn({
@@ -354,7 +453,41 @@ export class CopilotService {
     }
     if (!outcome) return null;
 
+    // Mini mode: lớp deterministic vẫn parse được các intent ngoài phạm vi
+    // (update_course, create_class...) -> trả lời "chưa được bật" thay vì đi
+    // tiếp vào flow đó.
+    if (isAgentMiniMode() && this.isOutcomeOutsideMiniScope(outcome)) {
+      return this.saveMiniModeBlockedTurn({
+        sessionId,
+        state,
+        userMessageId,
+        startedAt,
+      });
+    }
+
+    if (
+      state.pending_action &&
+      (outcome.type === 'student_form' ||
+        outcome.type === 'course_form' ||
+        (outcome.type === 'clarification' && isWriteTool(outcome.intent)))
+    ) {
+      return this.blockNewWriteWhilePending(
+        sessionId,
+        state,
+        userMessageId,
+        startedAt,
+      );
+    }
+
     if (outcome.type === 'pending_write') {
+      if (state.pending_action) {
+        return this.blockNewWriteWhilePending(
+          sessionId,
+          state,
+          userMessageId,
+          startedAt,
+        );
+      }
       return this.savePendingWriteTurn({
         actor,
         sessionId,
@@ -402,6 +535,39 @@ export class CopilotService {
       });
     }
 
+    if (outcome.type === 'student_table') {
+      const response: CopilotResponse = {
+        type: 'student_table',
+        title: outcome.title,
+        message: outcome.message,
+        scope: outcome.scope,
+        students: outcome.students,
+      };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, outcome.contextPatch),
+      });
+    }
+
+    if (outcome.type === 'class_table') {
+      const response: CopilotResponse = {
+        type: 'class_table',
+        title: outcome.title,
+        message: outcome.message,
+        classes: outcome.classes,
+      };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, outcome.contextPatch),
+      });
+    }
+
     const response: CopilotResponse =
       outcome.type === 'clarification'
         ? {
@@ -426,6 +592,7 @@ export class CopilotService {
     actor: ActorPayload,
     sessionId: number,
     input?: Record<string, unknown>,
+    idempotencyKey?: string,
   ) {
     const startedAt = Date.now();
     const session = await this.findActiveSession(
@@ -437,7 +604,39 @@ export class CopilotService {
     const pending = state.pending_action;
 
     if (!pending) {
+      // Double-submit: confirm thứ 2 tới sau khi pending đã execute + clear.
+      // Key khớp với action vừa chạy -> trả thông báo idempotent, KHÔNG ghi DB lần 2.
+      if (
+        idempotencyKey &&
+        state.last_executed_idempotency_key === idempotencyKey
+      ) {
+        const response: CopilotResponse = {
+          type: 'text_message',
+          message:
+            'Thao tác này vừa được thực hiện rồi, mình không thực hiện lại lần nữa.',
+        };
+        return this.saveAssistantTurn({
+          sessionId,
+          startedAt,
+          response,
+          state,
+        });
+      }
       throw new BadRequestException('Không có hành động nào đang chờ xác nhận');
+    }
+
+    // Confirm gửi key của một bản nháp CŨ (không khớp pending hiện tại) -> chặn,
+    // tránh xác nhận nhầm bản nháp đã bị thay thế.
+    if (
+      idempotencyKey &&
+      pending.idempotency_key &&
+      idempotencyKey !== pending.idempotency_key
+    ) {
+      throw new BadRequestException({
+        code: 'IDEMPOTENCY_KEY_MISMATCH',
+        message:
+          'Bản nháp đã thay đổi so với lúc bạn mở preview. Vui lòng kiểm tra lại bản nháp mới nhất rồi xác nhận.',
+      });
     }
 
     // Guard mini mode: pending_action cũ (trước khi bật mini mode) có thể là tool
@@ -489,13 +688,53 @@ export class CopilotService {
       });
     }
 
-    const finalInput = { ...(pending.input || {}), ...(input || {}) };
+    const finalInput = this.normalizePendingInput(pending.tool_name, {
+      ...(pending.input || {}),
+      ...(input || {}),
+    });
+    const validation = this.validatePendingRequired(
+      pending.tool_name,
+      finalInput,
+    );
+    if (validation) {
+      const nextPending: PendingAction = {
+        ...pending,
+        input: finalInput,
+        display_input: finalInput,
+        status: 'validation_error',
+        validation_errors: validation.errors,
+      };
+      const response: CopilotResponse = {
+        ...this.previewResponse(nextPending),
+        status: 'validation_error' as const,
+        message: validation.message,
+      };
+      const nextState = this.mergeState(state, {
+        pending_action: nextPending,
+      });
+      return this.saveAssistantTurn({
+        sessionId,
+        startedAt,
+        response,
+        state: nextState,
+        toolName: pending.tool_name,
+      });
+    }
     try {
       const result = await this.toolRegistry.execute(
         sessionId,
         actor,
         pending.tool_name,
         finalInput,
+      );
+      const patch = this.statePatchFromToolResult(pending.tool_name, result);
+      // Gợi ý bước tiếp theo: vừa tạo lớp -> gợi ý thêm học viên mới tạo gần
+      // đây vào lớp; vừa tạo học viên -> gợi ý thêm vào lớp mới tạo gần nhất.
+      const suggestions = await this.buildPostCreateSuggestions(
+        actor.tenantId,
+        pending.tool_name,
+        state,
+        patch,
       );
       const response: CopilotResponse = {
         type: 'tool_result',
@@ -504,8 +743,8 @@ export class CopilotService {
         status: 'SUCCESS',
         result,
         data: result,
+        ...(suggestions.length ? { suggestions } : {}),
       };
-      const patch = this.statePatchFromToolResult(pending.tool_name, result);
       // Cập nhật đúng khóa "vừa tạo" -> đồng bộ luôn last_created_course để card
       // "khóa vừa tạo" phản ánh dữ liệu mới.
       if (
@@ -522,6 +761,9 @@ export class CopilotService {
         pending_enrollment_context: null,
         pending_class_creation: null,
         last_intent: pending.tool_name,
+        // Ghi nhớ key vừa execute: confirm lặp lại (double-click) sẽ được trả
+        // lời idempotent thay vì ghi DB lần 2.
+        last_executed_idempotency_key: pending.idempotency_key || null,
       });
 
       return this.saveAssistantTurn({
@@ -683,6 +925,60 @@ export class CopilotService {
     });
   }
 
+  async updatePendingAction(
+    actor: ActorPayload,
+    sessionId: number,
+    body: {
+      inputPatch?: Record<string, unknown>;
+      input?: Record<string, unknown>;
+    },
+  ) {
+    const session = await this.findActiveSession(
+      actor.tenantId,
+      actor.userId,
+      sessionId,
+    );
+    const state = this.normalizeState(session.state);
+    const pending = state.pending_action;
+
+    if (!pending) {
+      throw new BadRequestException({
+        code: 'NO_PENDING_ACTION',
+        message: 'Không có bản nháp nào đang chờ xác nhận.',
+      });
+    }
+
+    const mergedInput = this.normalizePendingInput(pending.tool_name, {
+      ...(pending.input || {}),
+      ...(body.input || {}),
+      ...(body.inputPatch || {}),
+    });
+    const nextPending: PendingAction = {
+      ...pending,
+      input: mergedInput,
+      display_input: mergedInput,
+      status: pending.status === 'validation_error' ? 'draft' : pending.status,
+      validation_errors: undefined,
+    };
+    const nextState = this.mergeState(state, {
+      pending_action: nextPending,
+    });
+    const updated = await this.prisma.aiAgentSession.update({
+      where: { id: sessionId },
+      data: {
+        state: nextState as any,
+        updatedAt: new Date(),
+      },
+    });
+
+    return {
+      session: updated,
+      state: updated.state,
+      phase: this.phaseFromState(nextState),
+      response: this.previewResponse(nextPending),
+    };
+  }
+
   async mergeSessionState(
     tenantId: number,
     userId: number,
@@ -791,7 +1087,9 @@ export class CopilotService {
     };
   }
 
-  private previewResponse(pendingAction: PendingAction): CopilotResponse {
+  private previewResponse(
+    pendingAction: PendingAction,
+  ): Extract<CopilotResponse, { type: 'preview_card' }> {
     return {
       type: 'preview_card',
       status: 'waiting_confirm',
@@ -847,11 +1145,6 @@ export class CopilotService {
         '',
         bullet('Tên khóa', row.title || row.name),
         bullet('Mã khóa', row.courseCode || row.code),
-        bullet('Ngày bắt đầu', this.formatDateVi(row.startDate)),
-        bullet(
-          'Ngày kết thúc',
-          this.formatDateVi(row.expireDate ?? row.endDate),
-        ),
         bullet('ID', row.id),
       ]
         .filter((line) => line !== null)
@@ -867,8 +1160,6 @@ export class CopilotService {
         bullet('Cấp độ', row.level),
         bullet('Mô tả', row.description),
         bullet('Trạng thái', row.status),
-        bullet('Ngày bắt đầu', this.formatDateVi(row.startDate)),
-        bullet('Ngày kết thúc', this.formatDateVi(row.expireDate ?? row.endDate)),
         bullet('ID', row.id),
       ]
         .filter((line) => line !== null)
@@ -878,10 +1169,7 @@ export class CopilotService {
     if (toolName === 'create_class') {
       const scheduleLines = this.formatClassSessionLines(row.sessions);
       const hasExtra =
-        row.teacherName ||
-        row.startDate ||
-        row.endDate ||
-        scheduleLines.length;
+        row.teacherName || row.startDate || row.endDate || scheduleLines.length;
       return [
         'Đã tạo lớp học thành công.',
         '',
@@ -899,6 +1187,25 @@ export class CopilotService {
         hasExtra
           ? null
           : '\nBạn có thể cập nhật giáo viên, ngày học và lịch học sau.',
+      ]
+        .filter((line) => line !== null)
+        .join('\n');
+    }
+
+    if (toolName === 'assign_student_to_class') {
+      const studentName =
+        row.user?.fullName || row.user?.name || `#${row.userId}`;
+      const className =
+        row.courseClass?.title || row.courseClass?.name || `#${row.classId}`;
+      const courseName =
+        row.courseClass?.course?.title || row.courseClass?.course?.name;
+      return [
+        'Đã thêm học viên vào lớp thành công.',
+        '',
+        bullet('Học viên', studentName),
+        bullet('Lớp', className),
+        bullet('Khóa', courseName),
+        bullet('Vai trò', row.roleInClass),
       ]
         .filter((line) => line !== null)
         .join('\n');
@@ -965,6 +1272,7 @@ export class CopilotService {
       create_student: 'Tạo học viên mới',
       create_course: 'Tạo khóa học mới',
       create_class: 'Tạo lớp học mới',
+      assign_student_to_class: 'Thêm học viên vào lớp học',
       assign_student_to_course: 'Ghi danh học viên vào khóa học',
     };
     return {
@@ -974,12 +1282,501 @@ export class CopilotService {
       summary: summaries[action.action] || `Chuẩn bị chạy ${action.action}`,
       intent: action.action,
       status: 'waiting_confirm',
+      source: action.source,
+      draftId: action.draftId,
       severity: ['delete_students', 'delete_courses', 'close_class'].includes(
         action.action,
       )
         ? 'danger'
         : 'default',
     };
+  }
+
+  private async saveDraftUpdateTurn(params: {
+    sessionId: number;
+    state: DecisionContext;
+    pending: PendingAction;
+    inputPatch: Record<string, unknown>;
+    userMessageId?: number;
+    startedAt: number;
+  }) {
+    const input = this.normalizePendingInput(params.pending.tool_name, {
+      ...(params.pending.input || {}),
+      ...params.inputPatch,
+    });
+    const nextPending: PendingAction = {
+      ...params.pending,
+      input,
+      display_input: input,
+      status: 'draft',
+      validation_errors: undefined,
+    };
+    const response: CopilotResponse = {
+      ...this.previewResponse(nextPending),
+      message:
+        'Mình đã cập nhật bản nháp. Bạn kiểm tra lại rồi bấm Xác nhận nếu đúng.',
+    };
+    return this.saveAssistantTurn({
+      sessionId: params.sessionId,
+      userMessageId: params.userMessageId,
+      startedAt: params.startedAt,
+      response,
+      state: this.mergeState(params.state, {
+        pending_action: nextPending,
+      }),
+      toolName: params.pending.tool_name,
+    });
+  }
+
+  private blockNewWriteWhilePending(
+    sessionId: number,
+    state: DecisionContext,
+    userMessageId: number | undefined,
+    startedAt: number,
+  ) {
+    const response: CopilotResponse = {
+      type: 'clarification',
+      message:
+        'Bạn đang có một bản nháp chưa xác nhận. Bạn muốn xác nhận, hủy, sửa bản nháp hiện tại hay tạo thao tác mới?',
+      missing_fields: [],
+      intent: state.pending_action?.tool_name || 'unknown',
+      entities: {},
+    };
+    return this.saveAssistantTurn({
+      sessionId,
+      userMessageId,
+      startedAt,
+      response,
+      state,
+    });
+  }
+
+  private extractPendingDraftPatch(
+    toolName: AiToolName,
+    content: string,
+  ): Record<string, unknown> | null {
+    const patch: Record<string, unknown> = {};
+    if (toolName === 'create_student') {
+      this.assignMatchedValue(patch, 'email', content, [
+        'sửa email thành',
+        'đổi email thành',
+        'email là',
+        'email:',
+      ]);
+      this.assignMatchedValue(patch, 'fullName', content, [
+        'sửa tên thành',
+        'đổi tên thành',
+        'họ tên là',
+        'tên là',
+      ]);
+      this.assignMatchedValue(patch, 'phone', content, [
+        'số điện thoại là',
+        'sdt là',
+        'sđt là',
+        'phone là',
+      ]);
+      this.assignMatchedValue(patch, 'birthDate', content, ['ngày sinh là']);
+      this.assignMatchedValue(patch, 'address', content, ['địa chỉ là']);
+      // "ngày sinh là 17/07/1998" -> chuẩn hóa về ISO cho Prisma.
+      if (typeof patch.birthDate === 'string') {
+        const iso = this.deterministic.parseViDate(patch.birthDate);
+        if (iso) patch.birthDate = iso;
+      }
+    }
+
+    if (toolName === 'create_course') {
+      this.assignMatchedValue(patch, 'title', content, [
+        'đổi tên khóa thành',
+        'tên khóa là',
+      ]);
+      this.assignMatchedValue(patch, 'courseCode', content, [
+        'mã khóa là',
+        'mã khóa học là',
+      ]);
+      this.assignMatchedValue(patch, 'level', content, [
+        'cấp độ là',
+        'level là',
+      ]);
+      this.assignMatchedValue(patch, 'description', content, ['mô tả là']);
+      // Khóa học KHÔNG có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học.
+    }
+
+    if (toolName === 'create_class' || toolName === 'update_class') {
+      this.assignMatchedValue(patch, 'title', content, [
+        'đổi tên lớp thành',
+        'tên lớp là',
+      ]);
+      this.assignMatchedValue(patch, 'classCode', content, ['mã lớp là']);
+      this.assignMatchedValue(patch, 'teacherName', content, ['giáo viên là']);
+      this.assignMatchedValue(patch, 'description', content, ['mô tả là']);
+      // Ngày: hiểu cả "ngày bắt đầu là ...", "từ hôm nay đến ngày 30/07"...
+      // ("hôm nay" = ngày hiện tại, thiếu năm -> năm hiện tại). Luôn trả ISO.
+      const range = this.deterministic.parseClassDateRange(content);
+      if (range.startDate) patch.startDate = range.startDate;
+      if (range.endDate) patch.endDate = range.endDate;
+      this.assignMatchedValue(patch, 'courseId', content, [
+        'courseid là',
+        'mã khóa là',
+        'chọn khóa',
+        'thuộc khóa',
+      ]);
+      const classType = this.extractClassType(content);
+      if (classType) patch.classType = classType;
+    }
+
+    return Object.keys(patch).length > 0 ? patch : null;
+  }
+
+  private assignMatchedValue(
+    patch: Record<string, unknown>,
+    key: string,
+    content: string,
+    markers: string[],
+  ) {
+    const value = this.extractValueAfterMarker(content, markers);
+    if (value === null) return;
+    patch[key] =
+      key === 'courseId' ? Number(value.replace(/\D/g, '')) || value : value;
+  }
+
+  // Tất cả marker của mọi field: dùng để CẮT value tại marker kế tiếp
+  // ("tên là A, sdt là 09..." -> tên chỉ lấy "A", không ăn cả phần sdt).
+  private static readonly DRAFT_FIELD_MARKERS = [
+    'sửa email thành',
+    'đổi email thành',
+    'email là',
+    'email:',
+    'sửa tên thành',
+    'đổi tên thành',
+    'họ tên là',
+    'tên là',
+    'số điện thoại là',
+    'sdt là',
+    'sđt là',
+    'phone là',
+    'ngày sinh là',
+    'địa chỉ là',
+    'đổi tên khóa thành',
+    'tên khóa là',
+    'mã khóa là',
+    'mã khóa học là',
+    'cấp độ là',
+    'level là',
+    'mô tả là',
+    'ngày bắt đầu là',
+    'ngày kết thúc là',
+    'đổi tên lớp thành',
+    'tên lớp là',
+    'mã lớp là',
+    'giáo viên là',
+    'courseid là',
+    'chọn khóa',
+    'thuộc khóa',
+  ];
+
+  /** Segment (ngăn bởi dấu phẩy) trông như dữ liệu field khác (email/sđt/ngày)? */
+  private looksLikeFieldData(segment: string) {
+    if (!segment) return false;
+    if (/^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i.test(segment)) return true;
+    if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/.test(segment)) return true;
+    const digits = segment.replace(/\D/g, '');
+    if (
+      digits.length >= 9 &&
+      digits.length <= 12 &&
+      /^[\d\s+.()\-]+$/.test(segment)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  private extractValueAfterMarker(content: string, markers: string[]) {
+    const lower = content.toLowerCase();
+    for (const marker of markers) {
+      const index = lower.indexOf(marker);
+      if (index < 0) continue;
+      let value = content
+        .slice(index + marker.length)
+        .trim()
+        .replace(/^[:=\-\s]+/, '')
+        .trim();
+
+      // Value kết thúc TRƯỚC marker của field khác trong cùng câu.
+      const valueLower = value.toLowerCase();
+      let cut = value.length;
+      for (const other of CopilotService.DRAFT_FIELD_MARKERS) {
+        const otherIndex = valueLower.indexOf(other);
+        if (otherIndex >= 0 && otherIndex < cut) cut = otherIndex;
+      }
+      value = value.slice(0, cut);
+
+      // Bỏ các đoạn đuôi sau dấu phẩy trông như dữ liệu field khác
+      // ("tên là A, 0987xxxxxx" -> tên chỉ giữ "A").
+      const segments = value.split(',').map((s) => s.trim());
+      const kept: string[] = [];
+      for (const segment of segments) {
+        if (kept.length > 0 && this.looksLikeFieldData(segment)) break;
+        if (segment) kept.push(segment);
+      }
+      value = kept
+        .join(', ')
+        .replace(/[\s,;:]+$/, '')
+        .trim();
+      return value || null;
+    }
+    return null;
+  }
+
+  private extractClassType(content: string) {
+    const text = this.normalizeVietnamese(content);
+    if (text.includes('theo tuan') || text.includes('weekly')) {
+      return 'WEEKLY';
+    }
+    if (
+      text.includes('luyen de') ||
+      text.includes('exam prep') ||
+      text.includes('exam practice')
+    ) {
+      return 'EXAM_PRACTICE';
+    }
+    return null;
+  }
+
+  private normalizePendingInput(
+    toolName: AiToolName,
+    input: Record<string, unknown>,
+  ) {
+    if (toolName !== 'create_class') return input;
+    const next = { ...input };
+    const classType = this.extractInputString(next.classType ?? next.type);
+    const normalizedType = classType ? this.normalizeClassType(classType) : '';
+    if (normalizedType) {
+      next.classType = normalizedType;
+      next.type = normalizedType;
+    }
+    return next;
+  }
+
+  private normalizeClassType(value: string) {
+    const text = this.normalizeVietnamese(value);
+    if (text === 'weekly' || text.includes('theo tuan')) return 'WEEKLY';
+    if (
+      text === 'exam_prep' ||
+      text === 'exam prep' ||
+      text === 'exam_practice' ||
+      text === 'exam practice' ||
+      text.includes('luyen de')
+    ) {
+      return 'EXAM_PRACTICE';
+    }
+    return value;
+  }
+
+  private validatePendingRequired(
+    toolName: AiToolName,
+    input: Record<string, unknown>,
+  ): { message: string; errors: Record<string, string> } | null {
+    const hasText = (key: string) =>
+      Boolean(this.extractInputString(input[key]));
+    if (toolName === 'create_student' && !hasText('fullName')) {
+      return {
+        message: 'Vui lòng nhập họ và tên học viên.',
+        errors: { fullName: 'Vui lòng nhập họ và tên học viên.' },
+      };
+    }
+    if (toolName === 'create_course' && !hasText('title')) {
+      return {
+        message: 'Vui lòng nhập tên khóa học.',
+        errors: { title: 'Vui lòng nhập tên khóa học.' },
+      };
+    }
+    if (toolName === 'create_class') {
+      if (!Number(input.courseId || 0)) {
+        return {
+          message: 'Vui lòng chọn khóa học.',
+          errors: { courseId: 'Vui lòng chọn khóa học.' },
+        };
+      }
+      if (!hasText('title')) {
+        return {
+          message: 'Vui lòng nhập tên lớp học.',
+          errors: { title: 'Vui lòng nhập tên lớp học.' },
+        };
+      }
+      if (!hasText('classType') && !hasText('type')) {
+        return {
+          message: 'Vui lòng chọn loại lớp.',
+          errors: { classType: 'Vui lòng chọn loại lớp.' },
+        };
+      }
+    }
+    if (toolName === 'assign_student_to_class') {
+      if (!Number(input.userId || 0)) {
+        return {
+          message: 'Vui lòng chọn học viên.',
+          errors: { userId: 'Vui lòng chọn học viên.' },
+        };
+      }
+      if (!Number(input.classId || 0)) {
+        return {
+          message: 'Vui lòng chọn lớp học.',
+          errors: { classId: 'Vui lòng chọn lớp học.' },
+        };
+      }
+    }
+    return null;
+  }
+
+  private isNewWriteIntentWhilePending(content: string) {
+    const text = this.normalizeVietnamese(content);
+    return [
+      'tao hoc vien',
+      'tao khoa',
+      'tao lop',
+      'ghi danh',
+      'them ',
+      'xoa ',
+      'cap nhat',
+      'sua hoc vien',
+      'sua khoa',
+      'sua lop',
+    ].some((keyword) => text.includes(keyword));
+  }
+
+  private normalizeVietnamese(content: string) {
+    return content
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /** Outcome deterministic có thuộc nghiệp vụ NGOÀI phạm vi mini không. */
+  private isOutcomeOutsideMiniScope(outcome: DeterministicOutcome): boolean {
+    if (
+      outcome.type === 'pending_write' &&
+      !isToolAllowedInMiniMode(outcome.pending.tool_name)
+    ) {
+      return true;
+    }
+    if (
+      outcome.type === 'clarification' &&
+      isWriteTool(outcome.intent) &&
+      !isToolAllowedInMiniMode(outcome.intent)
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Preview update_student/update_course/update_class: lấy dữ liệu hiện tại của
+   * thực thể (theo tenant) làm nền cho display_input, field user muốn đổi đè lên.
+   * Chỉ phục vụ HIỂN THỊ form; input ghi DB vẫn tối thiểu. Lỗi -> giữ display cũ.
+   */
+  private async enrichUpdateDisplayInput(
+    tenantId: number,
+    pending: PendingAction,
+  ): Promise<Record<string, unknown>> {
+    const display = { ...(pending.display_input || pending.input || {}) };
+    const input = pending.input || {};
+    const toDateStr = (value: unknown) => {
+      if (!value) return '';
+      const date = value instanceof Date ? value : new Date(String(value));
+      return Number.isNaN(date.getTime())
+        ? ''
+        : date.toISOString().substring(0, 10);
+    };
+
+    try {
+      if (pending.tool_name === 'update_class') {
+        const id = Number(input.classId) || 0;
+        if (!id) return display;
+        const cls = await this.prisma.courseClass.findFirst({
+          where: { id, tenantId },
+          include: { course: true },
+        });
+        if (!cls) return display;
+        return {
+          title: cls.title,
+          classCode: cls.classCode,
+          classType: cls.type,
+          teacherName: cls.teacherName || '',
+          startDate: toDateStr(cls.startDate),
+          endDate: toDateStr(cls.endDate),
+          status: cls.status,
+          description: cls.description || '',
+          className: cls.title,
+          courseName: cls.course?.title || '',
+          ...display,
+        };
+      }
+
+      if (pending.tool_name === 'update_course') {
+        const id = Number(input.courseId) || 0;
+        if (!id) return display;
+        const course = await this.prisma.course.findFirst({
+          where: { id, tenantId },
+        });
+        if (!course) return display;
+        return {
+          title: course.title,
+          courseCode: course.courseCode,
+          level: course.level || '',
+          description: course.description || '',
+          courseName: course.title,
+          ...display,
+        };
+      }
+
+      if (pending.tool_name === 'update_student') {
+        const id = Number(input.userId ?? input.studentId) || 0;
+        if (!id) return display;
+        const student = await this.prisma.user.findFirst({
+          where: { id, tenantId, role: 'STUDENT' },
+        });
+        if (!student) return display;
+        return {
+          fullName: student.fullName,
+          email: student.email || '',
+          phone: student.phone || '',
+          birthDate: toDateStr(student.birthDate),
+          address: student.address || '',
+          studentName: student.fullName,
+          ...display,
+        };
+      }
+    } catch {
+      return display;
+    }
+    return display;
+  }
+
+  /** Turn trả lời chuẩn khi user yêu cầu nghiệp vụ ngoài phạm vi bản mini. */
+  private saveMiniModeBlockedTurn(params: {
+    sessionId: number;
+    state: DecisionContext;
+    userMessageId?: number;
+    startedAt: number;
+  }) {
+    const response: CopilotResponse = {
+      type: 'text_message',
+      message:
+        'Chức năng này chưa được bật trong bản Copilot mini. ' +
+        'Mình chỉ hỗ trợ: tạo học viên, tạo khóa học, tạo lớp học trong khóa, thêm học viên vào lớp học và sửa thông tin học viên/khóa học/lớp học.',
+    };
+    return this.saveAssistantTurn({
+      sessionId: params.sessionId,
+      userMessageId: params.userMessageId,
+      startedAt: params.startedAt,
+      response,
+      state: this.mergeState(params.state, {
+        pending_class_creation: null,
+        pending_clarification: null,
+      }),
+    });
   }
 
   /**
@@ -999,6 +1796,41 @@ export class CopilotService {
     const { actor, sessionId, state, pending, userMessageId, startedAt } =
       params;
 
+    // Guard mini mode NGAY khi tạo pending (mọi nguồn: LLM, suggestion,
+    // deterministic, state cũ): tool ngoài 3 nghiệp vụ không được tạo preview.
+    if (isAgentMiniMode() && !isToolAllowedInMiniMode(pending.tool_name)) {
+      return this.saveMiniModeBlockedTurn({
+        sessionId,
+        state,
+        userMessageId,
+        startedAt,
+      });
+    }
+
+    // Chuẩn hóa input cho MỌI nguồn pending (LLM/deterministic/suggestion):
+    // create_class luôn có cả `type` lẫn `classType` để form FE prefill
+    // đúng select "Loại lớp" ("theo tuần" -> WEEKLY, "luyện đề" -> EXAM_PRACTICE).
+    pending.input = this.normalizePendingInput(
+      pending.tool_name,
+      pending.input || {},
+    );
+    pending.display_input = this.normalizePendingInput(
+      pending.tool_name,
+      pending.display_input || pending.input,
+    );
+
+    // Preview update_*: điền giá trị HIỆN TẠI của thực thể vào display_input để
+    // form không trống trơn; pending.input giữ nguyên (chỉ chứa field cần đổi).
+    pending.display_input = await this.enrichUpdateDisplayInput(
+      actor.tenantId,
+      pending,
+    );
+
+    // Mỗi pending có idempotency key riêng để confirm chống double-submit.
+    if (!pending.idempotency_key) {
+      pending.idempotency_key = randomUUID();
+    }
+
     if (pending.tool_name === 'create_student') {
       const email = this.extractInputString(pending.input.email);
       const phone = this.extractInputString(pending.input.phone);
@@ -1009,11 +1841,34 @@ export class CopilotService {
         );
 
       if (duplicate) {
+        const conflictFields: Array<'email' | 'phone'> = [];
+        if (
+          email &&
+          duplicate.email &&
+          email.toLowerCase() === String(duplicate.email).toLowerCase()
+        ) {
+          conflictFields.push('email');
+        }
+        if (
+          phone &&
+          duplicate.phone &&
+          phone.replace(/\D/g, '') ===
+            String(duplicate.phone).replace(/\D/g, '')
+        ) {
+          conflictFields.push('phone');
+        }
+        if (conflictFields.length === 0) {
+          conflictFields.push(email ? 'email' : 'phone');
+        }
+
         const duplicateContext: DuplicateStudentContext = {
           searched_email: email,
           searched_phone: phone,
           existing_student: this.toStudentEntityOption(duplicate),
           intended_action: 'create',
+          status: 'waiting_choice',
+          original_input: { ...(pending.input || {}) },
+          conflict_fields: conflictFields,
         };
         const message = this.buildDuplicateStudentMessage(duplicateContext);
         const response: CopilotResponse = {
@@ -1022,6 +1877,8 @@ export class CopilotService {
           missing_fields: [],
           intent: 'create_student',
           entities: { duplicate_student_context: duplicateContext },
+          clarification_type: 'target_disambiguation',
+          options: DUPLICATE_CHOICE_OPTIONS,
         };
         const nextState = this.mergeState(state, {
           ...(params.contextPatch || {}),
@@ -1062,12 +1919,16 @@ export class CopilotService {
   }
 
   /**
-   * Xử lý câu trả lời của user khi đang có duplicate_student_context.
-   * - Case A: hủy -> clear context, báo đã hủy.
-   * - Case C: dùng học viên có sẵn -> set selected student, clear context.
-   * - Case B: nhập email/SĐT khác (hoặc yêu cầu khác) -> trả null để agent xử lý.
+   * State machine xử lý câu trả lời của user khi đang có duplicate_student_context.
+   * LUÔN xử lý ở backend, KHÔNG rơi xuống model — tránh model lặp lại cảnh báo trùng.
+   * - Option 1 (hoặc "dùng học viên có sẵn"): chọn học viên cũ, trả card thông tin.
+   * - Option 2 (hoặc nhập thẳng email/SĐT mới): giữ tên/ngày sinh/địa chỉ cũ,
+   *   patch contact mới, re-check trùng rồi trả preview (KHÔNG ghi DB).
+   * - Option 3 (hoặc hủy): clear context.
+   * - Không hiểu: nhắc lại menu 1/2/3.
    */
   private async handleDuplicateStudentReply(
+    actor: ActorPayload,
     sessionId: number,
     state: DecisionContext,
     content: string,
@@ -1077,8 +1938,15 @@ export class CopilotService {
     const dup = state.duplicate_student_context;
     if (!dup) return null;
 
-    // Case A: hủy
-    if (this.isCancelText(content)) {
+    const normalized = this.normalizeConfirmText(content);
+    const choice = this.parseDuplicateChoice(normalized);
+
+    // Option 3: hủy
+    if (
+      choice === 3 ||
+      this.isCancelText(content) ||
+      ['thoat', 'bo qua', 'huy thao tac'].includes(normalized)
+    ) {
       const response: CopilotResponse = {
         type: 'text_message',
         message:
@@ -1098,12 +1966,44 @@ export class CopilotService {
       });
     }
 
-    // Case C: dùng học viên có sẵn (chưa ghi danh trong Cụm 2)
-    if (this.isUseExistingStudentText(content)) {
+    // Option 1: dùng học viên có sẵn -> trả card thông tin + gợi ý tiếp theo.
+    if (choice === 1 || this.isUseExistingStudentText(content)) {
       const existing = dup.existing_student;
+      const metadata = existing.metadata;
+      const studentRecord =
+        metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+          ? metadata
+          : {
+              id: existing.id,
+              fullName: existing.label,
+              email: existing.email ?? null,
+              phone: existing.phone ?? null,
+            };
       const response: CopilotResponse = {
-        type: 'text_message',
-        message: `Đã chọn học viên có sẵn: ${existing.label}. Bạn muốn làm gì tiếp theo với học viên này?`,
+        type: 'tool_result',
+        tool_name: 'search_student',
+        status: 'SUCCESS',
+        message:
+          'Đã chọn học viên có sẵn này. Bạn muốn dùng học viên này để làm gì?',
+        result: studentRecord,
+        suggestions: [
+          {
+            id: 'duplicate-use-existing-enroll',
+            title: 'Thêm học viên này vào lớp học',
+            message: `Thêm ${existing.label} vào một lớp học có sẵn.`,
+            intent: 'assign_student_to_class',
+            draft_message: `Thêm học viên ${existing.label} #${existing.id} vào lớp học`,
+            priority: 1,
+          },
+          {
+            id: 'duplicate-use-existing-create-new',
+            title: 'Tạo học viên mới bằng email/SĐT khác',
+            message: 'Mở form tạo học viên mới.',
+            intent: 'create_student',
+            draft_message: 'Tạo học viên mới',
+            priority: 2,
+          },
+        ],
       };
       const nextState = this.mergeState(state, {
         selected_student_id: existing.id,
@@ -1121,8 +2021,185 @@ export class CopilotService {
       });
     }
 
-    // Case B / khác: để agent xử lý tiếp (ví dụ nhập email/SĐT mới).
-    return null;
+    // User nhập thẳng email/SĐT mới (ở bất kỳ status nào) -> hiểu là option 2.
+    const contact = this.extractContactFromText(content);
+    if (contact.email || contact.phone) {
+      return this.retryCreateStudentWithNewContact({
+        actor,
+        sessionId,
+        state,
+        dup,
+        contact,
+        userMessageId,
+        startedAt,
+      });
+    }
+
+    // Option 2 nhưng CHƯA kèm email/SĐT -> mời nhập, giữ context chờ contact mới.
+    if (choice === 2 || this.isNewContactIntentText(normalized)) {
+      const original = dup.original_input || {};
+      const heldName = this.extractInputString(original.fullName);
+      const heldBirthDate = this.extractInputString(original.birthDate);
+      const heldAddress = this.extractInputString(original.address);
+      const heldLines = [
+        `- Tên: ${heldName || 'Chưa có'}`,
+        ...(heldBirthDate ? [`- Ngày sinh: ${heldBirthDate}`] : []),
+        ...(heldAddress ? [`- Địa chỉ: ${heldAddress}`] : []),
+      ];
+      const response: CopilotResponse = {
+        type: 'clarification',
+        message: [
+          'Mời bạn nhập email hoặc SĐT mới để tạo học viên mới.',
+          '',
+          'Thông tin đang giữ:',
+          ...heldLines,
+          '',
+          'Bạn có thể nhập ví dụ:',
+          '- newemail@example.com',
+          '- 0987654321',
+          '- newemail@example.com, 0987654321',
+        ].join('\n'),
+        missing_fields: [],
+        intent: 'create_student',
+        entities: {},
+      };
+      const nextState = this.mergeState(state, {
+        duplicate_student_context: {
+          ...dup,
+          status: 'waiting_new_contact',
+        },
+      });
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: nextState,
+      });
+    }
+
+    // Không hiểu -> nhắc lại menu, KHÔNG gọi model, KHÔNG ghi DB.
+    const response: CopilotResponse = {
+      type: 'clarification',
+      message: [
+        'Mình chưa hiểu lựa chọn của bạn.',
+        '',
+        'Vui lòng chọn:',
+        '1. Dùng học viên có sẵn này',
+        '2. Nhập email/SĐT khác để tạo học viên mới',
+        '3. Hủy thao tác',
+        '',
+        'Hoặc bạn có thể nhập thẳng email/SĐT mới.',
+      ].join('\n'),
+      missing_fields: [],
+      intent: 'create_student',
+      entities: {},
+      clarification_type: 'target_disambiguation',
+      options: DUPLICATE_CHOICE_OPTIONS,
+    };
+    return this.saveAssistantTurn({
+      sessionId,
+      userMessageId,
+      startedAt,
+      response,
+      state,
+    });
+  }
+
+  /** "1" | "so 2" | "option 3" | "chon 1"... -> 1 | 2 | 3, khác -> null. */
+  private parseDuplicateChoice(normalized: string): 1 | 2 | 3 | null {
+    const match = normalized.match(/^(?:so|option|chon|lua chon)?\s*([123])$/);
+    if (!match) return null;
+    return Number(match[1]) as 1 | 2 | 3;
+  }
+
+  /** User muốn nhập email/SĐT khác nhưng chưa gõ contact mới. */
+  private isNewContactIntentText(normalized: string): boolean {
+    return [
+      'nhap email',
+      'nhap sdt',
+      'nhap so dien thoai',
+      'email khac',
+      'sdt khac',
+      'so dien thoai khac',
+      'so khac',
+      'tao moi',
+      'tao hoc vien moi',
+      'dung email khac',
+      'dung sdt khac',
+    ].some((keyword) => normalized.includes(keyword));
+  }
+
+  /** Tìm email/SĐT trong câu tự do ("email là x@y.com", "sdt mới 0987..."). */
+  private extractContactFromText(content: string): {
+    email?: string;
+    phone?: string;
+  } {
+    const result: { email?: string; phone?: string } = {};
+    const emailMatch = content.match(
+      /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/,
+    );
+    if (emailMatch) result.email = emailMatch[0];
+
+    const withoutEmail = emailMatch
+      ? content.replace(emailMatch[0], ' ')
+      : content;
+    for (const token of withoutEmail.split(/[,;\s]+/)) {
+      if (!token || /[a-zA-Z@\/]/.test(token)) continue;
+      const digits = token.replace(/\D/g, '');
+      if (digits.length >= 9 && digits.length <= 12) {
+        result.phone = digits;
+        break;
+      }
+    }
+    return result;
+  }
+
+  /**
+   * Option 2 kèm contact mới: giữ tên/ngày sinh/địa chỉ từ original_input, patch
+   * email/SĐT mới rồi đi lại luồng preview chuẩn (savePendingWriteTurn tự
+   * re-check trùng: còn trùng -> hỏi lại 1/2/3 với học viên trùng mới; hết trùng
+   * -> preview_card chờ confirm). KHÔNG ghi DB ở bước này.
+   */
+  private async retryCreateStudentWithNewContact(params: {
+    actor: ActorPayload;
+    sessionId: number;
+    state: DecisionContext;
+    dup: DuplicateStudentContext;
+    contact: { email?: string; phone?: string };
+    userMessageId: number;
+    startedAt: number;
+  }) {
+    const { actor, sessionId, state, dup, contact, userMessageId, startedAt } =
+      params;
+    const input: Record<string, unknown> = {
+      ...(dup.original_input || {}),
+    };
+    if (contact.email) input.email = contact.email;
+    if (contact.phone) input.phone = contact.phone;
+
+    const fullName = this.extractInputString(input.fullName);
+    const pending: PendingAction = {
+      tool_name: 'create_student',
+      input,
+      display_input: input,
+      summary: fullName ? `Tạo học viên mới: ${fullName}` : 'Tạo học viên mới',
+      intent: 'create_student',
+      status: 'waiting_confirm',
+      severity: 'default',
+    };
+    const clearedState = this.mergeState(state, {
+      duplicate_student_context: null,
+      pending_clarification: null,
+    });
+    return this.savePendingWriteTurn({
+      actor,
+      sessionId,
+      state: clearedState,
+      pending,
+      userMessageId,
+      startedAt,
+    });
   }
 
   /**
@@ -1168,20 +2245,29 @@ export class CopilotService {
       return null;
     }
 
+    // Đã có classId cụ thể -> dùng assign_student_to_class (ghi danh luôn ở cấp
+    // lớp; _to_course còn bị chặn trong mini mode nên pending đó không confirm được).
+    // courseId trong context có thể là 0 (các lớp trùng tên thuộc nhiều khóa) ->
+    // suy khóa thật từ lớp user vừa chọn.
+    const chosenMeta = (chosen.metadata || {}) as Record<string, any>;
+    const courseId =
+      Number(chosenMeta.courseId ?? chosenMeta.course?.id) ||
+      ctx.courseId ||
+      null;
     const pending: PendingAction = {
-      tool_name: 'assign_student_to_course',
+      tool_name: 'assign_student_to_class',
       input: {
         userId: ctx.userId,
-        courseId: ctx.courseId,
         classId: chosen.id,
       },
       display_input: {
         userId: ctx.userId,
-        courseId: ctx.courseId,
+        ...(courseId ? { courseId } : {}),
         classId: chosen.id,
+        className: chosen.label,
       },
-      summary: `Ghi danh học viên #${ctx.userId} vào khóa học #${ctx.courseId} (lớp ${chosen.label})`,
-      intent: 'assign_student_to_course',
+      summary: `Thêm học viên #${ctx.userId} vào lớp ${chosen.label}${courseId ? ` (khóa #${courseId})` : ''}`,
+      intent: 'assign_student_to_class',
       status: 'waiting_confirm',
       severity: 'default',
     };
@@ -1200,10 +2286,12 @@ export class CopilotService {
   }
 
   /**
-   * Xử lý user trả lời TÊN LỚP khi đang có pending_class_creation (đã biết khóa).
+   * Xử lý câu trả lời của user khi đang có pending_class_creation:
    * - Hủy -> clear context.
-   * - Có tên -> tạo preview create_class NGAY (sessions rỗng), không hỏi thêm.
-   * - Trống -> hỏi lại tên, giữ context.
+   * - Chưa biết khóa (courseId = 0) -> câu trả lời là TÊN KHÓA: tìm khóa thật,
+   *   giữ nguyên bản nháp (tên/loại/ngày) rồi đi tiếp (preview hoặc hỏi tên lớp).
+   * - Đã biết khóa -> câu trả lời là TÊN LỚP: tạo preview create_class NGAY.
+   * - Trống -> hỏi lại, giữ context.
    */
   private async handlePendingClassCreationReply(
     actor: ActorPayload,
@@ -1235,6 +2323,51 @@ export class CopilotService {
       });
     }
 
+    // Bản nháp chưa có khóa -> hiểu câu trả lời là tên khóa học.
+    if (!ctx.courseId) {
+      let outcome: DeterministicOutcome | null = null;
+      try {
+        outcome = await this.deterministic.resolveClassCourseReply(
+          actor.tenantId,
+          ctx,
+          content,
+        );
+      } catch {
+        outcome = null;
+      }
+      // Không xử lý được -> để LLM lo (context đã có trong prompt).
+      if (!outcome) return null;
+
+      if (outcome.type === 'pending_write') {
+        return this.savePendingWriteTurn({
+          actor,
+          sessionId,
+          state,
+          pending: outcome.pending,
+          userMessageId,
+          startedAt,
+          contextPatch: outcome.contextPatch,
+        });
+      }
+      const response: CopilotResponse =
+        outcome.type === 'clarification'
+          ? {
+              type: 'clarification',
+              message: outcome.message,
+              missing_fields: outcome.missingFields,
+              intent: outcome.intent,
+              entities: {},
+            }
+          : { type: 'text_message', message: (outcome as any).message };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, outcome.contextPatch),
+      });
+    }
+
     const title = content.trim();
     if (!title) {
       const response: CopilotResponse = {
@@ -1258,6 +2391,9 @@ export class CopilotService {
       courseLabel: ctx.courseTitle || ctx.courseCode,
       title,
       type: ctx.type,
+      teacherName: ctx.teacherName ?? undefined,
+      startDate: ctx.startDate ?? undefined,
+      endDate: ctx.endDate ?? undefined,
     });
     const clearedState = this.mergeState(state, {
       pending_class_creation: null,
@@ -1429,8 +2565,31 @@ export class CopilotService {
       message: assistantMessage,
       response: params.response,
       state: session.state,
+      // Phase kiểu FluentGo cho FE: PREVIEW -> khóa composer chờ confirm/cancel.
+      phase: this.phaseFromState(params.state),
       userMessageId: params.userMessageId,
     };
+  }
+
+  /**
+   * Suy ra phase phiên chat theo mô hình FluentGo từ state hiện tại:
+   * - PREVIEW: có pending_action chờ xác nhận (composer nên bị khóa).
+   * - DISAMBIGUATION: đang chờ user chọn/làm rõ (trùng học viên, chọn lớp...).
+   * - IDLE: sẵn sàng nhận yêu cầu mới.
+   */
+  private phaseFromState(
+    state: DecisionContext,
+  ): 'IDLE' | 'DISAMBIGUATION' | 'PREVIEW' {
+    if (state.pending_action) return 'PREVIEW';
+    if (
+      state.duplicate_student_context ||
+      state.pending_enrollment_context ||
+      state.pending_class_creation ||
+      state.pending_clarification
+    ) {
+      return 'DISAMBIGUATION';
+    }
+    return 'IDLE';
   }
 
   private responseToolName(response: CopilotResponse): string | null {
@@ -1506,6 +2665,21 @@ export class CopilotService {
           selected_class_id: option?.id || null,
           last_selected_class: option,
         };
+      case 'assign_student_to_class': {
+        // Kết quả từ addStudentToClass: enrollment kèm user + courseClass.course.
+        const row = (result || {}) as any;
+        return {
+          selected_student_id: Number(row.userId) || null,
+          selected_class_id: Number(row.classId) || null,
+          selected_course_id:
+            Number(row.courseClass?.courseId ?? row.courseClass?.course?.id) ||
+            null,
+          last_selected_student: this.toEntityOption(row.user),
+          last_selected_class: this.toEntityOption(row.courseClass),
+          last_selected_course: this.toEntityOption(row.courseClass?.course),
+          last_candidates: { classes: [] },
+        };
+      }
       case 'assign_student_to_course': {
         const row = (result || {}) as any;
         return {
@@ -1521,6 +2695,103 @@ export class CopilotService {
       default:
         return {};
     }
+  }
+
+  /**
+   * Gợi ý bước tiếp theo sau khi CONFIRM tạo thành công:
+   * - create_class -> gợi ý thêm học viên tạo gần đây nhất vào lớp vừa tạo.
+   * - create_student -> gợi ý thêm học viên vừa tạo vào lớp tạo gần đây nhất.
+   * Ưu tiên thực thể trong ngữ cảnh phiên chat, không có thì lấy bản ghi mới
+   * nhất trong DB. Không tìm được ứng viên -> không gợi ý gì.
+   */
+  private async buildPostCreateSuggestions(
+    tenantId: number,
+    toolName: AiToolName,
+    state: DecisionContext,
+    patch: Partial<DecisionContext>,
+  ): Promise<ProactiveSuggestion[]> {
+    try {
+      if (toolName === 'create_class') {
+        const newClass = patch.last_created_class;
+        if (!newClass?.id) return [];
+        const student =
+          state.last_created_student ||
+          state.last_selected_student ||
+          (await this.findLatestStudentOption(tenantId));
+        if (!student?.id) return [];
+        return [
+          {
+            id: `post-create-class-enroll-${newClass.id}`,
+            title: `Thêm học viên vào lớp ${newClass.label}`,
+            message: `Gợi ý: thêm ${student.label} — học viên tạo gần đây — vào lớp này.`,
+            intent: 'assign_student_to_class',
+            draft_message: `Thêm học viên ${student.label} #${student.id} vào lớp ${newClass.label}`,
+            priority: 1,
+            action: {
+              type: 'suggestion_action',
+              action: 'assign_student_to_class',
+              input: {
+                userId: Number(student.id),
+                classId: Number(newClass.id),
+              },
+              source: 'post_create_class_suggestion',
+            },
+          },
+        ];
+      }
+
+      if (toolName === 'create_student') {
+        const newStudent = patch.last_created_student;
+        if (!newStudent?.id) return [];
+        const cls =
+          state.last_created_class ||
+          state.last_selected_class ||
+          (await this.findLatestClassOption(tenantId));
+        if (!cls?.id) return [];
+        return [
+          {
+            id: `post-create-student-enroll-${newStudent.id}`,
+            title: `Thêm ${newStudent.label} vào lớp ${cls.label}`,
+            message: `Gợi ý: ghi danh học viên vừa tạo vào lớp mới nhất (${cls.label}).`,
+            intent: 'assign_student_to_class',
+            draft_message: `Thêm học viên ${newStudent.label} #${newStudent.id} vào lớp ${cls.label}`,
+            priority: 1,
+            action: {
+              type: 'suggestion_action',
+              action: 'assign_student_to_class',
+              input: {
+                userId: Number(newStudent.id),
+                classId: Number(cls.id),
+              },
+              source: 'post_create_student_suggestion',
+            },
+          },
+        ];
+      }
+    } catch {
+      // Gợi ý là tính năng phụ — lỗi không được làm hỏng turn chính.
+    }
+    return [];
+  }
+
+  private async findLatestStudentOption(
+    tenantId: number,
+  ): Promise<EntityOption | null> {
+    const student = await this.prisma.user.findFirst({
+      where: { tenantId, role: 'STUDENT' },
+      orderBy: { createdAt: 'desc' },
+    });
+    return this.toEntityOption(student);
+  }
+
+  private async findLatestClassOption(
+    tenantId: number,
+  ): Promise<EntityOption | null> {
+    const cls = await this.prisma.courseClass.findFirst({
+      where: { tenantId, status: 'ACTIVE' },
+      orderBy: { createdAt: 'desc' },
+    });
+    return this.toEntityOption(cls);
   }
 
   private toEntityOption(value: unknown): EntityOption | null {
@@ -1563,6 +2834,14 @@ export class CopilotService {
       .trim();
   }
 }
+
+// Nút chọn nhanh cho câu hỏi trùng học viên (frontend render thành 3 button,
+// user bấm sẽ gửi key "1"/"2"/"3" — vẫn hỗ trợ gõ tay).
+const DUPLICATE_CHOICE_OPTIONS = [
+  { key: '1', label: 'Dùng học viên có sẵn này' },
+  { key: '2', label: 'Nhập email/SĐT khác để tạo học viên mới' },
+  { key: '3', label: 'Hủy thao tác' },
+];
 
 const CONFIRM_KEYWORDS = new Set([
   'ok',

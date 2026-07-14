@@ -45,6 +45,7 @@ export default function CoursesPage() {
   const [courseCodeTouched, setCourseCodeTouched] = useState(false);
   const [description, setDescription] = useState("");
   const [level, setLevel] = useState("");
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     fetchCourses();
@@ -167,6 +168,7 @@ export default function CoursesPage() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setSaving(true);
     try {
       const normalizedCourseCode =
         normalizeGeneratedCode(courseCode) || generateCourseCode(title);
@@ -186,12 +188,15 @@ export default function CoursesPage() {
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi thêm mới khóa học";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleUpdate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+    setSaving(true);
     try {
       const normalizedCourseCode =
         normalizeGeneratedCode(courseCode) || generateCourseCode(title);
@@ -211,6 +216,8 @@ export default function CoursesPage() {
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi cập nhật khóa học";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -633,9 +640,10 @@ export default function CoursesPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Lưu khóa học
+                  {saving ? "Đang lưu..." : "Lưu khóa học"}
                 </button>
               </div>
             </form>
@@ -721,9 +729,10 @@ export default function CoursesPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Cập nhật
+                  {saving ? "Đang lưu..." : "Cập nhật"}
                 </button>
               </div>
             </form>

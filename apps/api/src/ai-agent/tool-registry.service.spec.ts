@@ -1,6 +1,7 @@
 import { ToolRegistryService } from './tool-registry.service';
 
 describe('ToolRegistryService - assign_student_to_course', () => {
+  const originalMiniMode = process.env.AGENT_MINI_MODE;
   const actor = { tenantId: 10, userId: 20, role: 'ADMIN' } as any;
   let prisma: any;
   let usersService: any;
@@ -9,6 +10,9 @@ describe('ToolRegistryService - assign_student_to_course', () => {
   let service: ToolRegistryService;
 
   beforeEach(() => {
+    // Suite này test cả các tool full-mode (assign_student_to_course, update_course...).
+    // afterEach sẽ restore lại giá trị env gốc.
+    process.env.AGENT_MINI_MODE = 'false';
     prisma = {
       aiAgentAction: {
         create: jest.fn().mockResolvedValue({ id: 1 }),
@@ -45,6 +49,14 @@ describe('ToolRegistryService - assign_student_to_course', () => {
       coursesService,
       enrollmentsService,
     );
+  });
+
+  afterEach(() => {
+    if (originalMiniMode === undefined) {
+      delete process.env.AGENT_MINI_MODE;
+    } else {
+      process.env.AGENT_MINI_MODE = originalMiniMode;
+    }
   });
 
   it('chặn khi học viên đã ghi danh khóa (STUDENT_ALREADY_ASSIGNED_TO_COURSE)', async () => {
@@ -95,7 +107,49 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     );
   });
 
+  it('assign_student_to_course truyền expireDate/allowLatePayment/note xuống ClassEnrollment', async () => {
+    coursesService.findClassesForCourse.mockResolvedValue([
+      { id: 5, status: 'ACTIVE', title: 'IELTS tối' },
+    ]);
+    coursesService.addStudentToClass.mockResolvedValue({
+      id: 56,
+      roleInClass: 'STUDENT',
+      expireDate: new Date('2026-12-31'),
+      allowLatePayment: true,
+      note: 'Học viên chuyển từ lớp cũ',
+      user: { id: 1, fullName: 'A' },
+      courseClass: { id: 5, course: { id: 10 } },
+    });
+
+    const result = await service.execute(1, actor, 'assign_student_to_course', {
+      userId: 1,
+      courseId: 10,
+      expireDate: '2026-12-31',
+      allowLatePayment: true,
+      note: 'Học viên chuyển từ lớp cũ',
+    });
+
+    expect(coursesService.addStudentToClass).toHaveBeenCalledWith(
+      10,
+      5,
+      expect.objectContaining({
+        userId: 1,
+        expireDate: '2026-12-31',
+        allowLatePayment: true,
+        note: 'Học viên chuyển từ lớp cũ',
+      }),
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        expireDate: new Date('2026-12-31'),
+        allowLatePayment: true,
+        note: 'Học viên chuyển từ lớp cũ',
+      }),
+    );
+  });
+
   it('create_class gọi CoursesService.createClass với schema đúng và bỏ field cấm', async () => {
+    process.env.AGENT_MINI_MODE = 'false';
     coursesService.createClass.mockResolvedValue({
       id: 7,
       title: 'Evening A',
@@ -143,13 +197,14 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     });
   });
 
-  it('update_course map ngày/status, bỏ field rỗng (không ghi đè)', async () => {
+  it('update_course map status, bỏ field rỗng và BỎ QUA ngày (khóa không có ngày)', async () => {
+    process.env.AGENT_MINI_MODE = 'false';
     const result = await service.execute(1, actor, 'update_course', {
       courseId: 79,
       level: 'Cấp độ 1',
       title: '', // rỗng -> không truyền xuống service
-      startDate: '2026-07-10',
-      endDate: '2026-07-31', // alias của expireDate
+      startDate: '2026-07-10', // khóa học không có ngày -> bị bỏ qua
+      endDate: '2026-07-31',
       status: 'ACTIVE',
     });
 
@@ -159,8 +214,6 @@ describe('ToolRegistryService - assign_student_to_course', () => {
       description: undefined,
       level: 'Cấp độ 1',
       status: 'ACTIVE',
-      startDate: '2026-07-10',
-      expireDate: '2026-07-31',
     });
     expect(result).toEqual(expect.objectContaining({ id: 79 }));
   });

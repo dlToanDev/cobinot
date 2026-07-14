@@ -4,6 +4,7 @@ import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { apiClient } from "@/lib/api-client";
+import { generateClassCode, normalizeGeneratedCode } from "@hxstu/shared";
 import Navbar from "../../../../../components/Navbar";
 
 export default function ClassDetailPage() {
@@ -16,11 +17,14 @@ export default function ClassDetailPage() {
   const [classDetail, setClassDetail] = useState<any>(null);
   const [enrolledStudents, setEnrolledStudents] = useState<any[]>([]);
   const [students, setStudents] = useState<any[]>([]);
+  const [allCourses, setAllCourses] = useState<
+    Array<{ id: number; title: string; courseCode?: string | null }>
+  >([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
   // Tab State
-  const [activeTab, setActiveTab] = useState<"students" | "schedule" | "assignments">("students");
+  const [activeTab, setActiveTab] = useState<"info" | "students" | "schedule" | "assignments">("students");
 
   // Modals & sub-state
   const [showAddStudent, setShowAddStudent] = useState(false);
@@ -34,8 +38,10 @@ export default function ClassDetailPage() {
 
   // Edit Class Form fields (Info tab)
   const [editClassCode, setEditClassCode] = useState("");
+  const [editClassCodeTouched, setEditClassCodeTouched] = useState(true);
   const [editTitle, setEditTitle] = useState("");
   const [editType, setEditType] = useState("WEEKLY");
+  const [editCourseId, setEditCourseId] = useState(0);
   const [editTeacherName, setEditTeacherName] = useState("");
   const [editStartDate, setEditStartDate] = useState("");
   const [editEndDate, setEditEndDate] = useState("");
@@ -47,27 +53,61 @@ export default function ClassDetailPage() {
     if (classId) {
       fetchClassData();
     }
-  }, [classId]);
+  }, [classId, courseId]);
+
+  const buildEditClassCode = (
+    courseList: Array<{ id: number; title: string; courseCode?: string | null }>,
+    nextCourseId: number,
+    nextTitle: string,
+    nextType: string,
+  ) => {
+    const formCourse = courseList.find(
+      (item) => Number(item.id) === nextCourseId,
+    );
+    return generateClassCode({
+      courseCode: formCourse?.courseCode,
+      courseTitle: formCourse?.title,
+      classTitle: nextTitle,
+      classType: nextType,
+      includeClassType: Boolean(nextType),
+    });
+  };
 
   const fetchClassData = async () => {
     setLoading(true);
     setError("");
     try {
-      const [classRes, studentsRes, allStudentsRes, courseRes] = await Promise.all([
-        apiClient.get(`/classes/${classId}`),
-        apiClient.get(`/classes/${classId}/students`),
-        apiClient.get("/students"),
-        apiClient.get(`/courses/${courseId}`),
-      ]);
+      const [classRes, studentsRes, allStudentsRes, courseRes, coursesRes] =
+        await Promise.all([
+          apiClient.get(`/classes/${classId}`),
+          apiClient.get(`/classes/${classId}/students`),
+          apiClient.get("/students"),
+          apiClient.get(`/courses/${courseId}`),
+          apiClient.get("/courses"),
+        ]);
       setClassDetail(classRes.data);
       setEnrolledStudents(studentsRes.data);
       setStudents(allStudentsRes.data);
       setCourse(courseRes.data);
+      const courseList = Array.isArray(coursesRes.data) ? coursesRes.data : [];
+      setAllCourses(courseList);
 
       // Populate Edit Form Fields
+      const clsCourseId = Number(classRes.data.courseId) || courseId;
       setEditClassCode(classRes.data.classCode);
+      // Mã đang đúng dạng tự sinh -> cho phép sinh lại khi đổi khóa/tên/loại.
+      setEditClassCodeTouched(
+        classRes.data.classCode !==
+          buildEditClassCode(
+            courseList,
+            clsCourseId,
+            classRes.data.title,
+            classRes.data.type,
+          ),
+      );
       setEditTitle(classRes.data.title);
       setEditType(classRes.data.type);
+      setEditCourseId(clsCourseId);
       setEditTeacherName(classRes.data.teacherName || "");
       setEditStartDate(classRes.data.startDate ? classRes.data.startDate.substring(0, 10) : "");
       setEditEndDate(classRes.data.endDate ? classRes.data.endDate.substring(0, 10) : "");
@@ -81,14 +121,29 @@ export default function ClassDetailPage() {
     }
   };
 
+  // Sinh lại mã lớp khi user đổi khóa/tên/loại mà chưa chỉnh tay mã.
+  const syncEditClassCode = (
+    nextCourseId: number,
+    nextTitle: string,
+    nextType: string,
+  ) => {
+    if (!editClassCodeTouched) {
+      setEditClassCode(
+        buildEditClassCode(allCourses, nextCourseId, nextTitle, nextType),
+      );
+    }
+  };
+
   const handleUpdateClassInfo = async (e: React.FormEvent) => {
     e.preventDefault();
     setEditLoading(true);
     setEditSuccess(false);
     setError("");
     try {
+      const movedToOtherCourse = editCourseId > 0 && editCourseId !== courseId;
       const res = await apiClient.patch(`/classes/${classId}`, {
-        classCode: editClassCode,
+        courseId: editCourseId > 0 ? editCourseId : undefined,
+        classCode: normalizeGeneratedCode(editClassCode),
         title: editTitle,
         type: editType,
         teacherName: editTeacherName || null,
@@ -99,6 +154,10 @@ export default function ClassDetailPage() {
       setClassDetail(res.data);
       setEditSuccess(true);
       setTimeout(() => setEditSuccess(false), 3000);
+      if (movedToOtherCourse) {
+        // Route theo khóa mới để URL khớp dữ liệu; effect sẽ refetch banner.
+        router.replace(`/courses/${editCourseId}/classes/${classId}`);
+      }
     } catch (err: any) {
       setError(err.response?.data?.message || "Không thể cập nhật lớp học");
     } finally {
@@ -278,6 +337,19 @@ export default function ClassDetailPage() {
                 <div className="bg-white border border-slate-200 rounded-2xl p-4 shadow-sm space-y-1">
                   <h3 className="text-[10px] font-bold text-slate-400 uppercase tracking-wider px-3 mb-3">Tác vụ lớp học</h3>
                   <button
+                    onClick={() => setActiveTab("info")}
+                    className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-semibold transition duration-150 ${
+                      activeTab === "info"
+                        ? "bg-indigo-600 text-white shadow-md shadow-indigo-100"
+                        : "text-slate-600 hover:bg-slate-50"
+                    }`}
+                  >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
+                    </svg>
+                    Thông tin lớp học
+                  </button>
+                  <button
                     onClick={() => setActiveTab("students")}
                     className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-semibold transition duration-150 ${
                       activeTab === "students"
@@ -333,6 +405,142 @@ export default function ClassDetailPage() {
 
               {/* Right Dynamic Content Panel */}
               <div className="md:col-span-9 bg-white border border-slate-200 rounded-3xl p-6 shadow-sm min-h-[400px]">
+                {/* 0. Tab INFO — sửa thông tin lớp, cho phép chuyển khóa */}
+                {activeTab === "info" && (
+                  <div className="space-y-6">
+                    <div className="pb-4 border-b border-slate-100">
+                      <h2 className="text-xl font-extrabold text-slate-900">Thông Tin Lớp Học</h2>
+                      <p className="text-slate-500 text-xs font-medium">Chỉnh sửa tên, mã lớp, lịch, giáo viên và khóa học cha</p>
+                    </div>
+
+                    {editSuccess && (
+                      <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-700 text-sm font-medium">
+                        Đã cập nhật thông tin lớp học.
+                      </div>
+                    )}
+
+                    <form onSubmit={handleUpdateClassInfo} className="space-y-4 max-w-2xl">
+                      <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">
+                          Khóa học <span className="text-red-500">*</span>
+                        </label>
+                        <select
+                          value={editCourseId || ""}
+                          onChange={(e) => {
+                            const nextCourseId = Number(e.target.value) || 0;
+                            setEditCourseId(nextCourseId);
+                            syncEditClassCode(nextCourseId, editTitle, editType);
+                          }}
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                          required
+                        >
+                          {allCourses.map((item) => (
+                            <option key={item.id} value={item.id}>
+                              {item.courseCode ? `${item.title} (${item.courseCode})` : item.title}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">
+                            Mã lớp học <span className="text-red-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={editClassCode}
+                            onChange={(e) => {
+                              setEditClassCodeTouched(true);
+                              setEditClassCode(normalizeGeneratedCode(e.target.value));
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 font-mono text-sm transition-all duration-150"
+                            required
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">
+                            Tên lớp học <span className="text-red-500">*</span>
+                          </label>
+                          <input
+                            type="text"
+                            value={editTitle}
+                            onChange={(e) => {
+                              setEditTitle(e.target.value);
+                              syncEditClassCode(editCourseId, e.target.value, editType);
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                            required
+                          />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Loại lớp học</label>
+                          <select
+                            value={editType}
+                            onChange={(e) => {
+                              setEditType(e.target.value);
+                              syncEditClassCode(editCourseId, editTitle, e.target.value);
+                            }}
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                          >
+                            <option value="WEEKLY">Học theo tuần (WEEKLY)</option>
+                            <option value="EXAM_PRACTICE">Luyện đề (EXAM_PRACTICE)</option>
+                          </select>
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Giáo viên phụ trách</label>
+                          <input
+                            type="text"
+                            value={editTeacherName}
+                            onChange={(e) => setEditTeacherName(e.target.value)}
+                            placeholder="Tên GV phụ trách"
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                          />
+                        </div>
+                      </div>
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Ngày bắt đầu</label>
+                          <input
+                            type="date"
+                            value={editStartDate}
+                            onChange={(e) => setEditStartDate(e.target.value)}
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Ngày kết thúc</label>
+                          <input
+                            type="date"
+                            value={editEndDate}
+                            onChange={(e) => setEditEndDate(e.target.value)}
+                            className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
+                          />
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Mô tả/Ghi chú</label>
+                        <textarea
+                          value={editDescription}
+                          onChange={(e) => setEditDescription(e.target.value)}
+                          rows={3}
+                          className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm resize-none transition-all duration-150"
+                        />
+                      </div>
+                      <div className="flex justify-end pt-4 border-t border-slate-100">
+                        <button
+                          type="submit"
+                          disabled={editLoading}
+                          className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {editLoading ? "Đang lưu..." : "Lưu thay đổi"}
+                        </button>
+                      </div>
+                    </form>
+                  </div>
+                )}
+
                 {/* 1. Tab STUDENTS */}
                 {activeTab === "students" && (
                   <div className="space-y-6">

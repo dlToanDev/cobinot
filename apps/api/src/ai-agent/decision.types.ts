@@ -37,6 +37,32 @@ export interface EntityOption {
   metadata?: Record<string, unknown>;
 }
 
+/** Một dòng trong bảng danh sách học viên (theo lớp hoặc theo khóa). */
+export interface StudentTableRow {
+  id: number;
+  fullName: string;
+  email?: string | null;
+  phone?: string | null;
+  className?: string | null;
+  classType?: string | null;
+  roleInClass?: string | null;
+  joinedAt?: string | null;
+}
+
+/** Một dòng trong bảng danh sách lớp học của khóa. */
+export interface ClassTableRow {
+  id: number;
+  title: string;
+  classCode?: string | null;
+  type?: string | null;
+  teacherName?: string | null;
+  studentCount?: number;
+  status?: string | null;
+  courseTitle?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+}
+
 export type PendingActionStatus =
   | 'draft'
   | 'validation_error'
@@ -54,6 +80,10 @@ export interface PendingAction {
   status?: PendingActionStatus;
   validation_errors?: Record<string, string>;
   severity?: 'default' | 'danger';
+  source?: string;
+  draftId?: string;
+  /** Chống double-submit: sinh khi tạo pending, so khớp khi confirm. */
+  idempotency_key?: string;
 }
 
 export interface PendingClarification {
@@ -69,6 +99,11 @@ export interface DuplicateStudentContext {
   searched_phone?: string | null;
   existing_student: EntityOption;
   intended_action: 'create' | 'assign' | 'update';
+  /** State machine: chờ chọn 1/2/3 hay chờ user nhập email/SĐT mới (option 2). */
+  status?: 'waiting_choice' | 'waiting_new_contact';
+  /** Input tạo học viên ban đầu — giữ lại tên/ngày sinh/địa chỉ khi đổi email/SĐT. */
+  original_input?: Record<string, unknown>;
+  conflict_fields?: Array<'email' | 'phone'>;
 }
 
 export interface PendingEnrollmentContext {
@@ -85,17 +120,23 @@ export interface PendingEnrollmentContext {
  * hỏi thêm ngày/giáo viên/lịch học.
  */
 export interface PendingClassCreationContext {
+  /** 0 = chưa xác định khóa; user sẽ trả lời tên khóa ở lượt sau. */
   courseId: number;
   courseTitle?: string | null;
   courseCode?: string | null;
   type: 'WEEKLY' | 'EXAM_PRACTICE';
   title?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  teacherName?: string | null;
 }
 
 export interface SuggestionAction {
   type: 'suggestion_action';
   action: AiToolName;
   input: Record<string, unknown>;
+  source?: string;
+  draftId?: string;
 }
 
 export interface ProactiveSuggestion {
@@ -143,6 +184,9 @@ export type CopilotResponse =
       missing_fields: string[];
       intent?: AiIntent | string;
       entities: Record<string, unknown>;
+      /** 'target_disambiguation' -> frontend render các nút chọn nhanh (options). */
+      clarification_type?: string;
+      options?: Array<{ key: string; label: string }>;
       suggestions?: ProactiveSuggestion[];
     }
   | {
@@ -162,6 +206,21 @@ export type CopilotResponse =
       intent: 'create_course';
       values?: Record<string, string>;
       submit_label?: string;
+      suggestions?: ProactiveSuggestion[];
+    }
+  | {
+      type: 'student_table';
+      title: string;
+      message?: string;
+      scope: 'course' | 'class';
+      students: StudentTableRow[];
+      suggestions?: ProactiveSuggestion[];
+    }
+  | {
+      type: 'class_table';
+      title: string;
+      message?: string;
+      classes: ClassTableRow[];
       suggestions?: ProactiveSuggestion[];
     }
   | {
@@ -218,6 +277,8 @@ export interface DecisionContext {
   duplicate_student_context?: DuplicateStudentContext | null;
   pending_enrollment_context?: PendingEnrollmentContext | null;
   pending_class_creation?: PendingClassCreationContext | null;
+  /** Idempotency key của pending action ĐÃ execute gần nhất (chống double-submit). */
+  last_executed_idempotency_key?: string | null;
   [key: string]: unknown;
 }
 

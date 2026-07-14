@@ -1,7 +1,7 @@
-'use client';
+"use client";
 
-import { useState } from 'react';
-import { LoaderCircle, UserRound } from 'lucide-react';
+import { useState } from "react";
+import { LoaderCircle } from "lucide-react";
 
 type StudentCreateFormData = {
   title?: string;
@@ -21,25 +21,32 @@ type StudentInput = {
 const FIELDS: Array<{
   name: keyof StudentInput;
   label: string;
-  type: 'text' | 'email' | 'tel' | 'date';
+  type: "text" | "email" | "tel" | "date";
   placeholder?: string;
   required?: boolean;
+  fullWidth?: boolean;
 }> = [
   {
-    name: 'fullName',
-    label: 'Họ và tên',
-    type: 'text',
-    placeholder: 'VD: Nguyễn Văn A',
+    name: "fullName",
+    label: "Họ và tên",
+    type: "text",
+    placeholder: "VD: Nguyễn Văn A",
     required: true,
+    fullWidth: true,
   },
-  { name: 'email', label: 'Email', type: 'email', placeholder: 'a@example.com' },
-  { name: 'phone', label: 'Số điện thoại', type: 'tel', placeholder: '09xxxxxxxx' },
-  { name: 'birthDate', label: 'Ngày sinh', type: 'date' },
+  { name: "email", label: "Email", type: "email", placeholder: "a@example.com" },
   {
-    name: 'address',
-    label: 'Địa chỉ',
-    type: 'text',
-    placeholder: 'Không bắt buộc',
+    name: "phone",
+    label: "Số điện thoại",
+    type: "tel",
+    placeholder: "09xxxxxxxx",
+  },
+  { name: "birthDate", label: "Ngày sinh", type: "date" },
+  {
+    name: "address",
+    label: "Địa chỉ",
+    type: "text",
+    placeholder: "Không bắt buộc",
   },
 ];
 
@@ -55,11 +62,11 @@ export default function StudentCreateForm({
   onSubmit: (input: StudentInput) => void;
 }) {
   const [values, setValues] = useState<StudentInput>({
-    fullName: data.values?.fullName ?? '',
-    email: data.values?.email ?? '',
-    phone: data.values?.phone ?? '',
-    birthDate: data.values?.birthDate ?? '',
-    address: data.values?.address ?? '',
+    fullName: data.values?.fullName ?? "",
+    email: data.values?.email ?? "",
+    phone: data.values?.phone ?? "",
+    birthDate: data.values?.birthDate ?? "",
+    address: data.values?.address ?? "",
   });
   const [touched, setTouched] = useState(false);
 
@@ -85,40 +92,35 @@ export default function StudentCreateForm({
   return (
     <form
       onSubmit={handleSubmit}
-      className="space-y-3 rounded-2xl border border-blue-100 bg-blue-50/40 p-4"
+      className="overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm"
     >
-      <div className="flex items-center gap-2">
-        <span className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-100 text-blue-600">
-          <UserRound size={16} />
-        </span>
-        <div>
-          <div className="text-sm font-semibold text-slate-900">
-            {data.title || 'Tạo học viên mới'}
-          </div>
-          {data.message && (
-            <p className="text-xs text-slate-500">{data.message}</p>
-          )}
+      <div className="border-b border-zinc-100 px-4 py-3">
+        <div className="text-sm font-semibold text-zinc-900">
+          {data.title || "Tạo học viên mới"}
         </div>
+        {data.message && (
+          <p className="mt-0.5 text-[13px] leading-5 text-zinc-500">
+            {data.message}
+          </p>
+        )}
       </div>
 
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid grid-cols-1 gap-x-4 gap-y-3 px-4 py-3.5 sm:grid-cols-2">
         {FIELDS.map((field) => {
           const showError =
             field.required && touched && !values[field.name]?.trim();
           return (
             <label
               key={field.name}
-              className={
-                field.name === 'address' ? 'sm:col-span-2 block' : 'block'
-              }
+              className={field.fullWidth ? "block sm:col-span-2" : "block"}
             >
-              <span className="mb-1 block text-xs font-medium text-slate-600">
+              <span className="mb-1 block text-[11px] font-medium leading-4 text-zinc-500">
                 {field.label}
-                {field.required && <span className="text-red-500"> *</span>}
+                {field.required && <span className="ml-0.5 text-red-500">*</span>}
               </span>
               <input
                 type={field.type}
-                value={values[field.name] ?? ''}
+                value={values[field.name] ?? ""}
                 placeholder={field.placeholder}
                 disabled={disabled}
                 onChange={(e) =>
@@ -127,14 +129,14 @@ export default function StudentCreateForm({
                     [field.name]: e.target.value,
                   }))
                 }
-                className={`h-10 w-full rounded-xl border bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 disabled:cursor-not-allowed disabled:bg-slate-100 ${
+                className={`h-9 w-full rounded-[10px] border bg-white px-3 text-[13px] text-zinc-900 outline-none transition placeholder:text-zinc-400 focus:ring-2 disabled:cursor-not-allowed disabled:bg-zinc-50 ${
                   showError
-                    ? 'border-red-300 focus:ring-red-200'
-                    : 'border-slate-200 focus:ring-blue-200'
+                    ? "border-red-300 focus:border-red-400 focus:ring-red-100"
+                    : "border-zinc-200 focus:border-zinc-400 focus:ring-zinc-100"
                 }`}
               />
               {showError && (
-                <span className="mt-1 block text-xs text-red-500">
+                <span className="mt-1 block text-[11px] leading-4 text-red-600">
                   Vui lòng nhập họ tên học viên.
                 </span>
               )}
@@ -143,16 +145,14 @@ export default function StudentCreateForm({
         })}
       </div>
 
-      <div className="flex justify-end">
+      <div className="flex justify-end border-t border-zinc-100 px-4 py-3">
         <button
           type="submit"
           disabled={disabled}
-          className="inline-flex items-center gap-2 rounded-full bg-slate-950 px-5 py-2 text-sm font-medium text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+          className="inline-flex h-9 items-center gap-1.5 rounded-[10px] bg-zinc-900 px-4 text-[13px] font-medium text-white transition hover:bg-zinc-700 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {sending ? (
-            <LoaderCircle size={16} className="animate-spin" />
-          ) : null}
-          {data.submit_label || 'Xem trước'}
+          {sending && <LoaderCircle size={14} className="animate-spin" />}
+          {data.submit_label || "Xem trước"}
         </button>
       </div>
     </form>

@@ -26,6 +26,7 @@ export function createDefaultCopilotState(): DecisionContext {
     duplicate_student_context: null,
     pending_enrollment_context: null,
     pending_class_creation: null,
+    last_executed_idempotency_key: null,
   };
 }
 

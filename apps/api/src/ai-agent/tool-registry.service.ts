@@ -213,15 +213,7 @@ export class ToolRegistryService {
           level:
             this.optionalString(input.level) ?? this.optionalString(input.type),
           status: this.optionalString(input.status),
-          // Ngày: nhận cả camelCase và snake_case, ngày kết thúc chấp nhận
-          // expireDate/endDate/expire_date.
-          startDate:
-            this.optionalDateString(input.startDate) ??
-            this.optionalDateString(input.start_date),
-          expireDate:
-            this.optionalDateString(input.expireDate) ??
-            this.optionalDateString(input.endDate) ??
-            this.optionalDateString(input.expire_date),
+          // Khóa học không có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học.
         });
       }
       case 'update_course':
@@ -236,10 +228,6 @@ export class ToolRegistryService {
             description: this.optionalString(input.description),
             level: this.optionalString(input.level),
             status: this.optionalString(input.status),
-            startDate: this.optionalDateString(input.startDate),
-            expireDate: this.optionalDateString(
-              input.expireDate ?? input.endDate,
-            ),
           },
         );
       case 'delete_courses':
@@ -405,6 +393,9 @@ export class ToolRegistryService {
         userId,
         roleInClass,
         joinedAt,
+        expireDate,
+        allowLatePayment,
+        note,
       },
     );
 
@@ -417,9 +408,10 @@ export class ToolRegistryService {
       classId: targetClassId,
       roleInClass: enrollment.roleInClass,
       joinedAt: enrollment.joinedAt,
-      expireDate: expireDate ?? null,
-      allowLatePayment: allowLatePayment ?? null,
-      note: note ?? null,
+      // Trả giá trị ĐÃ LƯU trong ClassEnrollment (không phải input echo).
+      expireDate: (enrollment as any).expireDate ?? null,
+      allowLatePayment: (enrollment as any).allowLatePayment ?? null,
+      note: (enrollment as any).note ?? null,
       user: enrollment.user,
       course: (enrollment as any).courseClass?.course,
       courseClass: (enrollment as any).courseClass,
@@ -516,7 +508,9 @@ export class ToolRegistryService {
   }
 
   private optionalDateString(value: unknown): string | undefined {
-    return this.optionalString(value);
+    const str = this.optionalString(value);
+    if (!str) return undefined;
+    return isNaN(new Date(str).getTime()) ? undefined : str;
   }
 
   private optionalNumber(value: unknown): number | undefined {

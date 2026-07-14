@@ -9,7 +9,9 @@ import {
 
 describe('tool-definitions', () => {
   it('không có tool schema nào chứa additionalProperties', () => {
-    expect(JSON.stringify(FULL_AGENT_TOOLS)).not.toContain('additionalProperties');
+    expect(JSON.stringify(FULL_AGENT_TOOLS)).not.toContain(
+      'additionalProperties',
+    );
   });
 
   it('READ_TOOL_NAMES và WRITE_TOOL_NAMES không có phần tử trùng nhau', () => {
@@ -50,14 +52,14 @@ describe('tool-definitions', () => {
     ).toBe(true);
   });
 
-  it('create_course có startDate và expireDate trong schema, title bắt buộc', () => {
+  it('create_course KHÔNG có startDate/expireDate trong schema (ngày chỉ thuộc lớp), title bắt buộc', () => {
     const tool = FULL_AGENT_TOOLS.find(
       (item) => item.function.name === 'create_course',
     );
     expect(tool).toBeDefined();
     const props = tool!.function.parameters.properties;
-    expect(props).toHaveProperty('startDate');
-    expect(props).toHaveProperty('expireDate');
+    expect(props).not.toHaveProperty('startDate');
+    expect(props).not.toHaveProperty('expireDate');
     expect(tool!.function.parameters.required).toContain('title');
   });
 
@@ -103,22 +105,37 @@ describe('tool-definitions', () => {
       }
     });
 
-    it('chỉ expose mini tool khi AGENT_MINI_MODE=true', () => {
+    it('mini mode expose đúng tool cho 7 nghiệp vụ (tạo/sửa + ghi danh theo LỚP)', () => {
       process.env.AGENT_MINI_MODE = 'true';
       const names = getConfiguredAgentTools().map((t) => t.function.name);
 
+      // WRITE: tạo học viên, tạo khóa, tạo lớp, thêm học viên vào lớp.
       expect(names).toContain('create_student');
       expect(names).toContain('create_course');
       expect(names).toContain('create_class');
-      expect(names).toContain('assign_student_to_course');
+      expect(names).toContain('assign_student_to_class');
+      // WRITE: sửa thông tin học viên/khóa học/lớp học.
+      expect(names).toContain('update_student');
+      expect(names).toContain('update_course');
+      expect(names).toContain('update_class');
+      // READ hỗ trợ.
       expect(names).toContain('search_student');
+      expect(names).toContain('get_student_detail');
       expect(names).toContain('search_course');
+      expect(names).toContain('get_course_detail');
+      expect(names).toContain('get_course_classes');
+      expect(names).toContain('search_class');
+      expect(names).toContain('get_class_detail');
       expect(names).toContain('ask_clarification');
 
-      expect(names).not.toContain('update_student');
+      // Ghi danh cấp khóa KHÔNG expose (flow chính là vào lớp).
+      expect(names).not.toContain('assign_student_to_course');
+      // Ngoài phạm vi mini: xóa/đóng/gỡ.
       expect(names).not.toContain('delete_students');
       expect(names).not.toContain('delete_courses');
       expect(names).not.toContain('close_class');
+      expect(names).not.toContain('remove_student_from_class');
+      expect(names).not.toContain('remove_student_from_course_classes');
     });
 
     it('expose full tool khi AGENT_MINI_MODE=false', () => {

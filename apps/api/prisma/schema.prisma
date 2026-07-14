@@ -94,14 +94,17 @@ model CourseClass {
 }
 
 model ClassEnrollment {
-  id          Int       @id @default(autoincrement())
-  userId      Int       @map("user_id")
-  classId     Int       @map("class_id")
-  roleInClass String    @default("STUDENT") @map("role_in_class")
-  joinedAt    DateTime  @default(now()) @map("joined_at")
-  endedAt     DateTime? @map("ended_at")
-  status      String    @default("ACTIVE")
-  createdAt   DateTime  @default(now()) @map("created_at")
+  id               Int       @id @default(autoincrement())
+  userId           Int       @map("user_id")
+  classId          Int       @map("class_id")
+  roleInClass      String    @default("STUDENT") @map("role_in_class")
+  joinedAt         DateTime  @default(now()) @map("joined_at")
+  endedAt          DateTime? @map("ended_at")
+  expireDate       DateTime? @map("expire_date")
+  allowLatePayment Boolean?  @map("allow_late_payment")
+  note             String?
+  status           String    @default("ACTIVE")
+  createdAt        DateTime  @default(now()) @map("created_at")
 
   user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
   courseClass CourseClass @relation(fields: [classId], references: [id], onDelete: Cascade)

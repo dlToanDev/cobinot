@@ -1,5 +1,6 @@
-import { IsDateString, IsOptional, IsString } from 'class-validator';
+import { IsOptional, IsString } from 'class-validator';
 
+// Khóa học không có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học (CourseClass).
 export class UpdateCourseDto {
   @IsOptional()
   @IsString()
@@ -20,12 +21,4 @@ export class UpdateCourseDto {
   @IsOptional()
   @IsString()
   status?: string;
-
-  @IsOptional()
-  @IsDateString({}, { message: 'Ngày bắt đầu không đúng định dạng' })
-  startDate?: string;
-
-  @IsOptional()
-  @IsDateString({}, { message: 'Ngày kết thúc không đúng định dạng' })
-  expireDate?: string;
 }

@@ -1,6 +1,19 @@
-import { IsDateString, IsIn, IsOptional, IsString } from 'class-validator';
+import {
+  IsDateString,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+} from 'class-validator';
+import { Type } from 'class-transformer';
 
 export class UpdateClassDto {
+  /** Đổi khóa học cha cho lớp; phải thuộc cùng tenant. */
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt({ message: 'Khóa học không hợp lệ' })
+  courseId?: number;
+
   @IsOptional()
   @IsString()
   classCode?: string;

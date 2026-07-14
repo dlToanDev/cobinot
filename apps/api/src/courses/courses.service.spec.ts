@@ -126,76 +126,15 @@ describe('CoursesService', () => {
       });
     });
 
-    it('should store startDate/expireDate as Date objects', async () => {
-      prisma.course.findMany.mockResolvedValue([]);
-      prisma.course.create.mockResolvedValue({
-        id: 1,
-        tenantId: 10,
-        title: 'Ielts 6.5',
-        courseCode: 'IELTS_6_5',
-      });
-
-      await service.createCourse(10, {
-        title: 'IELTS 6.5',
-        startDate: '2026-07-10',
-        expireDate: '2026-09-10',
-      });
-
-      expect(prisma.course.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          startDate: new Date('2026-07-10'),
-          expireDate: new Date('2026-09-10'),
-        }),
-      });
-    });
-
-    it('should store null dates when not provided', async () => {
+    it('should not store any start/expire dates (dates belong to classes)', async () => {
       prisma.course.findMany.mockResolvedValue([]);
       prisma.course.create.mockResolvedValue({ id: 1 });
 
       await service.createCourse(10, { title: 'Toán 12' });
 
-      expect(prisma.course.create).toHaveBeenCalledWith({
-        data: expect.objectContaining({
-          startDate: null,
-          expireDate: null,
-        }),
-      });
-    });
-
-    it('should throw COURSE_INVALID_DATE_RANGE when expireDate before startDate', async () => {
-      prisma.course.findMany.mockResolvedValue([]);
-
-      await expect(
-        service.createCourse(10, {
-          title: 'IELTS 6.5',
-          startDate: '2026-09-10',
-          expireDate: '2026-07-10',
-        }),
-      ).rejects.toMatchObject({
-        response: expect.objectContaining({
-          code: 'COURSE_INVALID_DATE_RANGE',
-        }),
-      });
-
-      expect(prisma.course.create).not.toHaveBeenCalled();
-    });
-
-    it('should throw COURSE_INVALID_DATE for unparseable date', async () => {
-      prisma.course.findMany.mockResolvedValue([]);
-
-      await expect(
-        service.createCourse(10, {
-          title: 'IELTS 6.5',
-          startDate: 'abc',
-        }),
-      ).rejects.toMatchObject({
-        response: expect.objectContaining({
-          code: 'COURSE_INVALID_DATE',
-        }),
-      });
-
-      expect(prisma.course.create).not.toHaveBeenCalled();
+      const data = prisma.course.create.mock.calls[0][0].data;
+      expect(data).not.toHaveProperty('startDate');
+      expect(data).not.toHaveProperty('expireDate');
     });
   });
 
@@ -363,6 +302,47 @@ describe('CoursesService', () => {
       expect(prisma.classSession.createMany).not.toHaveBeenCalled();
     });
 
+    it('chặn 2 lớp trùng tên trong CÙNG khóa + CÙNG loại (không dấu, hoa thường)', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 7, title: 'Toán 3' },
+      ]);
+
+      await expect(
+        service.createClass(10, {
+          courseId: 1,
+          title: 'toan 3',
+          type: 'WEEKLY',
+        }),
+      ).rejects.toThrow('không được trùng tên');
+      expect(prisma.courseClass.create).not.toHaveBeenCalled();
+    });
+
+    it('cho phép trùng tên khi KHÁC loại lớp (query lọc theo type)', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      // Lớp "Toán 3" WEEKLY đã tồn tại nhưng query lọc type=EXAM_PRACTICE nên
+      // không trả về -> vẫn tạo được lớp luyện đề cùng tên.
+      prisma.courseClass.findMany.mockResolvedValue([]);
+      prisma.courseClass.findFirst.mockResolvedValue(null);
+      prisma.courseClass.create.mockResolvedValue(classMock);
+
+      await service.createClass(10, {
+        courseId: 1,
+        title: 'Toán 3',
+        type: 'EXAM_PRACTICE',
+      });
+
+      expect(prisma.courseClass.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            courseId: 1,
+            type: 'EXAM_PRACTICE',
+          }),
+        }),
+      );
+      expect(prisma.courseClass.create).toHaveBeenCalled();
+    });
+
     it('should keep backward compatible controller signature', async () => {
       prisma.course.findFirst.mockResolvedValue(courseMock);
       prisma.courseClass.findFirst.mockResolvedValue(null);
@@ -380,6 +360,128 @@ describe('CoursesService', () => {
           }),
         }),
       );
+    });
+  });
+
+  describe('updateClass', () => {
+    const classMock = {
+      id: 5,
+      tenantId: 10,
+      courseId: 1,
+      classCode: 'IELTS_6_5_EVENING_A_WEEKLY',
+      title: 'Evening A',
+      type: 'WEEKLY',
+      startDate: null,
+      endDate: null,
+      course: { id: 1, tenantId: 10, title: 'IELTS 6.5' },
+    };
+
+    beforeEach(() => {
+      prisma.courseClass.update = jest.fn();
+    });
+
+    it('should move class to another course inside the same tenant', async () => {
+      prisma.courseClass.findFirst.mockResolvedValue(classMock);
+      prisma.course.findFirst.mockResolvedValue({ id: 2, tenantId: 10 });
+      prisma.courseClass.update.mockResolvedValue({
+        ...classMock,
+        courseId: 2,
+      });
+
+      await service.updateClass(10, 5, { courseId: 2 });
+
+      expect(prisma.course.findFirst).toHaveBeenCalledWith({
+        where: { id: 2, tenantId: 10 },
+      });
+      expect(prisma.courseClass.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ courseId: 2 }),
+        }),
+      );
+    });
+
+    it('should reject moving class to a course of another tenant', async () => {
+      prisma.courseClass.findFirst.mockResolvedValue(classMock);
+      prisma.course.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.updateClass(10, 5, { courseId: 99 }),
+      ).rejects.toThrow(
+        'Khóa học không tồn tại hoặc không thuộc trung tâm này',
+      );
+      expect(prisma.courseClass.update).not.toHaveBeenCalled();
+    });
+
+    it('should not touch courseId when unchanged', async () => {
+      prisma.courseClass.findFirst.mockResolvedValue(classMock);
+      prisma.courseClass.update.mockResolvedValue(classMock);
+
+      await service.updateClass(10, 5, { courseId: 1, title: 'Evening B' });
+
+      expect(prisma.course.findFirst).not.toHaveBeenCalled();
+      expect(prisma.courseClass.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ courseId: undefined }),
+        }),
+      );
+    });
+
+    it('đổi loại lớp -> tự sinh lại classCode theo loại mới', async () => {
+      prisma.courseClass.findFirst
+        .mockResolvedValueOnce(classMock) // findOneClass
+        .mockResolvedValue(null); // generateUniqueClassCode + ensureUniqueClassCode
+      prisma.courseClass.findMany.mockResolvedValue([]);
+      prisma.courseClass.update.mockResolvedValue({
+        ...classMock,
+        type: 'EXAM_PRACTICE',
+      });
+
+      await service.updateClass(10, 5, { type: 'EXAM_PRACTICE' });
+
+      expect(prisma.courseClass.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            type: 'EXAM_PRACTICE',
+            classCode: 'IELTS_6_5_EVENING_A_EXAM_PRACTICE',
+          }),
+        }),
+      );
+    });
+
+    it('đổi loại kèm classCode CŨ gửi lại nguyên vẹn (form) -> vẫn tự sinh mã mới theo loại', async () => {
+      prisma.courseClass.findFirst
+        .mockResolvedValueOnce(classMock)
+        .mockResolvedValue(null);
+      prisma.courseClass.findMany.mockResolvedValue([]);
+      prisma.courseClass.update.mockResolvedValue({
+        ...classMock,
+        type: 'EXAM_PRACTICE',
+      });
+
+      await service.updateClass(10, 5, {
+        type: 'EXAM_PRACTICE',
+        classCode: 'IELTS_6_5_EVENING_A_WEEKLY',
+      });
+
+      expect(prisma.courseClass.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            classCode: 'IELTS_6_5_EVENING_A_EXAM_PRACTICE',
+          }),
+        }),
+      );
+    });
+
+    it('đổi tên lớp trùng với lớp khác cùng khóa + cùng loại -> ConflictException', async () => {
+      prisma.courseClass.findFirst.mockResolvedValue(classMock);
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 9, title: 'Evening B' },
+      ]);
+
+      await expect(
+        service.updateClass(10, 5, { title: 'evening b' }),
+      ).rejects.toThrow('không được trùng tên');
+      expect(prisma.courseClass.update).not.toHaveBeenCalled();
     });
   });
 });

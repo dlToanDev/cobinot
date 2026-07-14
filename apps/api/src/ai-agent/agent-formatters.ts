@@ -36,11 +36,6 @@ export function formatCourseOption(course: any, index: number): string {
   return [
     `${index + 1}. ${label}`,
     line('Mã khóa', course?.courseCode || course?.code),
-    line('Ngày bắt đầu', formatDateForVi(course?.startDate)),
-    line(
-      'Ngày kết thúc',
-      formatDateForVi(course?.expireDate ?? course?.endDate),
-    ),
     line('Cấp độ', course?.level),
     line('ID', course?.id),
   ]

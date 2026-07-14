@@ -1,4 +1,12 @@
-import { IsDateString, IsIn, IsInt, IsOptional, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsDateString,
+  IsIn,
+  IsInt,
+  IsOptional,
+  IsString,
+  Min,
+} from 'class-validator';
 
 export class AddStudentToClassDto {
   @IsInt()
@@ -14,4 +22,16 @@ export class AddStudentToClassDto {
   @IsOptional()
   @IsDateString({}, { message: 'Ngày tham gia không đúng định dạng' })
   joinedAt?: string;
+
+  @IsOptional()
+  @IsDateString({}, { message: 'Ngày hết hạn học không đúng định dạng' })
+  expireDate?: string;
+
+  @IsOptional()
+  @IsBoolean()
+  allowLatePayment?: boolean;
+
+  @IsOptional()
+  @IsString()
+  note?: string;
 }

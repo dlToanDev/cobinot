@@ -20,6 +20,7 @@ import { CopilotService } from './copilot.service';
 import { CreateCopilotSessionDto } from './dto/create-session.dto';
 import { CreateCopilotMessageDto } from './dto/create-message.dto';
 import { UpdateSessionStateDto } from './dto/update-session-state.dto';
+import { UpdateCopilotSessionDto } from './dto/update-session.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles('ADMIN')
@@ -91,9 +92,19 @@ export class CopilotController {
   confirm(
     @GetActor() actor: ActorPayload,
     @Param('id', ParseIntPipe) id: number,
-    @Body() body?: { input?: Record<string, unknown> },
+    @Body()
+    body?: {
+      input?: Record<string, unknown>;
+      inputOverride?: Record<string, unknown>;
+      idempotencyKey?: string;
+    },
   ) {
-    return this.copilotService.confirm(actor, id, body?.input);
+    return this.copilotService.confirm(
+      actor,
+      id,
+      body?.inputOverride || body?.input,
+      body?.idempotencyKey,
+    );
   }
 
   @Post('sessions/:id/cancel')
@@ -102,6 +113,19 @@ export class CopilotController {
     @Param('id', ParseIntPipe) id: number,
   ) {
     return this.copilotService.cancel(actor, id);
+  }
+
+  @Patch('sessions/:id/pending-action')
+  updatePendingAction(
+    @GetActor() actor: ActorPayload,
+    @Param('id', ParseIntPipe) id: number,
+    @Body()
+    body?: {
+      inputPatch?: Record<string, unknown>;
+      input?: Record<string, unknown>;
+    },
+  ) {
+    return this.copilotService.updatePendingAction(actor, id, body || {});
   }
 
   @Patch('sessions/:id/state')
@@ -118,12 +142,34 @@ export class CopilotController {
     );
   }
 
+  @Patch('sessions/:id/title')
+  renameSession(
+    @GetActor() actor: ActorPayload,
+    @Param('id', ParseIntPipe) id: number,
+    @Body() dto: UpdateCopilotSessionDto,
+  ) {
+    return this.copilotService.renameSession(
+      actor.tenantId,
+      actor.userId,
+      id,
+      dto.title,
+    );
+  }
+
   @Patch('sessions/:id/close')
   closeSession(
     @GetActor() actor: ActorPayload,
     @Param('id', ParseIntPipe) id: number,
   ) {
     return this.copilotService.closeSession(actor.tenantId, actor.userId, id);
+  }
+
+  @Patch('sessions/:id/reopen')
+  reopenSession(
+    @GetActor() actor: ActorPayload,
+    @Param('id', ParseIntPipe) id: number,
+  ) {
+    return this.copilotService.reopenSession(actor.tenantId, actor.userId, id);
   }
 
   @Delete('sessions/:id')

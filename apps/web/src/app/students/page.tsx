@@ -36,6 +36,7 @@ export default function StudentsPage() {
   const [showCourses, setShowCourses] = useState<any>(null);
   const [studentCourses, setStudentCourses] = useState<any[]>([]);
   const [coursesLoading, setCoursesLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   // Form Fields
   const [fullName, setFullName] = useState("");
@@ -97,6 +98,7 @@ export default function StudentsPage() {
       return;
     }
 
+    setSaving(true);
     try {
       await apiClient.post("/students", {
         fullName: formatTitleCase(fullName),
@@ -115,6 +117,8 @@ export default function StudentsPage() {
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi thêm mới học viên";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -127,12 +131,14 @@ export default function StudentsPage() {
       return;
     }
 
+    setSaving(true);
     try {
+      // Gửi null khi user xóa rỗng để backend clear field (undefined = giữ nguyên).
       await apiClient.patch(`/students/${showEdit.id}`, {
         fullName: formatTitleCase(fullName),
-        email: email || undefined,
-        phone: phone || undefined,
-        address: address ? formatTitleCase(address) : undefined,
+        email: email || null,
+        phone: phone || null,
+        address: address ? formatTitleCase(address) : null,
         birthDate: birthDate === "" ? null : birthDate,
       });
       setShowEdit(null);
@@ -145,6 +151,8 @@ export default function StudentsPage() {
     } catch (err: any) {
       const msg = err.response?.data?.message || "Lỗi cập nhật học viên";
       setError(Array.isArray(msg) ? msg[0] : msg);
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -682,9 +690,10 @@ export default function StudentsPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Lưu học viên
+                  {saving ? "Đang lưu..." : "Lưu học viên"}
                 </button>
               </div>
             </form>
@@ -777,9 +786,10 @@ export default function StudentsPage() {
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
+                  disabled={saving}
+                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer disabled:cursor-not-allowed disabled:opacity-60"
                 >
-                  Cập nhật
+                  {saving ? "Đang lưu..." : "Cập nhật"}
                 </button>
               </div>
             </form>

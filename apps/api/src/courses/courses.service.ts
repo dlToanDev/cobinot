@@ -9,20 +9,15 @@ import { PrismaService } from '../prisma/prisma.service';
 import { CreateCourseDto } from './dto/create-course.dto';
 import { UpdateCourseDto } from './dto/update-course.dto';
 import { BulkDeleteCoursesDto } from './dto/bulk-delete-courses.dto';
-import {
-  CreateClassDto,
-  CreateClassSessionDto,
-} from './dto/create-class.dto';
+import { CreateClassDto, CreateClassSessionDto } from './dto/create-class.dto';
 import { UpdateClassDto } from './dto/update-class.dto';
 import { AddStudentToClassDto } from './dto/add-student-to-class.dto';
 import {
   normalizeTitleCase,
   matchesSearchKeyword,
+  toSearchKey,
 } from '../common/normalization';
-import {
-  generateCourseCode,
-  normalizeGeneratedCode,
-} from '@hxstu/shared';
+import { generateCourseCode, normalizeGeneratedCode } from '@hxstu/shared';
 
 export interface CreateClassInput extends CreateClassDto {
   courseId: number;
@@ -88,14 +83,7 @@ export class CoursesService {
     return course;
   }
 
-  async createCourse(
-    tenantId: number,
-    dto: CreateCourseDto & {
-      start_date?: string;
-      expire_date?: string;
-      endDate?: string;
-    },
-  ) {
+  async createCourse(tenantId: number, dto: CreateCourseDto) {
     const title = dto.title ? normalizeTitleCase(dto.title) : dto.title;
     const baseCourseCode =
       normalizeGeneratedCode(dto.courseCode || '') || generateCourseCode(title);
@@ -104,26 +92,12 @@ export class CoursesService {
       throw new BadRequestException('Không thể sinh mã khóa học từ tên này');
     }
 
-    // Nhận cả camelCase và snake_case, ngày kết thúc chấp nhận expireDate/endDate.
-    const startDate = this.parseOptionalCourseDate(
-      dto.startDate ?? dto.start_date,
-    );
-    const expireDate = this.parseOptionalCourseDate(
-      dto.expireDate ?? dto.expire_date ?? dto.endDate,
-    );
-
-    if (startDate && expireDate && expireDate < startDate) {
-      throw new BadRequestException({
-        code: 'COURSE_INVALID_DATE_RANGE',
-        message: 'Ngày kết thúc khóa học phải sau hoặc bằng ngày bắt đầu.',
-      });
-    }
-
     const courseCode = await this.generateUniqueCourseCode(
       tenantId,
       baseCourseCode,
     );
 
+    // Khóa học không có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học.
     return this.prisma.course.create({
       data: {
         tenantId,
@@ -132,24 +106,8 @@ export class CoursesService {
         description: dto.description || null,
         level: dto.level || null,
         status: dto.status || 'ACTIVE',
-        startDate,
-        expireDate,
       },
     });
-  }
-
-  /** Parse ngày optional cho khóa học; ném lỗi thân thiện nếu sai định dạng. */
-  private parseOptionalCourseDate(value?: string | null): Date | null {
-    if (value === undefined || value === null || value === '') return null;
-    const date = new Date(value);
-    if (Number.isNaN(date.getTime())) {
-      throw new BadRequestException({
-        code: 'COURSE_INVALID_DATE',
-        message:
-          'Ngày bắt đầu hoặc ngày kết thúc không hợp lệ. Vui lòng nhập theo dạng ngày/tháng/năm hoặc YYYY-MM-DD.',
-      });
-    }
-    return date;
   }
 
   async updateCourse(tenantId: number, id: number, dto: UpdateCourseDto) {
@@ -175,26 +133,7 @@ export class CoursesService {
       }
     }
 
-    // Chỉ đụng tới ngày khi user gửi field đó; validate range với giá trị hiện có.
-    const startDate =
-      dto.startDate !== undefined
-        ? this.parseOptionalCourseDate(dto.startDate)
-        : undefined;
-    const expireDate =
-      dto.expireDate !== undefined
-        ? this.parseOptionalCourseDate(dto.expireDate)
-        : undefined;
-    const effectiveStart =
-      startDate !== undefined ? startDate : course.startDate;
-    const effectiveExpire =
-      expireDate !== undefined ? expireDate : course.expireDate;
-    if (effectiveStart && effectiveExpire && effectiveExpire < effectiveStart) {
-      throw new BadRequestException({
-        code: 'COURSE_INVALID_DATE_RANGE',
-        message: 'Ngày kết thúc khóa học phải sau hoặc bằng ngày bắt đầu.',
-      });
-    }
-
+    // Khóa học không có ngày bắt đầu/kết thúc — ngày chỉ thuộc lớp học.
     return this.prisma.course.update({
       where: { id },
       data: {
@@ -208,10 +147,7 @@ export class CoursesService {
         description:
           dto.description !== undefined ? dto.description || null : undefined,
         level: dto.level !== undefined ? dto.level || null : undefined,
-        status:
-          dto.status !== undefined ? dto.status || undefined : undefined,
-        startDate,
-        expireDate,
+        status: dto.status !== undefined ? dto.status || undefined : undefined,
       },
     });
   }
@@ -526,6 +462,10 @@ export class CoursesService {
     }
 
     const title = normalizeTitleCase(input.title);
+    // Cùng khóa + cùng loại lớp thì KHÔNG được trùng tên (Toán 3 WEEKLY và
+    // Toán 3 EXAM_PRACTICE được phép; 2 lớp Toán 3 WEEKLY thì không).
+    await this.ensureUniqueClassTitle(tenantId, input.courseId, title, type);
+
     const baseClassCode = this.buildClassCode(course, title, type);
     const classCode = await this.generateUniqueClassCode(
       tenantId,
@@ -546,8 +486,8 @@ export class CoursesService {
           teacherName: input.teacherName
             ? normalizeTitleCase(input.teacherName)
             : null,
-          startDate: input.startDate ? new Date(input.startDate) : null,
-          endDate: input.endDate ? new Date(input.endDate) : null,
+          startDate: input.startDate && !isNaN(new Date(input.startDate).getTime()) ? new Date(input.startDate) : null,
+          endDate: input.endDate && !isNaN(new Date(input.endDate).getTime()) ? new Date(input.endDate) : null,
           status: 'ACTIVE',
         },
         include: { course: true },
@@ -582,10 +522,63 @@ export class CoursesService {
 
   async updateClass(tenantId: number, id: number, dto: UpdateClassDto) {
     const courseClass = await this.findOneClass(tenantId, id);
-    const classCode =
+    let classCode =
       dto.classCode !== undefined
         ? normalizeGeneratedCode(dto.classCode || '')
         : undefined;
+
+    if (dto.type && !['WEEKLY', 'EXAM_PRACTICE'].includes(dto.type)) {
+      throw new BadRequestException('Loại lớp không hợp lệ.');
+    }
+
+    // Đổi khóa cha: khóa mới phải thuộc cùng tenant. Enrollment gắn theo
+    // classId nên học viên trong lớp giữ nguyên khi chuyển khóa.
+    let nextCourseId: number | undefined;
+    let nextCourse: Course = courseClass.course;
+    if (dto.courseId !== undefined) {
+      const courseId = Number(dto.courseId);
+      if (!Number.isInteger(courseId) || courseId <= 0) {
+        throw new BadRequestException('Khóa học không hợp lệ');
+      }
+      if (courseId !== courseClass.courseId) {
+        nextCourse = await this.findOneCourse(tenantId, courseId);
+        nextCourseId = courseId;
+      }
+    }
+
+    const nextType = dto.type || courseClass.type;
+    const nextTitle =
+      dto.title !== undefined && dto.title
+        ? normalizeTitleCase(dto.title)
+        : courseClass.title;
+
+    // Cùng khóa + cùng loại lớp thì KHÔNG được trùng tên.
+    if (dto.type !== undefined || dto.title !== undefined || nextCourseId) {
+      await this.ensureUniqueClassTitle(
+        tenantId,
+        nextCourseId ?? courseClass.courseId,
+        nextTitle,
+        nextType,
+        id,
+      );
+    }
+
+    // Đổi LOẠI lớp mà không tự đặt mã mới -> mã sinh tự động phải đổi theo loại
+    // (..._TOAN_3_WEEKLY -> ..._TOAN_3_EXAM_PRACTICE). Mã do user tự đặt (không
+    // chứa segment loại) thì giữ nguyên.
+    const codeUntouched =
+      classCode === undefined || classCode === courseClass.classCode;
+    if (
+      dto.type &&
+      dto.type !== courseClass.type &&
+      codeUntouched &&
+      /(^|_)(WEEKLY|EXAM_PRACTICE)(_|$)/.test(courseClass.classCode)
+    ) {
+      classCode = await this.generateUniqueClassCode(
+        tenantId,
+        this.buildClassCode(nextCourse, nextTitle, dto.type),
+      );
+    }
 
     if (classCode && classCode !== courseClass.classCode) {
       await this.ensureUniqueClassCode(tenantId, classCode, id);
@@ -603,6 +596,7 @@ export class CoursesService {
     return this.prisma.courseClass.update({
       where: { id },
       data: {
+        courseId: nextCourseId,
         classCode,
         title:
           dto.title !== undefined
@@ -806,6 +800,9 @@ export class CoursesService {
         classId,
         roleInClass,
         joinedAt: dto.joinedAt ? new Date(dto.joinedAt) : undefined,
+        expireDate: dto.expireDate ? new Date(dto.expireDate) : undefined,
+        allowLatePayment: dto.allowLatePayment,
+        note: dto.note,
       },
       include: {
         user: true,
@@ -956,6 +953,44 @@ export class CoursesService {
 
     if (existingClass) {
       throw new ConflictException('Mã lớp đã được sử dụng trong trung tâm này');
+    }
+  }
+
+  /**
+   * Trong CÙNG khóa học + CÙNG loại lớp, tên lớp không được trùng (so khớp
+   * không dấu, không phân biệt hoa thường). Khác loại thì được phép trùng tên.
+   */
+  private async ensureUniqueClassTitle(
+    tenantId: number,
+    courseId: number,
+    title: string,
+    type: string,
+    excludeId?: number,
+  ) {
+    const titleKey = toSearchKey(title);
+    if (!titleKey) return;
+
+    const siblings =
+      (await this.prisma.courseClass.findMany({
+        where: {
+          tenantId,
+          courseId,
+          type,
+          ...(excludeId ? { id: { not: excludeId } } : {}),
+        },
+        select: { id: true, title: true },
+      })) || [];
+
+    const duplicate = siblings.find(
+      (sibling) => toSearchKey(sibling.title) === titleKey,
+    );
+    if (duplicate) {
+      const typeLabel =
+        type === 'EXAM_PRACTICE' ? 'luyện đề' : 'học theo tuần';
+      throw new ConflictException(
+        `Khóa học này đã có lớp "${title}" thuộc loại ${typeLabel}. ` +
+          'Cùng một loại lớp không được trùng tên — bạn đổi tên lớp hoặc chọn loại lớp khác nhé.',
+      );
     }
   }
 
