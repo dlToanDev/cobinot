@@ -492,6 +492,64 @@ export function EnrollmentResultBlock({
 }) {
   if (!isRecord(data)) return <GenericResultBlock data={data} />;
 
+  // Kết quả ghi danh GỘP nhiều học viên: từng dòng ✓/⚠/✗ (partial success —
+  // người lỗi không làm hỏng người khác).
+  if (data.bulk && Array.isArray(data.items)) {
+    const className = String(data.className || data.classId || "Chưa rõ");
+    const items = data.items.filter(isRecord);
+    const successCount = Number(
+      data.successCount ??
+        items.filter((item) => item.status === "SUCCESS").length,
+    );
+    return (
+      <ResultCardShell title={title || "Kết quả thêm học viên vào lớp"}>
+        <p className="px-0.5 pb-1 text-xs leading-5 text-zinc-500">
+          Lớp {className}: {successCount}/{items.length} học viên được thêm
+          thành công.
+        </p>
+        <ul className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-zinc-50/60">
+          {items.map((item, index) => {
+            const status = String(item.status || "");
+            const name = String(
+              item.studentName || `Học viên #${item.userId}`,
+            );
+            const tone =
+              status === "SUCCESS"
+                ? "text-emerald-600"
+                : status === "ALREADY_IN_CLASS"
+                  ? "text-amber-600"
+                  : "text-red-600";
+            const glyph =
+              status === "SUCCESS"
+                ? "✓"
+                : status === "ALREADY_IN_CLASS"
+                  ? "⚠"
+                  : "✗";
+            const note =
+              status === "SUCCESS"
+                ? "Đã thêm vào lớp"
+                : status === "ALREADY_IN_CLASS"
+                  ? "Đã có trong lớp từ trước"
+                  : String(item.message || "Lỗi không xác định");
+            return (
+              <li key={index} className="flex items-start gap-2 px-3 py-2">
+                <span
+                  className={`mt-0.5 w-4 shrink-0 text-center text-[13px] font-semibold ${tone}`}
+                >
+                  {glyph}
+                </span>
+                <span className="min-w-0 flex-1 text-[13px] leading-5 text-zinc-800">
+                  {name}
+                  <span className="ml-1 text-xs text-zinc-500">— {note}</span>
+                </span>
+              </li>
+            );
+          })}
+        </ul>
+      </ResultCardShell>
+    );
+  }
+
   const user = isRecord(data.user) ? data.user : null;
   const course = isRecord(data.course) ? data.course : null;
   const courseClass = isRecord(data.courseClass) ? data.courseClass : null;

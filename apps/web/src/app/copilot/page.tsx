@@ -121,6 +121,27 @@ const buildPendingPreviewMessage = (
 
 const readStoredActiveSessionId = () => getActiveCopilotSessionId();
 
+// Sidebar chỉ tải từng trang session; bấm "Xem thêm" mới tải trang kế.
+const SESSIONS_PAGE_SIZE = 10;
+// Trần limit phía backend (service clamp 50) — refresh không vượt quá mức này.
+const SESSIONS_MAX_LIMIT = 50;
+
+type CopilotSessionsResponse = {
+  items: CopilotSession[];
+  hasMore: boolean;
+};
+
+// Mở phiên chỉ tải ~20 tin MỚI NHẤT (memory giữ khoảng 20~50 tin vì sau mỗi
+// lượt chat list reset về trang đầu). Cuộn lên đầu khung chat thì tải thêm
+// từng 10 tin cũ hơn qua GET /messages?before=<id oldest>&limit=10.
+const MESSAGES_INITIAL_LIMIT = 20;
+const MESSAGES_OLDER_PAGE_SIZE = 10;
+
+type CopilotMessagesResponse = {
+  items: CopilotMessage[];
+  hasMore: boolean;
+};
+
 const storeActiveSessionId = (sessionId: number | null) => {
   setActiveCopilotSessionId(sessionId);
 };
@@ -274,11 +295,15 @@ export default function CopilotPage() {
   // luôn trả null) để tránh hydration mismatch. Khôi phục session được thực hiện
   // trong useEffect sau khi hydrate (xem effect bootstrap bên dưới).
   const [sessions, setSessions] = useState<CopilotSession[]>([]);
+  const [hasMoreSessions, setHasMoreSessions] = useState(false);
+  const [loadingMoreSessions, setLoadingMoreSessions] = useState(false);
   const [messages, setMessages] = useState<CopilotMessage[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [hasOlderMessages, setHasOlderMessages] = useState(false);
+  const [loadingOlderMessages, setLoadingOlderMessages] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -295,6 +320,17 @@ export default function CopilotPage() {
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const shouldRestoreScrollRef = useRef(false);
   const didBootstrapRef = useRef(false);
+  // Số session đang hiển thị — dùng làm offset khi "Xem thêm" và giữ nguyên
+  // số lượng khi refresh (không co list về 1 trang sau mỗi tin nhắn).
+  const sessionsCountRef = useRef(0);
+  // Khi prepend tin cũ: lưu scrollHeight/scrollTop trước đó để giữ nguyên vị
+  // trí đang đọc thay vì auto-scroll xuống cuối.
+  const prependScrollRef = useRef<{ height: number; top: number } | null>(
+    null,
+  );
+  // Chặn gọi trùng khi scroll bắn nhiều event trước lúc state loading kịp
+  // cập nhật (set state là async, ref thì đồng bộ).
+  const loadingOlderRef = useRef(false);
 
   const activateSession = useCallback((sessionId: number | null) => {
     setActiveSessionId(sessionId);
@@ -306,6 +342,18 @@ export default function CopilotPage() {
   }, []);
 
   useEffect(() => {
+    if (prependScrollRef.current) {
+      const previous = prependScrollRef.current;
+      prependScrollRef.current = null;
+      window.requestAnimationFrame(() => {
+        const el = messagesScrollRef.current;
+        if (el) {
+          el.scrollTop = el.scrollHeight - previous.height + previous.top;
+        }
+      });
+      return;
+    }
+
     if (shouldRestoreScrollRef.current) {
       window.requestAnimationFrame(() => {
         if (messagesScrollRef.current) {
@@ -320,6 +368,7 @@ export default function CopilotPage() {
   }, [messages, sending, scrollToBottom]);
 
   useEffect(() => {
+    sessionsCountRef.current = sessions.length;
     copilotClientSnapshot.sessions = sessions;
     copilotClientSnapshot.messages = messages;
     copilotClientSnapshot.activeSessionId = activeSessionId;
@@ -339,9 +388,18 @@ export default function CopilotPage() {
     setLoading(true);
     setError("");
     try {
-      const res = await apiClient.get("/copilot/sessions");
-      const nextSessions = res.data as CopilotSession[];
-      setSessions(nextSessions);
+      // Refresh giữ nguyên số session đang hiển thị: đã "Xem thêm" tới đâu
+      // thì tải lại tới đó, không co về 1 trang.
+      const limit = Math.min(
+        SESSIONS_MAX_LIMIT,
+        Math.max(SESSIONS_PAGE_SIZE, sessionsCountRef.current),
+      );
+      const res = await apiClient.get(
+        `/copilot/sessions?limit=${limit}&offset=0`,
+      );
+      const data = res.data as CopilotSessionsResponse;
+      setSessions(data.items || []);
+      setHasMoreSessions(Boolean(data.hasMore));
     } catch (err: unknown) {
       setError(getErrorMessage(err, "Không thể tải phiên chat"));
     } finally {
@@ -349,24 +407,52 @@ export default function CopilotPage() {
     }
   }, []);
 
+  const loadMoreSessions = useCallback(async () => {
+    setLoadingMoreSessions(true);
+    setError("");
+    try {
+      const res = await apiClient.get(
+        `/copilot/sessions?limit=${SESSIONS_PAGE_SIZE}&offset=${sessionsCountRef.current}`,
+      );
+      const data = res.data as CopilotSessionsResponse;
+      setSessions((current) => {
+        // Offset có thể lệch khi session mới được tạo -> lọc trùng theo id.
+        const seen = new Set(current.map((item) => item.id));
+        return [
+          ...current,
+          ...(data.items || []).filter((item) => !seen.has(item.id)),
+        ];
+      });
+      setHasMoreSessions(Boolean(data.hasMore));
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể tải thêm phiên chat"));
+    } finally {
+      setLoadingMoreSessions(false);
+    }
+  }, []);
+
   const fetchMessages = useCallback(async (sessionId: number) => {
     setLoadingMessages(true);
     try {
       const [messagesRes, sessionRes] = await Promise.all([
-        apiClient.get(`/copilot/sessions/${sessionId}/messages`),
+        apiClient.get(
+          `/copilot/sessions/${sessionId}/messages?limit=${MESSAGES_INITIAL_LIMIT}`,
+        ),
         apiClient.get(`/copilot/sessions/${sessionId}`),
       ]);
+      const messagesData = messagesRes.data as CopilotMessagesResponse;
+      setHasOlderMessages(Boolean(messagesData.hasMore));
       const sessionData = sessionRes.data as CopilotSession;
       if (sessionData?.status && sessionData.status !== "ACTIVE") {
         // Phiên đã đóng vẫn XEM LẠI được: hiển thị read-only, composer bị khóa,
         // không đụng pending. Muốn chat tiếp thì bấm "Đoạn chat mới".
         setActiveSessionStatus(sessionData.status);
         setActivePendingAction(null);
-        setMessages(messagesRes.data as CopilotMessage[]);
+        setMessages(messagesData.items || []);
         return true;
       }
       setActiveSessionStatus("ACTIVE");
-      const nextMessages = messagesRes.data as CopilotMessage[];
+      const nextMessages = messagesData.items || [];
       const pendingAction = sessionData?.state?.pending_action;
       setActivePendingAction(pendingAction || null);
       if (pendingAction) {
@@ -406,6 +492,51 @@ export default function CopilotPage() {
       setLoadingMessages(false);
     }
   }, []);
+
+  const loadOlderMessages = useCallback(async () => {
+    const sessionId = activeSessionId;
+    if (!sessionId || loadingOlderRef.current) return;
+    // Tin preview pending là tin ảo (id âm) -> lấy id thật nhỏ nhất làm mốc.
+    const oldestId = messages.reduce(
+      (min, message) =>
+        message.id > 0 && message.id < min ? message.id : min,
+      Number.POSITIVE_INFINITY,
+    );
+    if (!Number.isFinite(oldestId)) return;
+
+    loadingOlderRef.current = true;
+    setLoadingOlderMessages(true);
+    setError("");
+    try {
+      const res = await apiClient.get(
+        `/copilot/sessions/${sessionId}/messages?limit=${MESSAGES_OLDER_PAGE_SIZE}&before=${oldestId}`,
+      );
+      const data = res.data as CopilotMessagesResponse;
+      const items = data.items || [];
+      if (items.length > 0) {
+        const el = messagesScrollRef.current;
+        if (el) {
+          prependScrollRef.current = {
+            height: el.scrollHeight,
+            top: el.scrollTop,
+          };
+        }
+        setMessages((current) => {
+          const seen = new Set(current.map((message) => message.id));
+          return [
+            ...items.filter((message) => !seen.has(message.id)),
+            ...current,
+          ];
+        });
+      }
+      setHasOlderMessages(Boolean(data.hasMore));
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, "Không thể tải tin nhắn cũ hơn"));
+    } finally {
+      loadingOlderRef.current = false;
+      setLoadingOlderMessages(false);
+    }
+  }, [activeSessionId, messages]);
 
   // Bootstrap an toàn khi reload: hỏi backend session ACTIVE hiện tại (tạo mới
   // nếu chưa có). Không bao giờ dùng session đã CLOSED.
@@ -604,7 +735,11 @@ export default function CopilotPage() {
           title: makeSessionTitle(content),
         });
         sessionId = (sessionRes.data as CopilotSession).id;
-        setSessions((current) => [sessionRes.data, ...current]);
+        // POST /sessions có thể tái sử dụng session trống đã có trong list.
+        setSessions((current) => [
+          sessionRes.data as CopilotSession,
+          ...current.filter((item) => item.id !== sessionId),
+        ]);
         activateSession(sessionId);
       }
 
@@ -702,7 +837,11 @@ export default function CopilotPage() {
           title: makeSessionTitle(draftMessage),
         });
         sessionId = (sessionRes.data as CopilotSession).id;
-        setSessions((current) => [sessionRes.data, ...current]);
+        // POST /sessions có thể tái sử dụng session trống đã có trong list.
+        setSessions((current) => [
+          sessionRes.data as CopilotSession,
+          ...current.filter((item) => item.id !== sessionId),
+        ]);
         activateSession(sessionId);
       }
 
@@ -1162,6 +1301,9 @@ export default function CopilotPage() {
           loading={loading}
           sending={sending}
           open={sidebarOpen}
+          hasMore={hasMoreSessions}
+          loadingMore={loadingMoreSessions}
+          onLoadMore={() => void loadMoreSessions()}
           onClose={() => setSidebarOpen(false)}
           onNewSession={() => void startNewSession()}
           onSelectSession={selectSession}
@@ -1196,11 +1338,28 @@ export default function CopilotPage() {
                 onScroll={(event) => {
                   copilotClientSnapshot.scrollTop =
                     event.currentTarget.scrollTop;
+                  // Cuộn lên gần đầu -> tự tải trang tin cũ hơn (infinite
+                  // scroll kiểu ChatGPT). Vị trí đọc được giữ nguyên khi
+                  // prepend nên không giật xuống cuối.
+                  if (
+                    event.currentTarget.scrollTop < 80 &&
+                    hasOlderMessages &&
+                    !loadingMessages &&
+                    !loadingOlderMessages
+                  ) {
+                    void loadOlderMessages();
+                  }
                 }}
                 className="flex-1 overflow-y-auto [scrollbar-width:thin] [scrollbar-color:#d4d4d8_transparent]"
               >
                 <div className="mx-auto w-full max-w-3xl space-y-5 px-4 py-6">
                   {error && <CopilotErrorCard message={error} />}
+                  {loadingOlderMessages && (
+                    <div className="flex items-center justify-center gap-2 py-1 text-[12px] text-zinc-400">
+                      <LoaderCircle size={14} className="animate-spin" />
+                      Đang tải tin nhắn cũ hơn...
+                    </div>
+                  )}
                   {messages.map((message) => (
                     <CopilotMessageBubble
                       key={message.id}

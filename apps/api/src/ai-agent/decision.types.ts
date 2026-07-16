@@ -107,9 +107,19 @@ export interface DuplicateStudentContext {
 }
 
 export interface PendingEnrollmentContext {
+  /** 0 = chưa chốt học viên (đang chờ chọn) HOẶC bản gộp nhiều người (userIds). */
   userId: number;
+  /** Ghi danh GỘP nhiều học viên: danh sách id + nhãn hiển thị tương ứng. */
+  userIds?: number[];
+  studentLabels?: string[];
   courseId: number;
   candidateClasses: EntityOption[];
+  /** Nhiều học viên trùng tên: danh sách chờ chọn (theo số thứ tự hoặc tên). */
+  candidateStudents?: EntityOption[];
+  /** Đích ghi danh gốc, giữ lại để đi tiếp sau khi user chọn học viên. */
+  targetType?: 'course' | 'class';
+  targetKeyword?: string;
+  targetCourseKeyword?: string;
   expireDate?: string | null;
   allowLatePayment?: boolean | null;
 }
@@ -256,6 +266,19 @@ export type CopilotResponse =
       suggestions?: ProactiveSuggestion[];
     };
 
+/**
+ * Cập nhật học viên đang dở: đã parse được field cần đổi nhưng chưa chốt
+ * học viên (đang hỏi "học viên nào?"), hoặc ngược lại đã chốt học viên nhưng
+ * chưa biết đổi gì. Câu trả lời tiếp theo (số thứ tự/tên/field) đi tiếp từ đây.
+ */
+export interface PendingStudentUpdateContext {
+  /** Field muốn đổi đã parse sẵn (phone, email, birthDate, address, fullName). */
+  fields: Record<string, string>;
+  /** Học viên đã chốt (khi đang hỏi field cần đổi). */
+  student_id?: number | null;
+  student_label?: string | null;
+}
+
 export interface DecisionContext {
   last_intent?: AiIntent | string | null;
   selected_student_id?: number | null;
@@ -277,6 +300,7 @@ export interface DecisionContext {
   duplicate_student_context?: DuplicateStudentContext | null;
   pending_enrollment_context?: PendingEnrollmentContext | null;
   pending_class_creation?: PendingClassCreationContext | null;
+  pending_student_update?: PendingStudentUpdateContext | null;
   /** Idempotency key của pending action ĐÃ execute gần nhất (chống double-submit). */
   last_executed_idempotency_key?: string | null;
   [key: string]: unknown;

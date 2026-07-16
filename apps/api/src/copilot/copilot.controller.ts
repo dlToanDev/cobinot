@@ -7,6 +7,7 @@ import {
   ParseIntPipe,
   Patch,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
@@ -37,8 +38,16 @@ export class CopilotController {
   }
 
   @Get('sessions')
-  findSessions(@GetActor() actor: ActorPayload) {
-    return this.copilotService.findSessions(actor.tenantId, actor.userId);
+  findSessions(
+    @GetActor() actor: ActorPayload,
+    @Query('limit') limit?: string,
+    @Query('offset') offset?: string,
+  ) {
+    // Service tự clamp limit/offset (mặc định 10, tối đa 50).
+    return this.copilotService.findSessions(actor.tenantId, actor.userId, {
+      limit: limit !== undefined ? Number(limit) : undefined,
+      offset: offset !== undefined ? Number(offset) : undefined,
+    });
   }
 
   @Get('sessions/current')
@@ -61,8 +70,14 @@ export class CopilotController {
   findMessages(
     @GetActor() actor: ActorPayload,
     @Param('id', ParseIntPipe) id: number,
+    @Query('limit') limit?: string,
+    @Query('before') before?: string,
   ) {
-    return this.copilotService.findMessages(actor.tenantId, actor.userId, id);
+    // Service tự clamp limit/before (mặc định 50 tin mới nhất, tối đa 200).
+    return this.copilotService.findMessages(actor.tenantId, actor.userId, id, {
+      limit: limit !== undefined ? Number(limit) : undefined,
+      before: before !== undefined ? Number(before) : undefined,
+    });
   }
 
   @Post('sessions/:id/messages')

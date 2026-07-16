@@ -419,6 +419,34 @@ describe('DeterministicIntentService', () => {
     }
   });
 
+  it('"hsk1, lớp luyện đề, ngày bắt đầu là ngày hôm này..." -> tên KHÔNG dính loại, type EXAM_PRACTICE, ngày bắt đầu = hôm nay', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 9, title: 'Tiếng Trung', courseCode: 'TIENG_TRUNG' },
+    ]);
+
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const now = new Date();
+    const todayIso = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tạo lớp học hsk1, lớp luyện đề, ngày bắt đầu là ngày hôm này ngày kết thúc là 21/08/2026 trong khóa Tiếng Trung',
+    );
+
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        courseId: 9,
+        title: 'hsk1',
+        type: 'EXAM_PRACTICE',
+        sessions: [],
+        startDate: todayIso,
+        endDate: '2026-08-21',
+      });
+    }
+  });
+
   it('tạo lớp theo tuần thiếu tên -> hỏi tên NGẮN GỌN + lưu pending_class_creation', async () => {
     coursesService.searchCourses.mockResolvedValue([
       { id: 62, title: 'Tiếng Bi', courseCode: 'TIENG_BI' },
@@ -706,6 +734,13 @@ describe('DeterministicIntentService', () => {
     // "ngày bắt đầu là hôm nay" cũng phải hiểu được.
     const range2 = service.parseClassDateRange('ngày bắt đầu là hôm nay');
     expect(range2.startDate).toBe(todayIso);
+
+    // Lỗi gõ phổ biến "ngày hôm này" (này thay vì nay) vẫn phải nhận.
+    const range3 = service.parseClassDateRange(
+      'ngày bắt đầu là ngày hôm này ngày kết thúc là 21/08/2026',
+    );
+    expect(range3.startDate).toBe(todayIso);
+    expect(range3.endDate).toBe('2026-08-21');
   });
 
   it('parseViDate: dd/mm thiếu năm -> năm hiện tại; dd/mm/yyyy giữ nguyên', () => {
@@ -901,6 +936,205 @@ describe('DeterministicIntentService', () => {
         }),
       );
       expect(outcome.contextPatch.last_candidates?.classes).toHaveLength(2);
+    }
+  });
+
+  it('ghi danh: nhiều HỌC VIÊN trùng tên -> clarification chọn học viên + LƯU đích ghi danh vào pending_enrollment_context', async () => {
+    // Tái hiện sự cố "them toan h vao lop nay" -> 4 học viên trùng tên; trước
+    // đây chỉ lưu last_candidates (mất lớp đích) nên câu trả lời "1" rơi xuống
+    // LLM và không tạo được bản nháp nào.
+    usersService.searchStudents.mockResolvedValue([
+      { id: 132, fullName: 'Toan H' },
+      { id: 131, fullName: 'Toan Hoang', email: 'toanhoang12@gmail.com' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'them toan h vao lop hehe cho toi',
+    );
+
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.missingFields).toEqual(['userId']);
+      expect(outcome.intent).toBe('assign_student_to_class');
+      expect(outcome.message).toContain('Bạn muốn chọn học viên nào?');
+      expect(outcome.contextPatch.pending_enrollment_context).toEqual(
+        expect.objectContaining({
+          userId: 0,
+          candidateStudents: [
+            expect.objectContaining({ id: 132 }),
+            expect.objectContaining({ id: 131 }),
+          ],
+          targetType: 'class',
+          targetKeyword: 'hehe',
+        }),
+      );
+    }
+  });
+
+  it('ghi danh NHIỀU học viên "A và B vào lớp X": 1 bản nháp GỘP userIds, confirm 1 lần', async () => {
+    usersService.searchStudents
+      .mockResolvedValueOnce([{ id: 3, fullName: 'Tiến' }])
+      .mockResolvedValueOnce([{ id: 132, fullName: 'Toan H' }]);
+    coursesService.searchClasses.mockResolvedValue([
+      {
+        id: 8,
+        title: 'Tiếng Bỉ 1',
+        courseId: 20,
+        course: { id: 20, title: 'Tiếng Bỉ' },
+      },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'thêm tiến và toan h vào lớp tiếng bỉ 1',
+    );
+
+    expect(usersService.searchStudents).toHaveBeenNthCalledWith(1, 1, 'tiến');
+    expect(usersService.searchStudents).toHaveBeenNthCalledWith(2, 1, 'toan h');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('assign_student_to_class');
+      expect(outcome.pending.input).toEqual({
+        userIds: [3, 132],
+        classId: 8,
+      });
+      expect(outcome.pending.summary).toBe(
+        'Thêm 2 học viên (Tiến, Toan H) vào lớp Tiếng Bỉ 1',
+      );
+      expect(outcome.pending.display_input?.students).toEqual([
+        expect.objectContaining({ id: 3, label: 'Tiến' }),
+        expect.objectContaining({ id: 132, label: 'Toan H' }),
+      ]);
+    }
+  });
+
+  it('ghi danh nhiều học viên: 1 tên trùng nhiều người -> hỏi lại NÊU RÕ tên đó, không hủy cả nhóm', async () => {
+    usersService.searchStudents
+      .mockResolvedValueOnce([{ id: 3, fullName: 'Tiến' }])
+      .mockResolvedValueOnce([
+        { id: 132, fullName: 'Toan H' },
+        { id: 131, fullName: 'Toan Hoang', email: 'toanhoang12@gmail.com' },
+      ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'thêm tiến, toan vào lớp tiếng bỉ 1',
+    );
+
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.intent).toBe('assign_student_to_class');
+      expect(outcome.message).toContain('"toan" có nhiều người trùng tên');
+      expect(outcome.message).toContain('Toan Hoang');
+      expect(outcome.message).toContain('ghi rõ hơn');
+    }
+  });
+
+  it('ghi danh nhiều học viên vào lớp trùng tên nhiều khóa -> hỏi chọn lớp, giữ userIds trong context', async () => {
+    usersService.searchStudents
+      .mockResolvedValueOnce([{ id: 3, fullName: 'Tiến' }])
+      .mockResolvedValueOnce([{ id: 132, fullName: 'Toan H' }]);
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 50, title: 'Test 1', courseId: 91 },
+      { id: 40, title: 'Test 1', courseId: 89 },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'thêm tiến và toan h vào lớp test 1',
+    );
+
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.missingFields).toEqual(['classId']);
+      expect(outcome.message).toContain('Bạn muốn thêm Tiến, Toan H vào lớp nào?');
+      expect(outcome.contextPatch.pending_enrollment_context).toEqual(
+        expect.objectContaining({
+          userId: 0,
+          userIds: [3, 132],
+          studentLabels: ['Tiến', 'Toan H'],
+        }),
+      );
+    }
+  });
+
+  it('resolveEnrollStudentReply: chọn học viên xong đi tiếp đích đã lưu -> preview assign_student_to_class', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      {
+        id: 7,
+        title: 'hehe',
+        courseId: 20,
+        course: { id: 20, title: 'Tiếng Bỉ' },
+      },
+    ]);
+
+    const outcome = await service.resolveEnrollStudentReply(
+      1,
+      {} as any,
+      {
+        userId: 0,
+        courseId: 0,
+        candidateClasses: [],
+        candidateStudents: [{ id: 132, value: 132, label: 'Toan H' }],
+        targetType: 'class',
+        targetKeyword: 'hehe',
+      },
+      { id: 132, label: 'Toan H' },
+    );
+
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, 'hehe');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('assign_student_to_class');
+      expect(outcome.pending.input).toEqual({ userId: 132, classId: 7 });
+      expect(outcome.pending.summary).toBe(
+        'Thêm học viên Toan H vào lớp hehe',
+      );
+    }
+  });
+
+  it('resolveEnrollStudentReply: chọn NHIỀU người ("1,3,5") -> bản nháp ghi danh GỘP userIds', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      {
+        id: 50,
+        title: 'Test 1',
+        courseId: 91,
+        course: { id: 91, title: 'Anh Văn' },
+      },
+    ]);
+
+    const outcome = await service.resolveEnrollStudentReply(
+      1,
+      {} as any,
+      {
+        userId: 0,
+        courseId: 0,
+        candidateClasses: [],
+        candidateStudents: [],
+        targetType: 'class',
+        targetKeyword: 'test 1',
+      },
+      [
+        { id: 132, label: 'Toan H' },
+        { id: 127, label: 'Toan Haha' },
+        { id: 114, label: 'Toàn Hoàng' },
+      ],
+    );
+
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userIds: [132, 127, 114],
+        classId: 50,
+      });
+      expect(outcome.pending.summary).toBe(
+        'Thêm 3 học viên (Toan H, Toan Haha, Toàn Hoàng) vào lớp Test 1',
+      );
     }
   });
 
@@ -1298,5 +1532,425 @@ describe('DeterministicIntentService', () => {
     const fb = await service.fallbackSearch(1, 'tìm học viên nam');
     expect(fb).not.toBeNull();
     expect(usersService.searchStudents).toHaveBeenCalledWith(1, 'nam');
+  });
+
+  it('"tạo cho tôi 1 hv tên Minh Nguyễn , email, sđt" -> tên đúng "Minh Nguyễn" (bỏ "1 hv tên")', async () => {
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tạo cho tôi 1 hv tên Minh Nguyễn , minh123@gmail.com, 0987643251',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        fullName: 'Minh Nguyễn',
+        email: 'minh123@gmail.com',
+        phone: '0987643251',
+      });
+    }
+  });
+
+  it('"tạo hv tên Minh Anh" -> không cắt mất "Minh" (trùng từ đệm "mình")', async () => {
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tạo cho tôi 1 học viên tên Minh Anh 0987643251',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        fullName: 'Minh Anh',
+        phone: '0987643251',
+      });
+    }
+  });
+
+  // ---- Update class dates ---------------------------------------------------
+
+  const todayIso = (() => {
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const now = new Date();
+    return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+  })();
+
+  it('"ngày bắt đầu là hôm nay" sau khi tạo lớp -> preview update_class lớp vừa tạo (không rơi xuống LLM)', async () => {
+    const outcome = await service.resolve(
+      1,
+      { last_created_class: { id: 53, label: 'Test 12' } },
+      'ngày bắt đầu là hôm nay',
+    );
+    expect(coursesService.searchClasses).not.toHaveBeenCalled();
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_class');
+      expect(outcome.pending.input).toEqual({
+        classId: 53,
+        startDate: todayIso,
+      });
+      expect(outcome.pending.status).toBe('waiting_confirm');
+    }
+  });
+
+  it('"lớp Test 12 kết thúc 30/9/2026" -> tự tìm lớp, preview update_class với endDate', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 53, title: 'Test 12' },
+    ]);
+    const outcome = await service.resolve(
+      1,
+      {},
+      'lớp Test 12 kết thúc 30/9/2026',
+    );
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, 'Test 12');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        classId: 53,
+        endDate: '2026-09-30',
+      });
+    }
+  });
+
+  it('"cập nhật ngày bắt đầu..." có cả khóa lẫn lớp trong ngữ cảnh -> update_class (ngày thuộc lớp, không hỏi khóa)', async () => {
+    const outcome = await service.resolve(
+      1,
+      {
+        last_created_course: { id: 9, label: 'Anh Văn' },
+        last_created_class: { id: 53, label: 'Test 12' },
+      },
+      'cập nhật ngày bắt đầu là hôm nay',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_class');
+      expect(outcome.pending.input).toEqual({
+        classId: 53,
+        startDate: todayIso,
+      });
+    }
+  });
+
+  it('"ngày bắt đầu là hôm nay" khi KHÔNG có lớp trong ngữ cảnh -> hỏi lớp nào', async () => {
+    const outcome = await service.resolve(1, {}, 'ngày bắt đầu là hôm nay');
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.intent).toBe('update_class');
+      expect(outcome.message).toContain('lớp nào');
+    }
+  });
+
+  // ---- Update student ------------------------------------------------------
+
+  it('"cập nhật thêm sdt là 0987654123" sau khi tạo học viên -> update_student học viên vừa tạo (không hỏi khóa học)', async () => {
+    const outcome = await service.resolve(
+      1,
+      {
+        last_intent: 'create_student',
+        last_created_student: { id: 7, label: 'Đặng Ngọc Linh' },
+      },
+      'cập nhật thêm sdt là 0987654123',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_student');
+      expect(outcome.pending.input).toEqual({
+        userId: 7,
+        phone: '0987654123',
+      });
+      expect(outcome.contextPatch.last_intent).toBe('update_student');
+    }
+    expect(usersService.searchStudents).not.toHaveBeenCalled();
+  });
+
+  it('"sữa so dien thoai cua hv vua tao thành 09..." -> update_student học viên vừa tạo, KHÔNG phải create', async () => {
+    // Tái hiện sự cố: chữ "tạo" trong cụm tham chiếu "vừa tạo" bị hiểu nhầm
+    // là động từ tạo -> câu sửa bị hijack thành preview TẠO học viên tên rác
+    // "sửa cua hv vua tao thành". ("sữa" là typo phổ biến của "sửa".)
+    const outcome = await service.resolve(
+      1,
+      {
+        last_intent: 'create_student',
+        last_created_student: { id: 7, label: 'Đặng Ngọc Linh' },
+      },
+      'sữa so dien thoai cua hv vua tao thành 0978656453',
+    );
+
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_student');
+      expect(outcome.pending.input).toEqual({
+        userId: 7,
+        phone: '0978656453',
+      });
+    }
+    expect(usersService.searchStudents).not.toHaveBeenCalled();
+  });
+
+  it('"cập nhật sđt ..." khi KHÔNG có học viên trong ngữ cảnh -> hỏi học viên nào (không hỏi khóa học)', async () => {
+    const outcome = await service.resolve(
+      1,
+      {},
+      'cập nhật sđt là 0987654123',
+    );
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.intent).toBe('update_student');
+      expect(outcome.message).toContain('học viên nào');
+    }
+  });
+
+  it('"cập nhật" trống sau khi tạo học viên -> hỏi field cần đổi cho đúng học viên vừa tạo', async () => {
+    const outcome = await service.resolve(
+      1,
+      {
+        last_intent: 'create_student',
+        last_created_student: { id: 7, label: 'Đặng Ngọc Linh' },
+      },
+      'cập nhật',
+    );
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.intent).toBe('update_student');
+      expect(outcome.message).toContain('Đặng Ngọc Linh');
+    }
+  });
+
+  it('"sửa email học viên An thành ..." -> tự tìm học viên An, preview update_student với email mới', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 12, fullName: 'Nguyễn Văn An' },
+    ]);
+    const outcome = await service.resolve(
+      1,
+      {},
+      'sửa email học viên An thành an2@gmail.com',
+    );
+    expect(usersService.searchStudents).toHaveBeenCalledWith(1, 'An');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_student');
+      expect(outcome.pending.input).toEqual({
+        userId: 12,
+        email: 'an2@gmail.com',
+      });
+    }
+  });
+
+  it('"đổi tên học viên A thành B" -> tách tên cần tìm và tên mới', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 15, fullName: 'Trần Văn A' },
+    ]);
+    const outcome = await service.resolve(
+      1,
+      {},
+      'đổi tên học viên Trần Văn A thành Trần Văn B',
+    );
+    expect(usersService.searchStudents).toHaveBeenCalledWith(1, 'Trần Văn A');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 15,
+        fullName: 'Trần Văn B',
+      });
+    }
+  });
+
+  it('"cập nhật tên thành ..." khi vừa tạo học viên -> đổi tên học viên ngữ cảnh', async () => {
+    const outcome = await service.resolve(
+      1,
+      {
+        last_intent: 'create_student',
+        last_created_student: { id: 7, label: 'Đặng Ngọc Linh' },
+      },
+      'cập nhật tên thành Đặng Ngọc Lan',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_student');
+      expect(outcome.pending.input).toEqual({
+        userId: 7,
+        fullName: 'Đặng Ngọc Lan',
+      });
+    }
+  });
+
+  it('"cập nhật ngày sinh 12/03/2000, địa chỉ Hà Nội" -> bóc đủ field, chuẩn ISO ngày', async () => {
+    const outcome = await service.resolve(
+      1,
+      { last_created_student: { id: 7, label: 'Đặng Ngọc Linh' } },
+      'cập nhật ngày sinh 12/03/2000, địa chỉ Hà Nội',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 7,
+        birthDate: '2000-03-12',
+        address: 'Hà Nội',
+      });
+    }
+  });
+
+  it('keyword học viên không dính từ nối: "học viên Minh Nguyễn CÓ ngày sinh..." -> tìm "Minh Nguyễn"', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 21, fullName: 'Minh Nguyễn' },
+    ]);
+    const outcome = await service.resolve(
+      1,
+      {},
+      'đổi cho tôi học viên Minh Nguyễn có ngày sinh là 1/3/2003',
+    );
+    expect(usersService.searchStudents).toHaveBeenCalledWith(1, 'Minh Nguyễn');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 21,
+        birthDate: '2003-03-01',
+      });
+    }
+  });
+
+  it('nhiều học viên trùng tên -> hỏi chọn, LƯU field đã parse vào pending_student_update', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 20, fullName: 'Minh Nguyễn Hoàng' },
+      { id: 21, fullName: 'Minh Nguyễn' },
+    ]);
+    const outcome = await service.resolve(
+      1,
+      {},
+      'đổi cho tôi học viên Minh Nguyễn ngày sinh là 1/3/2003',
+    );
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.intent).toBe('update_student');
+      expect(outcome.contextPatch.pending_student_update).toEqual({
+        fields: { birthDate: '2003-03-01' },
+      });
+      expect(outcome.contextPatch.last_candidates?.students).toHaveLength(2);
+    }
+  });
+
+  it('trả lời "2" sau danh sách trùng tên -> update đúng học viên thứ 2 với field đã lưu', async () => {
+    const state = {
+      last_intent: 'update_student',
+      pending_student_update: { fields: { birthDate: '2003-03-01' } },
+      last_candidates: {
+        students: [
+          { id: 20, value: 20, label: 'Minh Nguyễn Hoàng' },
+          { id: 21, value: 21, label: 'Minh Nguyễn' },
+        ],
+      },
+    };
+    const outcome = await service.resolve(1, state as any, '2');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('update_student');
+      expect(outcome.pending.input).toEqual({
+        userId: 21,
+        birthDate: '2003-03-01',
+      });
+      expect(outcome.contextPatch.pending_student_update).toBeNull();
+    }
+  });
+
+  it('trả lời bằng TÊN sau danh sách trùng -> khớp chính xác, không dính tên dài hơn', async () => {
+    const state = {
+      pending_student_update: { fields: { phone: '0987643251' } },
+      last_candidates: {
+        students: [
+          { id: 20, value: 20, label: 'Minh Nguyễn Hoàng' },
+          { id: 21, value: 21, label: 'Minh Nguyễn' },
+        ],
+      },
+    };
+    const outcome = await service.resolve(1, state as any, 'Minh Nguyễn');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 21,
+        phone: '0987643251',
+      });
+    }
+  });
+
+  it('trả lời "hủy" khi đang chọn học viên -> dừng thao tác, xóa context', async () => {
+    const state = {
+      pending_student_update: { fields: { birthDate: '2003-03-01' } },
+      last_candidates: {
+        students: [{ id: 20, value: 20, label: 'Minh Nguyễn Hoàng' }],
+      },
+    };
+    const outcome = await service.resolve(1, state as any, 'hủy');
+    expect(outcome?.type).toBe('message');
+    if (outcome?.type === 'message') {
+      expect(outcome.message).toContain('Đã hủy');
+      expect(outcome.contextPatch.pending_student_update).toBeNull();
+    }
+  });
+
+  it('đã chốt học viên, trả lời field cần đổi ("sđt 0987...") -> preview luôn', async () => {
+    const state = {
+      pending_student_update: {
+        fields: {},
+        student_id: 7,
+        student_label: 'Đặng Ngọc Linh',
+      },
+    };
+    const outcome = await service.resolve(1, state as any, 'sđt 0987654123');
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 7,
+        phone: '0987654123',
+      });
+    }
+  });
+
+  it('đang hỏi tên học viên, trả lời tên mới -> tìm tiếp và preview với field đã lưu', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 33, fullName: 'Trần Thị Hoa' },
+    ]);
+    const state = {
+      pending_student_update: { fields: { phone: '0987654123' } },
+    };
+    const outcome = await service.resolve(1, state as any, 'Trần Thị Hoa');
+    expect(usersService.searchStudents).toHaveBeenCalledWith(
+      1,
+      'Trần Thị Hoa',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.input).toEqual({
+        userId: 33,
+        phone: '0987654123',
+      });
+    }
+  });
+
+  it('đang chọn học viên nhưng user đổi ý gõ intent khác -> không hijack', async () => {
+    const state = {
+      pending_student_update: { fields: { phone: '0987654123' } },
+      last_candidates: {
+        students: [{ id: 20, value: 20, label: 'Minh Nguyễn Hoàng' }],
+      },
+    };
+    const outcome = await service.resolve(
+      1,
+      state as any,
+      'tạo học viên Lê Minh Tuấn',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('create_student');
+    }
+  });
+
+  it('"tạo học viên Nguyễn Văn An sđt 0988888888" vẫn là create, không bị hiểu thành update', async () => {
+    const outcome = await service.resolve(
+      1,
+      { last_created_student: { id: 7, label: 'Đặng Ngọc Linh' } },
+      'tạo học viên Nguyễn Văn An số điện thoại 0988888888',
+    );
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('create_student');
+    }
   });
 });

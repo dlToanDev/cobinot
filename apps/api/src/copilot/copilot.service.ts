@@ -55,11 +55,28 @@ export class CopilotService {
   private static readonly AI_FALLBACK_PREFIX =
     'AI đang tạm hết quota, mình sẽ tìm trực tiếp trong dữ liệu hệ thống.\n\n';
 
-  createSession(
+  async createSession(
     tenantId: number,
     userId: number,
     dto: CreateCopilotSessionDto,
   ) {
+    // Chống session rác: bấm "Chat mới" liên tục mà chưa nhắn gì thì tái sử
+    // dụng session ACTIVE trống thay vì tạo bản ghi mới. Reset title + state
+    // sạch nên hành vi giống hệt một session vừa tạo.
+    const emptyActive = await this.prisma.aiAgentSession.findFirst({
+      where: { tenantId, userId, status: 'ACTIVE', messages: { none: {} } },
+      orderBy: { updatedAt: 'desc' },
+    });
+    if (emptyActive) {
+      return this.prisma.aiAgentSession.update({
+        where: { id: emptyActive.id },
+        data: {
+          title: dto.title || 'Phiên chat mới',
+          state: createDefaultCopilotState() as any,
+        },
+      });
+    }
+
     return this.prisma.aiAgentSession.create({
       data: {
         tenantId,
@@ -72,11 +89,34 @@ export class CopilotService {
     });
   }
 
-  findSessions(tenantId: number, userId: number) {
-    return this.prisma.aiAgentSession.findMany({
+  /**
+   * Danh sách session có phân trang (sidebar chỉ hiển thị 1 trang, bấm
+   * "Xem thêm" mới tải tiếp). Lấy limit+1 bản ghi để biết còn trang sau
+   * hay không mà không cần COUNT riêng.
+   */
+  async findSessions(
+    tenantId: number,
+    userId: number,
+    pagination?: { limit?: number; offset?: number },
+  ) {
+    const rawLimit = Number(pagination?.limit);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(Math.trunc(rawLimit), 1), 50)
+      : 10;
+    const rawOffset = Number(pagination?.offset);
+    const offset =
+      Number.isFinite(rawOffset) && rawOffset > 0 ? Math.trunc(rawOffset) : 0;
+
+    const rows = await this.prisma.aiAgentSession.findMany({
       where: { tenantId, userId },
-      orderBy: { updatedAt: 'desc' },
+      // Thêm id làm tiebreaker để thứ tự ổn định giữa các trang khi
+      // updatedAt trùng nhau.
+      orderBy: [{ updatedAt: 'desc' }, { id: 'desc' }],
+      skip: offset,
+      take: limit + 1,
     });
+
+    return { items: rows.slice(0, limit), hasMore: rows.length > limit };
   }
 
   /**
@@ -95,6 +135,20 @@ export class CopilotService {
       const expired = ttlHours > 0 && ageMs > ttlHours * 60 * 60 * 1000;
       if (!expired) {
         return active;
+      }
+      // Session quá cũ nhưng TRỐNG (chưa nhắn gì) -> reset dùng lại luôn,
+      // đóng rồi tạo mới chỉ tích thêm session rác CLOSED.
+      const messageCount = await this.prisma.aiAgentSessionMessage.count({
+        where: { sessionId: active.id },
+      });
+      if (messageCount === 0) {
+        return this.prisma.aiAgentSession.update({
+          where: { id: active.id },
+          data: {
+            title: 'Phiên chat mới',
+            state: createDefaultCopilotState() as any,
+          },
+        });
       }
       // Session quá cũ -> đóng (clear context) rồi tạo mới.
       await this.closeSession(tenantId, userId, active.id);
@@ -166,12 +220,37 @@ export class CopilotService {
     return this.prisma.aiAgentSession.delete({ where: { id } });
   }
 
-  async findMessages(tenantId: number, userId: number, sessionId: number) {
+  /**
+   * Tin nhắn của session, mặc định chỉ trả `limit` tin MỚI NHẤT (UI chat mở
+   * từ cuối). Truyền `before` (id tin cũ nhất đang hiển thị) để tải trang cũ
+   * hơn. Lấy limit+1 để biết còn tin cũ hơn không mà không cần COUNT.
+   */
+  async findMessages(
+    tenantId: number,
+    userId: number,
+    sessionId: number,
+    pagination?: { limit?: number; before?: number },
+  ) {
     await this.findSession(tenantId, userId, sessionId);
-    return this.prisma.aiAgentSessionMessage.findMany({
-      where: { sessionId },
-      orderBy: { createdAt: 'asc' },
+
+    const rawLimit = Number(pagination?.limit);
+    const limit = Number.isFinite(rawLimit)
+      ? Math.min(Math.max(Math.trunc(rawLimit), 1), 200)
+      : 50;
+    const rawBefore = Number(pagination?.before);
+    const before =
+      Number.isFinite(rawBefore) && rawBefore > 0 ? Math.trunc(rawBefore) : 0;
+
+    const rows = await this.prisma.aiAgentSessionMessage.findMany({
+      where: { sessionId, ...(before ? { id: { lt: before } } : {}) },
+      // id autoincrement trùng thứ tự tạo -> sort id desc lấy tin mới nhất,
+      // rồi đảo lại thành asc cho UI hiển thị từ trên xuống.
+      orderBy: { id: 'desc' },
+      take: limit + 1,
     });
+
+    const hasMore = rows.length > limit;
+    return { items: rows.slice(0, limit).reverse(), hasMore };
   }
 
   async createMessage(
@@ -1192,6 +1271,25 @@ export class CopilotService {
         .join('\n');
     }
 
+    if (toolName === 'assign_student_to_class' && row.bulk) {
+      // Kết quả GỘP: báo cáo từng dòng ✓ / ⚠ / ✗, không all-or-nothing.
+      const className = row.className || `#${row.classId}`;
+      const lines = (Array.isArray(row.items) ? row.items : []).map(
+        (item: any) => {
+          const name = item.studentName || `học viên #${item.userId}`;
+          if (item.status === 'SUCCESS') return `✓ ${name} — đã thêm vào lớp`;
+          if (item.status === 'ALREADY_IN_CLASS')
+            return `⚠ ${name} — đã có trong lớp từ trước`;
+          return `✗ ${name} — ${item.message || 'lỗi không xác định'}`;
+        },
+      );
+      return [
+        `Đã xử lý ${row.total} học viên cho lớp ${className}: ${row.successCount}/${row.total} thêm thành công.`,
+        '',
+        ...lines,
+      ].join('\n');
+    }
+
     if (toolName === 'assign_student_to_class') {
       const studentName =
         row.user?.fullName || row.user?.name || `#${row.userId}`;
@@ -1611,7 +1709,10 @@ export class CopilotService {
       }
     }
     if (toolName === 'assign_student_to_class') {
-      if (!Number(input.userId || 0)) {
+      const hasBulkUsers =
+        Array.isArray(input.userIds) &&
+        input.userIds.some((id) => Number(id) > 0);
+      if (!hasBulkUsers && !Number(input.userId || 0)) {
         return {
           message: 'Vui lòng chọn học viên.',
           errors: { userId: 'Vui lòng chọn học viên.' },
@@ -2239,6 +2340,73 @@ export class CopilotService {
       });
     }
 
+    // Đang chờ chọn HỌC VIÊN (nhiều người trùng tên): resolve theo số thứ
+    // tự/tên rồi đi tiếp phần đích ghi danh đã lưu — không rơi xuống LLM.
+    // Hỗ trợ chọn NHIỀU người cùng lúc ("1,3,5") -> bản nháp ghi danh gộp.
+    if (!ctx.userId && ctx.candidateStudents?.length) {
+      const chosenStudents = this.resolveMultiChoice(
+        content,
+        ctx.candidateStudents,
+      );
+      if (!chosenStudents?.length) return null;
+
+      let outcome: DeterministicOutcome | null = null;
+      try {
+        const picked = chosenStudents.map((option) => ({
+          id: Number(option.id),
+          label: option.label,
+        }));
+        outcome = await this.deterministic.resolveEnrollStudentReply(
+          actor.tenantId,
+          state,
+          ctx,
+          picked.length === 1 ? picked[0] : picked,
+        );
+      } catch {
+        outcome = null;
+      }
+      if (!outcome) return null;
+
+      const basePatch: Partial<DecisionContext> = {
+        pending_enrollment_context: null,
+        pending_clarification: null,
+        ...(chosenStudents.length === 1
+          ? { selected_student_id: Number(chosenStudents[0].id) }
+          : {}),
+      };
+      if (outcome.type === 'pending_write') {
+        return this.savePendingWriteTurn({
+          actor,
+          sessionId,
+          state: this.mergeState(state, basePatch),
+          pending: outcome.pending,
+          userMessageId,
+          startedAt,
+          contextPatch: outcome.contextPatch,
+        });
+      }
+      const response: CopilotResponse =
+        outcome.type === 'clarification'
+          ? {
+              type: 'clarification',
+              message: outcome.message,
+              missing_fields: outcome.missingFields,
+              intent: outcome.intent,
+              entities: {},
+            }
+          : { type: 'text_message', message: (outcome as any).message };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, {
+          ...basePatch,
+          ...outcome.contextPatch,
+        }),
+      });
+    }
+
     const chosen = this.resolveClassChoice(content, ctx.candidateClasses || []);
     if (!chosen) {
       // Không xác định được lớp -> để agent xử lý tiếp, giữ context.
@@ -2254,23 +2422,50 @@ export class CopilotService {
       Number(chosenMeta.courseId ?? chosenMeta.course?.id) ||
       ctx.courseId ||
       null;
-    const pending: PendingAction = {
-      tool_name: 'assign_student_to_class',
-      input: {
-        userId: ctx.userId,
-        classId: chosen.id,
-      },
-      display_input: {
-        userId: ctx.userId,
-        ...(courseId ? { courseId } : {}),
-        classId: chosen.id,
-        className: chosen.label,
-      },
-      summary: `Thêm học viên #${ctx.userId} vào lớp ${chosen.label}${courseId ? ` (khóa #${courseId})` : ''}`,
-      intent: 'assign_student_to_class',
-      status: 'waiting_confirm',
-      severity: 'default',
-    };
+    const isBulk = Array.isArray(ctx.userIds) && ctx.userIds.length > 1;
+    const bulkStudents = isBulk
+      ? ctx.userIds!.map((id, index) => ({
+          id,
+          label: ctx.studentLabels?.[index] || `#${id}`,
+          email: null,
+        }))
+      : [];
+    const pending: PendingAction = isBulk
+      ? {
+          tool_name: 'assign_student_to_class',
+          input: {
+            userIds: ctx.userIds,
+            classId: chosen.id,
+          },
+          display_input: {
+            userIds: ctx.userIds,
+            ...(courseId ? { courseId } : {}),
+            classId: chosen.id,
+            className: chosen.label,
+            students: bulkStudents,
+          },
+          summary: `Thêm ${ctx.userIds!.length} học viên (${bulkStudents.map((s) => s.label).join(', ')}) vào lớp ${chosen.label}`,
+          intent: 'assign_student_to_class',
+          status: 'waiting_confirm',
+          severity: 'default',
+        }
+      : {
+          tool_name: 'assign_student_to_class',
+          input: {
+            userId: ctx.userId,
+            classId: chosen.id,
+          },
+          display_input: {
+            userId: ctx.userId,
+            ...(courseId ? { courseId } : {}),
+            classId: chosen.id,
+            className: chosen.label,
+          },
+          summary: `Thêm học viên #${ctx.userId} vào lớp ${chosen.label}${courseId ? ` (khóa #${courseId})` : ''}`,
+          intent: 'assign_student_to_class',
+          status: 'waiting_confirm',
+          severity: 'default',
+        };
     const clearedState = this.mergeState(state, {
       pending_enrollment_context: null,
       pending_clarification: null,
@@ -2432,6 +2627,33 @@ export class CopilotService {
       description: [c.classCode, c.status].filter(Boolean).join(' | '),
       metadata: c,
     };
+  }
+
+  /**
+   * Chọn NHIỀU mục theo số thứ tự: "1,3,5", "1 3 5", "1 và 3", "chọn 1, 2".
+   * Câu chỉ gồm số + ngăn cách/liên từ -> lấy tất cả số hợp lệ (khử trùng).
+   * Không phải dạng đó -> fallback chọn 1 mục theo số/tên (resolveClassChoice).
+   */
+  private resolveMultiChoice(
+    content: string,
+    candidates: EntityOption[],
+  ): EntityOption[] | null {
+    if (!candidates.length) return null;
+    const text = this.normalizeText(content);
+    const stripped = text
+      .replace(/\b(chon|so|nguoi|hoc vien|va|and|them|ca)\b/g, ' ')
+      .trim();
+    if (stripped && /^[\d\s,.;+&-]+$/.test(stripped)) {
+      const numbers = stripped.match(/\d{1,2}/g) || [];
+      const indexes = [
+        ...new Set(numbers.map((value) => parseInt(value, 10))),
+      ].filter((value) => value >= 1 && value <= candidates.length);
+      if (indexes.length) {
+        return indexes.map((value) => candidates[value - 1]);
+      }
+    }
+    const single = this.resolveClassChoice(content, candidates);
+    return single ? [single] : null;
   }
 
   private resolveClassChoice(
@@ -2666,8 +2888,17 @@ export class CopilotService {
           last_selected_class: option,
         };
       case 'assign_student_to_class': {
-        // Kết quả từ addStudentToClass: enrollment kèm user + courseClass.course.
         const row = (result || {}) as any;
+        // Kết quả GỘP nhiều học viên: chỉ chốt ngữ cảnh LỚP (không có "học
+        // viên vừa chọn" duy nhất).
+        if (row.bulk) {
+          return {
+            selected_class_id: Number(row.classId) || null,
+            selected_course_id: Number(row.courseId) || null,
+            last_candidates: { classes: [] },
+          };
+        }
+        // Kết quả từ addStudentToClass: enrollment kèm user + courseClass.course.
         return {
           selected_student_id: Number(row.userId) || null,
           selected_class_id: Number(row.classId) || null,

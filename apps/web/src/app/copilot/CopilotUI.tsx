@@ -1,3 +1,4 @@
+
 "use client";
 
 import React from "react";
@@ -79,7 +80,7 @@ export function CopilotHeader({
           <PanelLeft size={17} />
         </button>
         <h1 className="truncate text-sm font-semibold text-zinc-900">
-          AI Agent
+          Xiuuu
         </h1>
         <span className="ml-1 hidden items-center gap-1.5 text-xs text-zinc-400 sm:inline-flex">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
@@ -113,6 +114,9 @@ export function CopilotSessionSidebar({
   loading,
   sending,
   open,
+  hasMore,
+  loadingMore,
+  onLoadMore,
   onClose,
   onNewSession,
   onSelectSession,
@@ -123,6 +127,9 @@ export function CopilotSessionSidebar({
   loading: boolean;
   sending: boolean;
   open: boolean;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
   onClose: () => void;
   onNewSession: () => void;
   onSelectSession: (sessionId: number) => void;
@@ -157,6 +164,7 @@ export function CopilotSessionSidebar({
         </div>
 
         <div className="px-3 pb-2 pt-1">
+          
           <button
             type="button"
             onClick={onNewSession}
@@ -230,6 +238,19 @@ export function CopilotSessionSidebar({
                   </div>
                 );
               })}
+              {hasMore && (
+                <button
+                  type="button"
+                  onClick={onLoadMore}
+                  disabled={loadingMore || sending}
+                  className="mt-1 flex w-full items-center justify-center gap-2 rounded-lg px-2.5 py-2 text-[12px] font-medium text-zinc-500 transition hover:bg-zinc-200/40 hover:text-zinc-900 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {loadingMore && (
+                    <LoaderCircle size={13} className="animate-spin" />
+                  )}
+                  {loadingMore ? "Đang tải..." : "Xem thêm"}
+                </button>
+              )}
             </div>
           )}
         </div>

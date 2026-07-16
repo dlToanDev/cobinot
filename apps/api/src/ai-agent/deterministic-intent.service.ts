@@ -9,6 +9,7 @@ import {
   EntityOption,
   PendingAction,
   PendingClassCreationContext,
+  PendingEnrollmentContext,
   StudentTableRow,
 } from './decision.types';
 import { formatCandidateList } from './agent-formatters';
@@ -247,6 +248,11 @@ const BIRTHDATE_RE = /^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{4}$/;
 const MODIFY_VERB_RE =
   /(^|\s)(sua|cap nhat|capnhat|chinh sua|thay doi|update|edit|doi|xoa|delete|remove|huy)(\s|$)/;
 
+// Động từ cập nhật MẠNH (không thể là tên riêng như "Sửa"/"Đổi") — dùng để
+// phân xử câu vừa có động từ tạo vừa có động từ sửa ("cập nhật thêm sđt...").
+const STRONG_UPDATE_VERB_RE =
+  /(^|\s)(cap nhat|capnhat|chinh sua|thay doi|update|edit)(\s|$)/;
+
 // Động từ xem danh sách học viên trong khóa/lớp ("xem ds", "liệt kê", "cho tôi
 // xem danh sách", "tất cả học viên"...).
 const LIST_STUDENTS_VERB_RE =
@@ -370,6 +376,18 @@ export class DeterministicIntentService {
 
     const origTokens = message.trim().split(/\s+/).filter(Boolean);
 
+    // 0. Cập nhật học viên đang dở: đang hỏi "học viên nào?"/"đổi gì?" ->
+    // câu trả lời (số thứ tự, tên, field mới) đi tiếp thay vì rơi xuống LLM.
+    if (state.pending_student_update) {
+      const reply = await this.handleUpdateStudentReply(
+        tenantId,
+        state,
+        message,
+        norm,
+      );
+      if (reply) return reply;
+    }
+
     // 1. Ghi danh: "thêm X vào lớp/khóa Y" -> ưu tiên trước create/search.
     const enroll = this.parseEnroll(norm, origTokens);
     if (enroll) {
@@ -388,6 +406,15 @@ export class DeterministicIntentService {
     const createCourse = this.parseCreateCourse(message, norm);
     if (createCourse) {
       return this.handleCreateCourse(createCourse);
+    }
+
+    // 2c. Cập nhật học viên: "cập nhật thêm sđt là 09...", "sửa email học viên
+    // A thành ..." — mặc định nhắm vào học viên VỪA TẠO/vừa chọn trong ngữ
+    // cảnh. Đặt TRƯỚC nhánh tạo học viên để "cập nhật thêm sđt..." không bị
+    // hiểu nhầm thành create_student (chữ "thêm" ở đây chỉ là trạng từ).
+    const updateStudent = this.parseUpdateStudent(message, norm, state);
+    if (updateStudent) {
+      return this.handleUpdateStudent(tenantId, state, updateStudent);
     }
 
     // 3. Tạo học viên: "tạo/thêm học viên ..." nhưng KHÔNG có "vào" (tránh nhầm
@@ -418,6 +445,15 @@ export class DeterministicIntentService {
       this.hasStudentInfoSignal(origTokens, norm)
     ) {
       return this.handleCreateStudent(origTokens);
+    }
+
+    // 3b. Đổi NGÀY lớp học: "ngày bắt đầu là hôm nay", "kết thúc 30/9/2026".
+    // Ngày CHỈ thuộc lớp học nên mặc định nhắm vào lớp trong ngữ cảnh (vừa
+    // tạo/vừa chọn). Đặt TRƯỚC update_course để "cập nhật ngày bắt đầu..."
+    // không bị nhánh khóa học nuốt rồi hỏi ngược "khóa học nào?".
+    const updateClassDates = this.parseUpdateClassDates(message, norm);
+    if (updateClassDates) {
+      return this.handleUpdateClassDates(tenantId, state, updateClassDates);
     }
 
     // 3c. Cập nhật khóa học: câu ngắn kiểu "cấp độ 1", "mô tả là...", "ngày bắt
@@ -652,6 +688,431 @@ export class DeterministicIntentService {
       pending,
       contextPatch: { last_intent: 'create_course' },
     };
+  }
+
+  // ---- Update student ------------------------------------------------------
+
+  /**
+   * Nhận diện câu cập nhật học viên ("cập nhật thêm sđt là 09...", "sửa email
+   * học viên A thành ..."). Trả về field cần đổi + tên học viên (nếu user nêu
+   * đích danh), hoặc null nếu không phải để nhánh khác/LLM xử lý.
+   */
+  private parseUpdateStudent(
+    message: string,
+    norm: string,
+    state: DecisionContext,
+  ): { fields: Record<string, string>; studentKeyword?: string } | null {
+    // Loại trừ các intent khác để tránh false positive.
+    if (/(^|\s)vao(\s|$)/.test(norm)) return null; // ghi danh
+    if (CLASS_RE.test(norm)) return null; // liên quan lớp
+    if (COURSE_RE.test(norm)) return null; // liên quan khóa -> update_course
+    if (SEARCH_VERB_RE.test(norm)) return null; // tìm kiếm
+
+    const hasStrongVerb = STRONG_UPDATE_VERB_RE.test(norm);
+    const hasUpdateVerb =
+      hasStrongVerb || /(^|\s)(sua|doi)(\s|$)/.test(norm);
+    if (!hasUpdateVerb) return null;
+
+    // Câu có động từ tạo + "học viên" chỉ được coi là update khi có động từ
+    // update MẠNH ("sửa"/"đổi" có thể là tên riêng: "thêm học viên Ng Văn Sửa").
+    // "vừa tạo/mới tạo/đã tạo/vừa thêm" là cụm THAM CHIẾU ngữ cảnh ("sửa sđt
+    // của hv vừa tạo") — không phải động từ tạo -> bỏ khỏi norm trước khi xét.
+    const normNoCtxRef = norm.replace(
+      /(^|\s)(vua|moi|da)\s+(tao|them)(?=\s|$)/g,
+      '$1',
+    );
+    if (
+      CREATE_VERB_RE.test(normNoCtxRef) &&
+      STUDENT_RE.test(norm) &&
+      !hasStrongVerb
+    ) {
+      return null;
+    }
+
+    const mentionsStudent = STUDENT_RE.test(norm);
+    // Học viên có phải thực thể user đang thao tác không (vừa tạo/vừa sửa)?
+    const studentIsFocus =
+      mentionsStudent ||
+      state.last_intent === 'create_student' ||
+      state.last_intent === 'update_student';
+
+    const fields = this.parseStudentUpdateFields(message, studentIsFocus);
+
+    if (Object.keys(fields).length === 0) {
+      // Không bóc được field học viên nào: chỉ nhận khi user nhắc "học viên"
+      // hoặc học viên là thực thể vừa thao tác VÀ đang có trong ngữ cảnh
+      // (vd gõ mỗi "cập nhật" ngay sau khi tạo học viên).
+      const hasStudentContext = Boolean(
+        state.last_created_student?.id ||
+          state.last_selected_student?.id ||
+          state.selected_student_id,
+      );
+      if (!mentionsStudent && !(studentIsFocus && hasStudentContext)) {
+        return null;
+      }
+    }
+
+    // "... học viên <tên> ..." -> tự tìm học viên đó thay vì lấy từ ngữ cảnh.
+    let studentKeyword: string | undefined;
+    // Lookahead nhãn field đòi khoảng trắng bao quanh để không cắt giữa token
+    // ("an2@gmail.com" chứa "mail" nhưng không phải nhãn).
+    const kwMatch = message.match(
+      /(?:học\s*viên|hoc\s*vien|hv|hs)\s+([^,;:=]+?)(?=\s*[,;:=]|\s+(?:sđt|sdt|số\s*điện\s*thoại|so\s*dien\s*thoai|phone|email|mail|ngày\s*sinh|ngay\s*sinh|dob|địa\s*chỉ|dia\s*chi|address)(?:\s|[,;:=]|$)|$)/iu,
+    );
+    if (kwMatch && kwMatch[1].trim()) {
+      let keyword = this.cleanText(kwMatch[1]);
+      // Bỏ từ nối dính cuối tên trước nhãn field ("Minh Nguyễn CÓ ngày sinh
+      // là..." -> "Minh Nguyễn").
+      keyword = keyword
+        .replace(/(?:\s+(?:có|co|và|va|với|voi|của|cua))+$/iu, '')
+        .trim();
+      const tail = keyword.match(/^(.+?)\s+(?:là|thành)\s+(\S.*)$/iu);
+      if (tail) {
+        // Đuôi "là/thành <giá trị>" là giá trị đã bóc vào fields -> cắt khỏi
+        // tên ("học viên An là 0987..." -> "An").
+        const tailKey = toSearchKey(tail[2]);
+        const tailDigits = tail[2].replace(/\D/g, '');
+        const matchesField = Object.values(fields).some((value) => {
+          const valueDigits = String(value).replace(/\D/g, '');
+          return (
+            toSearchKey(String(value)) === tailKey ||
+            (valueDigits.length >= 8 && valueDigits === tailDigits)
+          );
+        });
+        if (matchesField) {
+          keyword = tail[1].trim();
+        } else if (
+          !fields.fullName &&
+          /(?:đổi|sửa|cập\s*nhật|thay\s*đổi)\s+tên/iu.test(message)
+        ) {
+          // "đổi tên học viên A thành B": trước "thành" là tên cần tìm, sau
+          // là tên mới. KHÔNG áp dụng khi không có chữ "tên" (tránh cắt nhầm
+          // tên chứa "Thành": "cập nhật học viên Nguyễn Thành Nam").
+          keyword = tail[1].trim();
+          const newName = this.stripPoliteTail(tail[2]);
+          if (newName) fields.fullName = newName;
+        }
+      }
+      keyword = this.stripPoliteTail(keyword);
+      if (keyword) studentKeyword = keyword;
+    }
+
+    return { fields, studentKeyword };
+  }
+
+  /** Bóc các field cập nhật học viên từ câu tiếng Việt. */
+  private parseStudentUpdateFields(
+    message: string,
+    allowName: boolean,
+  ): Record<string, string> {
+    const fields: Record<string, string> = {};
+
+    // SĐT có nhãn đứng ngay trước số ("sđt là 0987...", "phone: 0987...").
+    const phone = message.match(
+      /(?:sđt|sdt|số\s*điện\s*thoại|so\s*dien\s*thoai|phone|điện\s*thoại|dien\s*thoai)\s*(?:là|la|thành|thanh|sang|:|=)?\s*(\+?[\d\s.\-]{9,15})/iu,
+    );
+    if (phone) {
+      const digits = phone[1].replace(/[\s.\-]/g, '');
+      if (/^\+?\d{9,12}$/.test(digits)) fields.phone = digits;
+    }
+    // Nhãn SĐT và số đứng xa nhau ("sđt học viên An thành 0987...").
+    if (
+      !fields.phone &&
+      /(sđt|sdt|số\s*điện\s*thoại|so\s*dien\s*thoai|phone|điện\s*thoại|dien\s*thoai)/iu.test(
+        message,
+      )
+    ) {
+      const token = message
+        .split(/\s+/)
+        .map((t) => t.replace(/[,;.]+$/, ''))
+        .find((t) => /^\+?\d{9,12}$/.test(t.replace(/[.\-]/g, '')));
+      if (token) fields.phone = token.replace(/[.\-]/g, '');
+    }
+
+    // Email: token dạng email là tín hiệu không thể nhầm.
+    const email = message
+      .split(/\s+/)
+      .map((t) => t.replace(/[,;]+$/, ''))
+      .find((t) => EMAIL_RE.test(t));
+    if (email) fields.email = email;
+
+    // Ngày sinh.
+    const birth = message.match(
+      /(?:ngày\s*sinh|ngay\s*sinh|dob|sinh\s*ngày|sinh\s*ngay)\s*(?:là|la|thành|thanh|sang|:|=)?\s*([\d\/.\-]+)/iu,
+    );
+    if (birth) {
+      const iso = this.parseViDate(birth[1]);
+      if (iso) fields.birthDate = iso;
+    }
+
+    // Địa chỉ: lấy tới dấu phẩy/chấm phẩy hoặc hết câu.
+    const address = message.match(
+      /(?:địa\s*chỉ|dia\s*chi|address)\s*(?:là|la|thành|thanh|sang|:|=)?\s*(.+?)(?=[,;]|$)/iu,
+    );
+    if (address && address[1].trim()) {
+      const clean = this.stripPoliteTail(address[1]);
+      if (clean) fields.address = clean;
+    }
+
+    // Tên: CHỈ khi học viên đang là thực thể trong focus (tránh giẫm chân
+    // "đổi tên khóa/lớp"). Nhãn "tên" phải đứng NGAY trước thành/là để
+    // "sửa tên học viên A thành B" không bị bóc nhầm ở đây (đã xử lý riêng).
+    if (allowName) {
+      const name = message.match(
+        /(?:^|\s)(?:đổi\s+)?tên\s+(?:thành|là)\s+(.+?)(?=[,;]|$)/iu,
+      );
+      if (name && name[1].trim()) {
+        const clean = this.stripPoliteTail(name[1]);
+        if (clean) fields.fullName = clean;
+      }
+    }
+
+    return fields;
+  }
+
+  private async handleUpdateStudent(
+    tenantId: number,
+    state: DecisionContext,
+    parsed: { fields: Record<string, string>; studentKeyword?: string },
+  ): Promise<DeterministicOutcome> {
+    let student = this.resolveContextStudent(state);
+
+    // User nêu đích danh tên học viên trong câu -> tìm học viên đó thay vì
+    // lấy từ ngữ cảnh ("vừa tạo"/"bên trên" vẫn tính là ngữ cảnh).
+    if (
+      parsed.studentKeyword &&
+      !this.isContextRefPhrase(parsed.studentKeyword)
+    ) {
+      const students = await this.usersService.searchStudents(
+        tenantId,
+        parsed.studentKeyword,
+      );
+      if (students.length === 0) {
+        return {
+          type: 'clarification',
+          message: `Mình chưa tìm thấy học viên "${parsed.studentKeyword}". Bạn kiểm tra lại tên (hoặc email/SĐT) giúp mình nhé.`,
+          missingFields: ['userId'],
+          intent: 'update_student',
+          contextPatch: {
+            last_intent: 'update_student',
+            pending_student_update: { fields: parsed.fields },
+          },
+        };
+      }
+      if (students.length > 1) {
+        const rows = students
+          .slice(0, 10)
+          .map((item: any, index: number) => {
+            const extra = [item.email, item.phone].filter(Boolean).join(' | ');
+            return `${index + 1}. ${item.fullName || `#${item.id}`}${extra ? ` (${extra})` : ''}`;
+          })
+          .join('\n');
+        return {
+          type: 'clarification',
+          message: `Mình tìm thấy nhiều học viên "${parsed.studentKeyword}". Bạn muốn cập nhật học viên nào? (nhắn số thứ tự hoặc tên)\n\n${rows}`,
+          missingFields: ['userId'],
+          intent: 'update_student',
+          contextPatch: {
+            last_intent: 'update_student',
+            last_candidates: { students: this.toOptions(students) },
+            pending_student_update: { fields: parsed.fields },
+          },
+        };
+      }
+      const found: any = students[0];
+      student = {
+        id: Number(found.id),
+        label: String(found.fullName || `#${found.id}`),
+      };
+    }
+
+    if (!student) {
+      return {
+        type: 'clarification',
+        message:
+          'Bạn muốn cập nhật học viên nào? Bạn cho mình tên (hoặc email/SĐT) của học viên nhé.',
+        missingFields: ['userId'],
+        intent: 'update_student',
+        contextPatch: {
+          last_intent: 'update_student',
+          pending_student_update: { fields: parsed.fields },
+        },
+      };
+    }
+
+    return this.buildUpdateStudentPending(student, parsed.fields);
+  }
+
+  /**
+   * Đã chốt học viên: đủ field -> preview update_student chờ confirm; chưa có
+   * field -> hỏi tiếp và ghi nhớ học viên trong pending_student_update.
+   */
+  private buildUpdateStudentPending(
+    student: { id: number; label: string },
+    fields: Record<string, string>,
+  ): DeterministicOutcome {
+    if (Object.keys(fields).length === 0) {
+      return {
+        type: 'clarification',
+        message: `Bạn muốn cập nhật thông tin gì cho học viên "${student.label}"? (tên, email, số điện thoại, ngày sinh, địa chỉ)`,
+        missingFields: [],
+        intent: 'update_student',
+        contextPatch: {
+          last_intent: 'update_student',
+          selected_student_id: student.id,
+          pending_student_update: {
+            fields: {},
+            student_id: student.id,
+            student_label: student.label,
+          },
+          last_candidates: { students: [] },
+        },
+      };
+    }
+
+    const input: Record<string, unknown> = {
+      userId: student.id,
+      ...fields,
+    };
+    const pending: PendingAction = {
+      tool_name: 'update_student',
+      input,
+      display_input: { ...input, studentName: student.label },
+      summary: `Cập nhật học viên ${student.label}`,
+      intent: 'update_student',
+      status: 'waiting_confirm',
+      severity: 'default',
+    };
+    return {
+      type: 'pending_write',
+      pending,
+      contextPatch: {
+        last_intent: 'update_student',
+        selected_student_id: student.id,
+        pending_student_update: null,
+        last_candidates: { students: [] },
+      },
+    };
+  }
+
+  /**
+   * Follow-up khi đang có pending_student_update:
+   * - Đã chốt học viên (đang hỏi đổi gì) -> bóc field từ câu trả lời.
+   * - Đang hỏi học viên nào -> nhận số thứ tự/tên trong danh sách ứng viên,
+   *   hoặc coi câu trả lời ngắn là tên để tìm tiếp.
+   * - "hủy" -> dừng, xóa context. Câu không hiểu -> trả null cho luồng khác/LLM.
+   */
+  private async handleUpdateStudentReply(
+    tenantId: number,
+    state: DecisionContext,
+    message: string,
+    norm: string,
+  ): Promise<DeterministicOutcome | null> {
+    const ctx = state.pending_student_update;
+    if (!ctx) return null;
+
+    if (
+      ['huy', 'huy bo', 'cancel', 'thoi', 'khong', 'bo qua', 'huy thao tac'].includes(
+        norm,
+      )
+    ) {
+      return {
+        type: 'message',
+        message:
+          'Đã hủy thao tác cập nhật học viên. Dữ liệu chưa được ghi vào hệ thống.',
+        contextPatch: {
+          pending_student_update: null,
+          last_candidates: { students: [] },
+        },
+      };
+    }
+
+    // Đã chốt học viên, đang hỏi field cần đổi -> bóc field từ câu trả lời.
+    if (ctx.student_id) {
+      const fields = this.parseStudentUpdateFields(message, true);
+      if (Object.keys(fields).length === 0) return null;
+      return this.buildUpdateStudentPending(
+        {
+          id: Number(ctx.student_id),
+          label: String(ctx.student_label || `#${ctx.student_id}`),
+        },
+        fields,
+      );
+    }
+
+    const candidates = state.last_candidates?.students || [];
+
+    // Chọn theo số thứ tự trong danh sách ("2", "số 2", "người 2", "hv 2").
+    const idxMatch = norm.match(
+      /^(?:chon\s+)?(?:so|thu|nguoi|hoc vien|hv|hs)?\s*(\d{1,2})$/,
+    );
+    if (idxMatch && candidates.length > 0) {
+      const chosen = candidates[Number(idxMatch[1]) - 1];
+      if (!chosen?.id) {
+        return {
+          type: 'clarification',
+          message: `Danh sách chỉ có ${candidates.length} học viên. Bạn chọn số thứ tự từ 1 đến ${candidates.length} giúp mình nhé.`,
+          missingFields: ['userId'],
+          intent: 'update_student',
+          contextPatch: {},
+        };
+      }
+      return this.buildUpdateStudentPending(
+        { id: Number(chosen.id), label: String(chosen.label || `#${chosen.id}`) },
+        ctx.fields || {},
+      );
+    }
+
+    // Chọn theo tên trong danh sách ứng viên (ưu tiên khớp CHÍNH XÁC để
+    // "Minh Nguyễn" không dính "Minh Nguyễn Hoàng").
+    const key = toSearchKey(message);
+    if (candidates.length > 0 && key) {
+      const exact = candidates.filter(
+        (c) => toSearchKey(String(c.label || '')) === key,
+      );
+      const matched =
+        exact.length > 0
+          ? exact
+          : candidates.filter((c) =>
+              toSearchKey(String(c.label || '')).includes(key),
+            );
+      if (matched.length === 1 && matched[0].id) {
+        return this.buildUpdateStudentPending(
+          { id: Number(matched[0].id), label: String(matched[0].label) },
+          ctx.fields || {},
+        );
+      }
+    }
+
+    // Đang hỏi tên học viên -> câu trả lời NGẮN không kèm intent khác là TÊN.
+    if (
+      candidates.length === 0 &&
+      key &&
+      !/^\d+$/.test(key) &&
+      !MODIFY_VERB_RE.test(norm) &&
+      !CREATE_VERB_RE.test(norm) &&
+      !SEARCH_VERB_RE.test(norm) &&
+      !COURSE_RE.test(norm) &&
+      !CLASS_RE.test(norm) &&
+      message.trim().split(/\s+/).length <= 6
+    ) {
+      return this.handleUpdateStudent(tenantId, state, {
+        fields: ctx.fields || {},
+        studentKeyword: message.trim(),
+      });
+    }
+
+    return null;
+  }
+
+  /** Học viên vừa tạo/đang chọn trong ngữ cảnh, hoặc null. */
+  private resolveContextStudent(
+    state: DecisionContext,
+  ): { id: number; label: string } | null {
+    const opt = state.last_created_student || state.last_selected_student;
+    const id = Number(opt?.id) || Number(state.selected_student_id) || 0;
+    if (!id) return null;
+    return { id, label: String(opt?.label || `#${id}`) };
   }
 
   // ---- Update course -------------------------------------------------------
@@ -989,6 +1450,93 @@ export class DeterministicIntentService {
     };
   }
 
+  // ---- Update class dates ---------------------------------------------------
+
+  /**
+   * Nhận diện câu đổi ngày lớp học: "ngày bắt đầu là hôm nay", "lớp Test 12
+   * kết thúc 30/9/2026". Ngày chỉ thuộc lớp học (khóa không có ngày, học viên
+   * chỉ có ngày sinh) nên câu nói về ngày bắt đầu/kết thúc là về LỚP.
+   */
+  private parseUpdateClassDates(
+    message: string,
+    norm: string,
+  ): { startDate?: string; endDate?: string; classKeyword?: string } | null {
+    if (/(^|\s)vao(\s|$)/.test(norm)) return null; // ghi danh "từ hôm nay"
+    if (STUDENT_RE.test(norm)) return null;
+    if (COURSE_RE.test(norm)) return null;
+    if (SEARCH_VERB_RE.test(norm)) return null;
+    // Câu tạo lớp/khóa tự parse ngày trong luồng create.
+    if (CREATE_VERB_RE.test(norm) || CREATE_CLASS_VERB_RE.test(norm)) {
+      return null;
+    }
+    if (/(^|\s)ngay sinh(\s|$)/.test(norm)) return null; // ngày sinh học viên
+
+    const { startDate, endDate } = this.parseClassDateRange(message);
+    if (!startDate && !endDate) return null;
+
+    // Tên lớp nêu đích danh: "lớp Test 12 bắt đầu ..." -> tự tìm lớp đó.
+    let classKeyword: string | undefined;
+    const kw = message.match(
+      /(?:lớp học|lop hoc|lớp|lop|class)\s+(.+?)(?=\s+(?:bắt đầu|bat dau|khai giảng|khai giang|kết thúc|ket thuc|từ|tu|đến|den|tới|toi|ngày|ngay|là|la|hết hạn|het han)(?:\s|$)|\s*[,;:]|$)/iu,
+    );
+    if (kw && kw[1].trim()) {
+      const keyword = this.stripPoliteTail(this.cleanText(kw[1]));
+      const key = toSearchKey(keyword);
+      if (
+        keyword &&
+        !['nay', 'do', 'hoc', 'hien tai', 'vua tao', 'moi tao'].includes(key)
+      ) {
+        classKeyword = keyword;
+      }
+    }
+
+    return { startDate, endDate, classKeyword };
+  }
+
+  private async handleUpdateClassDates(
+    tenantId: number,
+    state: DecisionContext,
+    parsed: { startDate?: string; endDate?: string; classKeyword?: string },
+  ): Promise<DeterministicOutcome> {
+    const resolved = await this.resolveClassTarget(
+      tenantId,
+      state,
+      parsed.classKeyword,
+      'update_class',
+      'đổi ngày bắt đầu/kết thúc',
+    );
+    if ('outcome' in resolved) return resolved.outcome;
+
+    const input: Record<string, unknown> = { classId: resolved.target.id };
+    const parts: string[] = [];
+    if (parsed.startDate) {
+      input.startDate = parsed.startDate;
+      parts.push(`ngày bắt đầu ${parsed.startDate}`);
+    }
+    if (parsed.endDate) {
+      input.endDate = parsed.endDate;
+      parts.push(`ngày kết thúc ${parsed.endDate}`);
+    }
+
+    const pending: PendingAction = {
+      tool_name: 'update_class',
+      input,
+      display_input: { ...input, className: resolved.target.label },
+      summary: `Cập nhật ${parts.join(', ')} cho lớp ${resolved.target.label}`,
+      intent: 'update_class',
+      status: 'waiting_confirm',
+      severity: 'default',
+    };
+    return {
+      type: 'pending_write',
+      pending,
+      contextPatch: {
+        last_intent: 'update_class',
+        selected_class_id: resolved.target.id,
+      },
+    };
+  }
+
   // ---- Rename class ---------------------------------------------------------
 
   /**
@@ -1193,6 +1741,7 @@ export class DeterministicIntentService {
     const clearedCandidates: Partial<DecisionContext> = {
       last_intent: 'create_student',
       last_candidates: { students: [], courses: [], classes: [] },
+      pending_student_update: null,
     };
 
     // Thiếu tên -> KHÔNG hỏi cụt lủn nữa. Trả về form nhập liệu (điền sẵn những
@@ -1490,6 +2039,10 @@ export class DeterministicIntentService {
       )
       .trim();
 
+    // "hsk1, lớp luyện đề" -> đoạn sau dấu phẩy chỉ mô tả LOẠI lớp, không
+    // thuộc tên (loại đã được parseClassType nhận riêng từ cả câu) -> bỏ.
+    title = this.dropClassTypeSegments(title);
+
     // "theo tuần"/"hàng tuần"... chỉ là loại lớp, KHÔNG phải tên -> để trống,
     // sẽ hỏi tên lớp ngắn gọn ở bước sau.
     if (this.isBareClassTypePhrase(title)) title = '';
@@ -1515,8 +2068,10 @@ export class DeterministicIntentService {
     endDate?: string;
   } {
     // "hôm nay"/"ngày mai" hoặc chuỗi số dạng ngày (30/07, 09/07/2026...).
+    // n[aà]y: chấp nhận cả lỗi gõ phổ biến "hôm này" (parseViDate bỏ dấu nên
+    // vẫn ra "hom nay").
     const DATE_TOKEN =
-      '(hôm\\s*nay|hom\\s*nay|bữa\\s*nay|bua\\s*nay|ngày\\s*mai|ngay\\s*mai|today|tomorrow|[0-9][0-9/\\-.]{2,})';
+      '(hôm\\s*n[aà]y|hom\\s*n[aà]y|bữa\\s*n[aà]y|bua\\s*n[aà]y|ngày\\s*mai|ngay\\s*mai|today|tomorrow|[0-9][0-9/\\-.]{2,})';
     const startMatch = message.match(
       new RegExp(
         `(?:bắt đầu|bat dau|khai giảng|khai giang|từ ngày|tu ngay|từ|tu)\\s*(?:là|la)?\\s*(?:ngày|ngay)?\\s*${DATE_TOKEN}`,
@@ -1533,6 +2088,38 @@ export class DeterministicIntentService {
       startDate: startMatch ? this.parseViDate(startMatch[1]) : undefined,
       endDate: endMatch ? this.parseViDate(endMatch[1]) : undefined,
     };
+  }
+
+  /**
+   * Bỏ các đoạn (ngăn bởi dấu phẩy) chỉ mô tả loại lớp: "hsk1, lớp luyện đề"
+   * -> "hsk1". Giữ đoạn đầu vì tên thật thường bắt đầu bằng "Luyện đề...".
+   */
+  private dropClassTypeSegments(title: string): string {
+    const TYPE_SEGMENT_KEYS = new Set([
+      'luyen de',
+      'lop luyen de',
+      'loai lop luyen de',
+      'loai luyen de',
+      'exam practice',
+      'lop exam practice',
+      'theo tuan',
+      'lop theo tuan',
+      'hoc theo tuan',
+      'hang tuan',
+      'lop hang tuan',
+      'loai lop theo tuan',
+      'lop thuong',
+      'weekly',
+      'lop weekly',
+    ]);
+    return title
+      .split(',')
+      .map((segment) => segment.trim())
+      .filter(
+        (segment, index) =>
+          segment && (index === 0 || !TYPE_SEGMENT_KEYS.has(toSearchKey(segment))),
+      )
+      .join(', ');
   }
 
   /** true nếu "tên lớp" thực chất chỉ là cụm mô tả loại lớp theo tuần. */
@@ -2011,6 +2598,13 @@ export class DeterministicIntentService {
       courseKeyword?: string;
     },
   ): Promise<DeterministicOutcome> {
+    // 0. Nhiều học viên trong 1 câu ("thêm A, B và C vào lớp X") -> tách theo
+    // dấu phẩy/"và", resolve từng người rồi tạo 1 bản nháp GỘP.
+    const keywords = this.splitStudentKeywords(enroll.studentKeyword);
+    if (keywords.length > 1) {
+      return this.handleBulkEnrollStudents(tenantId, state, keywords, enroll);
+    }
+
     // 1. Học viên: "bên trên"/"vừa tạo"... -> lấy từ ngữ cảnh hội thoại.
     let student: any;
     if (this.isContextRefPhrase(enroll.studentKeyword)) {
@@ -2041,11 +2635,149 @@ export class DeterministicIntentService {
         );
       }
       if (students.length > 1) {
-        return this.chooseFrom('student', students);
+        // Nhiều học viên trùng tên: hỏi chọn nhưng PHẢI lưu đích ghi danh vào
+        // pending_enrollment_context để lượt trả lời "1"/tên được state machine
+        // đưa thẳng vào preview — không rơi xuống LLM (LLM không hoàn tất được
+        // ghi danh, từng trả lời suông không tạo bản nháp nào).
+        const options = this.toOptions(students);
+        return {
+          type: 'clarification',
+          message:
+            `${formatCandidateList('student', students)}\n` +
+            'Bạn có thể chọn nhiều người cùng lúc, ví dụ: "1, 3, 5".',
+          missingFields: ['userId'],
+          intent: 'assign_student_to_class',
+          contextPatch: {
+            last_intent: 'assign_student_to_class',
+            last_candidates: { students: options },
+            pending_enrollment_context: {
+              userId: 0,
+              courseId: 0,
+              candidateClasses: [],
+              candidateStudents: options,
+              targetType: enroll.target,
+              targetKeyword: enroll.targetKeyword,
+              targetCourseKeyword: enroll.courseKeyword,
+            },
+          },
+        };
       }
       student = students[0];
     }
 
+    return this.resolveEnrollTarget(tenantId, state, student, enroll);
+  }
+
+  /**
+   * Tách phần học viên thành nhiều keyword: "A, B và C" -> ["A","B","C"].
+   * Ngăn cách bởi dấu phẩy hoặc liên từ đứng riêng ("và"/"va"/"cùng"/"with").
+   */
+  private splitStudentKeywords(keyword: string): string[] {
+    return keyword
+      .split(/\s*,\s*|\s+(?:và|va|cùng|cung|voi|với|and|with)\s+/iu)
+      .map((part) => part.trim())
+      .filter(Boolean);
+  }
+
+  /**
+   * Ghi danh NHIỀU học viên trong 1 câu. Resolve từng người độc lập:
+   * - Tất cả chốt được duy nhất -> 1 bản nháp gộp (confirm 1 lần, kết quả
+   *   từng người khi execute).
+   * - Có tên không thấy/trùng nhiều người -> hỏi lại NÊU RÕ từng tên có vấn
+   *   đề, không hủy cả nhóm.
+   */
+  private async handleBulkEnrollStudents(
+    tenantId: number,
+    state: DecisionContext,
+    keywords: string[],
+    enroll: {
+      target: 'course' | 'class';
+      targetKeyword: string;
+      courseKeyword?: string;
+    },
+  ): Promise<DeterministicOutcome> {
+    const resolved: any[] = [];
+    const notFound: string[] = [];
+    const ambiguous: Array<{ keyword: string; candidates: any[] }> = [];
+
+    for (const keyword of keywords) {
+      // "học viên vừa tạo" đứng trong danh sách -> lấy từ ngữ cảnh.
+      if (this.isContextRefPhrase(keyword)) {
+        const ctxStudent =
+          state.last_created_student || state.last_selected_student;
+        if (ctxStudent?.id) {
+          resolved.push({ id: ctxStudent.id, fullName: ctxStudent.label });
+        } else {
+          notFound.push(keyword);
+        }
+        continue;
+      }
+      const students = await this.usersService.searchStudents(
+        tenantId,
+        keyword,
+      );
+      if (students.length === 0) notFound.push(keyword);
+      else if (students.length > 1) ambiguous.push({ keyword, candidates: students });
+      else resolved.push(students[0]);
+    }
+
+    if (notFound.length || ambiguous.length) {
+      const lines: string[] = [];
+      if (notFound.length) {
+        lines.push(
+          `- Không tìm thấy: ${notFound.map((k) => `"${k}"`).join(', ')}.`,
+        );
+      }
+      for (const item of ambiguous) {
+        const rows = item.candidates
+          .slice(0, 5)
+          .map((s: any) => {
+            const extra = [s.email, s.phone].filter(Boolean).join(' | ');
+            return `   • ${s.fullName || `#${s.id}`} (ID: ${s.id}${extra ? ` | ${extra}` : ''})`;
+          })
+          .join('\n');
+        lines.push(`- "${item.keyword}" có nhiều người trùng tên:\n${rows}`);
+      }
+      return {
+        type: 'clarification',
+        message:
+          'Mình chưa chốt được danh sách học viên:\n\n' +
+          lines.join('\n') +
+          '\n\nBạn ghi rõ hơn (kèm email/SĐT hoặc ID) rồi gửi lại cả câu giúp mình nhé.',
+        missingFields: ['userId'],
+        intent: 'assign_student_to_class',
+        contextPatch: { last_intent: 'assign_student_to_class' },
+      };
+    }
+
+    // Cùng 1 người bị nhắc 2 lần -> khử trùng theo id.
+    const unique = new Map<number, any>();
+    for (const s of resolved) unique.set(Number(s.id), s);
+    const students = [...unique.values()];
+    return this.resolveEnrollTarget(
+      tenantId,
+      state,
+      students.length === 1 ? students[0] : students,
+      enroll,
+    );
+  }
+
+  /**
+   * Đã chốt học viên -> xác định ĐÍCH ghi danh (lớp/khóa) và trả preview hoặc
+   * câu hỏi chọn tiếp. Dùng chung cho handleEnroll và lượt trả lời chọn học
+   * viên (resolveEnrollStudentReply). `student` có thể là MỘT học viên hoặc
+   * MẢNG học viên (bản nháp gộp).
+   */
+  private async resolveEnrollTarget(
+    tenantId: number,
+    state: DecisionContext,
+    student: any,
+    enroll: {
+      target: 'course' | 'class';
+      targetKeyword: string;
+      courseKeyword?: string;
+    },
+  ): Promise<DeterministicOutcome> {
     // 2. Đích là KHÓA: ghi danh vẫn CHỈ ở cấp lớp -> xác định khóa rồi dẫn user
     //    tới lớp cụ thể (khóa 1 lớp thì preview luôn, nhiều lớp thì hỏi chọn).
     if (enroll.target !== 'class') {
@@ -2112,17 +2844,29 @@ export class DeterministicIntentService {
       // chooseFrom (mất userId) thì câu trả lời rơi xuống LLM — LLM không có cách
       // hoàn tất ghi danh nên từng bịa "đã thêm thành công" mà không ghi DB.
       const options = this.toOptions(classes);
+      const students: any[] = Array.isArray(student) ? student : [student];
+      const names = students
+        .map((s) => s.fullName || s.name || `học viên #${s.id}`)
+        .join(', ');
       return {
         type: 'clarification',
         message:
           `${formatCandidateList('class', classes)}\n` +
-          `Bạn muốn thêm ${student.fullName || `học viên #${student.id}`} vào lớp nào?`,
+          `Bạn muốn thêm ${names} vào lớp nào?`,
         missingFields: ['classId'],
         intent: 'assign_student_to_class',
         contextPatch: {
           last_intent: 'assign_student_to_class',
           pending_enrollment_context: {
-            userId: Number(student.id),
+            userId: students.length === 1 ? Number(students[0].id) : 0,
+            ...(students.length > 1
+              ? {
+                  userIds: students.map((s) => Number(s.id)),
+                  studentLabels: students.map(
+                    (s) => s.fullName || s.name || `#${s.id}`,
+                  ),
+                }
+              : {}),
             // Các lớp trùng tên có thể thuộc nhiều khóa khác nhau -> chưa chốt
             // khóa; courseId thật được suy từ lớp user chọn ở lượt sau.
             courseId: 0,
@@ -2139,6 +2883,38 @@ export class DeterministicIntentService {
       courseLabel: cls.course?.title || cls.course?.courseCode,
       classLabel: cls.title || cls.classCode,
     });
+  }
+
+  /**
+   * User trả lời CHỌN HỌC VIÊN (số thứ tự/tên) khi đang có
+   * pending_enrollment_context.candidateStudents. Học viên đã được copilot
+   * resolve từ danh sách; đi tiếp phần đích ghi danh đã lưu trong context.
+   * Chọn nhiều người ("1,3,5") -> truyền mảng -> bản nháp ghi danh GỘP.
+   */
+  async resolveEnrollStudentReply(
+    tenantId: number,
+    state: DecisionContext,
+    ctx: PendingEnrollmentContext,
+    student:
+      | { id: number; label: string }
+      | Array<{ id: number; label: string }>,
+  ): Promise<DeterministicOutcome | null> {
+    if (!ctx.targetType) return null;
+    const list = Array.isArray(student) ? student : [student];
+    const students = list.map((item) => ({
+      id: item.id,
+      fullName: item.label,
+    }));
+    return this.resolveEnrollTarget(
+      tenantId,
+      state,
+      students.length === 1 ? students[0] : students,
+      {
+        target: ctx.targetType,
+        targetKeyword: ctx.targetKeyword || '',
+        courseKeyword: ctx.targetCourseKeyword,
+      },
+    );
   }
 
   /**
@@ -2224,6 +3000,10 @@ export class DeterministicIntentService {
     }
 
     const options = this.toOptions(classes);
+    const students: any[] = Array.isArray(student) ? student : [student];
+    const names = students
+      .map((s) => s.fullName || s.name || `học viên #${s.id}`)
+      .join(', ');
     // Intent để assign_student_to_class (KHÔNG phải _to_course): ghi danh luôn
     // ở cấp lớp, và _to_course bị chặn trong mini mode -> tránh dính guard
     // isOutcomeOutsideMiniScope trả lời "chưa được bật trong bản mini".
@@ -2231,13 +3011,21 @@ export class DeterministicIntentService {
       type: 'clarification',
       message:
         `${formatCandidateList('class', classes)}\n` +
-        `Bạn muốn thêm ${student.fullName || `học viên #${student.id}`} vào lớp nào?`,
+        `Bạn muốn thêm ${names} vào lớp nào?`,
       missingFields: ['classId'],
       intent: 'assign_student_to_class',
       contextPatch: {
         last_intent: 'assign_student_to_class',
         pending_enrollment_context: {
-          userId: Number(student.id),
+          userId: students.length === 1 ? Number(students[0].id) : 0,
+          ...(students.length > 1
+            ? {
+                userIds: students.map((s) => Number(s.id)),
+                studentLabels: students.map(
+                  (s) => s.fullName || s.name || `#${s.id}`,
+                ),
+              }
+            : {}),
           courseId,
           candidateClasses: options,
         },
@@ -2632,7 +3420,7 @@ export class DeterministicIntentService {
   }
 
   private buildEnrollPending(
-    student: any,
+    studentOrStudents: any,
     target: {
       classId: number;
       courseId?: number;
@@ -2642,8 +3430,55 @@ export class DeterministicIntentService {
       roleInClass?: string;
     },
   ): DeterministicOutcome {
-    const studentLabel = student.fullName || student.name || `#${student.id}`;
+    const students: any[] = Array.isArray(studentOrStudents)
+      ? studentOrStudents
+      : [studentOrStudents];
     const classLabel = target.classLabel || `#${target.classId}`;
+    const labelOf = (s: any) => s.fullName || s.name || s.label || `#${s.id}`;
+
+    // Nhiều học viên -> 1 bản nháp GỘP (userIds), xác nhận 1 lần cho cả nhóm.
+    if (students.length > 1) {
+      const names = students.map(labelOf);
+      const input: Record<string, unknown> = {
+        userIds: students.map((s) => Number(s.id)),
+        classId: target.classId,
+      };
+      if (target.joinedAt) input.joinedAt = target.joinedAt;
+      if (target.roleInClass) input.roleInClass = target.roleInClass;
+
+      const displayInput: Record<string, unknown> = {
+        ...input,
+        className: classLabel,
+        students: students.map((s) => ({
+          id: Number(s.id),
+          label: labelOf(s),
+          email: s.email ?? null,
+        })),
+      };
+      if (target.courseLabel) displayInput.courseName = target.courseLabel;
+
+      const pending: PendingAction = {
+        tool_name: 'assign_student_to_class',
+        input,
+        display_input: displayInput,
+        summary: `Thêm ${students.length} học viên (${names.join(', ')}) vào lớp ${classLabel}`,
+        intent: 'assign_student_to_class',
+        status: 'waiting_confirm',
+        severity: 'default',
+      };
+      return {
+        type: 'pending_write',
+        pending,
+        contextPatch: {
+          last_intent: 'assign_student_to_class',
+          selected_class_id: target.classId,
+          ...(target.courseId ? { selected_course_id: target.courseId } : {}),
+        },
+      };
+    }
+
+    const student = students[0];
+    const studentLabel = labelOf(student);
     const input: Record<string, unknown> = {
       userId: Number(student.id),
       classId: target.classId,
@@ -2695,7 +3530,11 @@ export class DeterministicIntentService {
       };
     }
 
-    const titlePart = rest.slice(0, courseMarker.index);
+    // Cắt phần chi tiết (ngày/lịch/giáo viên...) đứng trước "trong khóa" để
+    // không dính vào tên lớp, giống nhánh không nêu khóa.
+    const titlePart = this.stripClassDetailSuffix(
+      rest.slice(0, courseMarker.index),
+    ).titlePart;
     const courseRest = rest
       .slice(courseMarker.index + courseMarker[0].length)
       .trim();
@@ -2750,7 +3589,8 @@ export class DeterministicIntentService {
   }
 
   private parseClassType(message: string): CourseClassType {
-    const norm = toSearchKey(message);
+    // Bỏ dấu câu để "hsk1, lớp luyện đề, ngày..." vẫn khớp "luyen de".
+    const norm = toSearchKey(message).replace(/[,.;:]+/g, ' ').replace(/\s+/g, ' ');
     if (
       /(^|\s)(luyen de|on de|giai de|mock test|test practice|exam practice)(\s|$)/.test(
         norm,
@@ -2917,11 +3757,35 @@ export class DeterministicIntentService {
 
   private stripLeading(origTokens: string[]): string[] {
     let start = 0;
-    while (
-      start < origTokens.length &&
-      LEADING_STRIP.has(toSearchKey(origTokens[start]))
-    ) {
-      start += 1;
+    while (start < origTokens.length) {
+      const key = toSearchKey(origTokens[start]);
+      // Nhãn "tên/name (là)": mọi thứ phía sau là TÊN thật -> dừng strip NGAY,
+      // kể cả khi token đầu của tên trùng từ đệm ("tên Minh Nguyễn" — "Minh"
+      // trùng "mình" — không được cắt mất).
+      if (key === 'ten' || key === 'name') {
+        start += 1;
+        if (
+          start < origTokens.length &&
+          toSearchKey(origTokens[start]) === 'la'
+        ) {
+          start += 1;
+        }
+        break;
+      }
+      if (LEADING_STRIP.has(key)) {
+        start += 1;
+        continue;
+      }
+      // Số lượng đứng trước danh từ thực thể ("1 hv", "2 học viên") là từ đệm.
+      if (
+        /^\d{1,2}$/.test(key) &&
+        start + 1 < origTokens.length &&
+        LEADING_STRIP.has(toSearchKey(origTokens[start + 1]))
+      ) {
+        start += 1;
+        continue;
+      }
+      break;
     }
     return origTokens.slice(start);
   }

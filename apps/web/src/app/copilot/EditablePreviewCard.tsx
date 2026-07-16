@@ -3,7 +3,7 @@
 import React, { useState, useEffect, useRef } from "react";
 import { apiClient } from "@/lib/api-client";
 import { normalizeGeneratedCode } from "@hxstu/shared";
-import { AlertTriangle, LoaderCircle } from "lucide-react";
+import { AlertTriangle, LoaderCircle, X } from "lucide-react";
 import { formatFieldLabel, formatFieldValue, isRecord } from "./ResultBlocks";
 
 const ACTION_TITLES: Record<string, string> = {
@@ -247,6 +247,41 @@ export default function EditablePreviewCard({
     draftSyncTimerRef.current = setTimeout(() => {
       onDraftChange(nextInput);
     }, 350);
+  };
+
+  // Bản nháp GỘP nhiều học viên (userIds): hiển thị danh sách, cho bỏ bớt
+  // từng người trước khi Xác nhận (giữ tối thiểu 1 người).
+  const bulkUserIds: number[] = Array.isArray(formData.userIds)
+    ? (formData.userIds as unknown[])
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value) && value > 0)
+    : [];
+  const isBulkAssign =
+    data.tool_name === "assign_student_to_class" && bulkUserIds.length > 0;
+  const bulkStudentDirectory = new Map<
+    number,
+    { label: string; email: string | null }
+  >();
+  const displayStudents = (data.display_input?.students ??
+    pendingAction.display_input?.students) as unknown;
+  if (Array.isArray(displayStudents)) {
+    for (const item of displayStudents) {
+      if (isRecord(item) && item.id !== undefined) {
+        bulkStudentDirectory.set(Number(item.id), {
+          label: String(item.label || `#${item.id}`),
+          email: typeof item.email === "string" ? item.email : null,
+        });
+      }
+    }
+  }
+  const removeBulkStudent = (id: number) => {
+    if (bulkUserIds.length <= 1) return;
+    const next = {
+      ...formData,
+      userIds: bulkUserIds.filter((value) => value !== id),
+    };
+    setFormData(next);
+    scheduleDraftSync(next);
   };
 
   useEffect(() => {
@@ -580,21 +615,63 @@ export default function EditablePreviewCard({
         return (
           <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
             <div className="sm:col-span-2">
-              <FieldLabel label="Học viên ghi danh" required />
-              <select
-                name="userId"
-                value={String(formData.userId || "")}
-                onChange={handleChange}
-                className={inputClass(Boolean(validationErrors.userId))}
-              >
-                <option value="">-- Chọn học viên --</option>
-                {students.map((s) => (
-                  <option key={s.id} value={s.id}>
-                    {s.fullName} (#{s.id}) {s.email ? `| ${s.email}` : ""}
-                  </option>
-                ))}
-              </select>
-              <FieldError error={validationErrors.userId} />
+              {isBulkAssign ? (
+                <>
+                  <FieldLabel
+                    label={`Học viên ghi danh (${bulkUserIds.length})`}
+                    required
+                  />
+                  <ul className="divide-y divide-zinc-100 rounded-[10px] border border-zinc-200 bg-white">
+                    {bulkUserIds.map((id) => {
+                      const info = bulkStudentDirectory.get(id);
+                      return (
+                        <li
+                          key={id}
+                          className="flex items-center gap-2 px-3 py-2"
+                        >
+                          <span className="min-w-0 flex-1 truncate text-[13px] text-zinc-800">
+                            {info?.label || `Học viên #${id}`}{" "}
+                            <span className="text-zinc-400">
+                              (#{id}
+                              {info?.email ? ` | ${info.email}` : ""})
+                            </span>
+                          </span>
+                          {bulkUserIds.length > 1 && (
+                            <button
+                              type="button"
+                              onClick={() => removeBulkStudent(id)}
+                              disabled={confirmDisabled}
+                              title="Bỏ học viên này khỏi danh sách"
+                              className="shrink-0 rounded p-1 text-zinc-400 transition hover:bg-zinc-100 hover:text-red-500 disabled:pointer-events-none disabled:opacity-40"
+                            >
+                              <X size={14} />
+                            </button>
+                          )}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                  <FieldError error={validationErrors.userId} />
+                </>
+              ) : (
+                <>
+                  <FieldLabel label="Học viên ghi danh" required />
+                  <select
+                    name="userId"
+                    value={String(formData.userId || "")}
+                    onChange={handleChange}
+                    className={inputClass(Boolean(validationErrors.userId))}
+                  >
+                    <option value="">-- Chọn học viên --</option>
+                    {students.map((s) => (
+                      <option key={s.id} value={s.id}>
+                        {s.fullName} (#{s.id}) {s.email ? `| ${s.email}` : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <FieldError error={validationErrors.userId} />
+                </>
+              )}
             </div>
 
             <div className="sm:col-span-2">

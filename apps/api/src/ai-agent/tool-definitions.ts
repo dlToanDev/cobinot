@@ -364,16 +364,22 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
     type: 'function',
     function: {
       name: 'assign_student_to_class',
-      description: 'Thêm học viên vào một lớp học cụ thể.',
+      description:
+        'Thêm học viên vào một lớp học cụ thể. Nhiều học viên cùng lúc thì dùng userIds (1 lần gọi cho cả nhóm, KHÔNG gọi lặp từng người).',
       parameters: {
         type: 'object',
         properties: {
-          userId: numberField('ID học viên'),
+          userId: numberField('ID học viên (khi chỉ thêm 1 người)'),
+          userIds: {
+            type: 'array',
+            items: { type: 'number' },
+            description: 'Danh sách ID học viên khi thêm NHIỀU người cùng lúc',
+          },
           classId: numberField('ID lớp học'),
           roleInClass: stringField('Vai trò trong lớp', ['STUDENT', 'TEACHER']),
           joinedAt: stringField('Ngày tham gia dạng YYYY-MM-DD'),
         },
-        required: ['userId', 'classId'],
+        required: ['classId'],
       },
     },
   },

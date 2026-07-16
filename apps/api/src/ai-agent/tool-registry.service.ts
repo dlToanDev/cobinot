@@ -269,6 +269,11 @@ export class ToolRegistryService {
           this.optionalString(input.expectedStatus),
         );
       case 'assign_student_to_class':
+        // Bản gộp: userIds[] -> thêm từng người, partial success (người lỗi
+        // không làm hỏng người khác), trả kết quả theo từng dòng.
+        if (Array.isArray(input.userIds) && input.userIds.length > 0) {
+          return this.assignStudentsToClass(tenantId, input);
+        }
         return this.coursesService.addStudentToClass(
           tenantId,
           this.requireNumber(input.classId, 'classId'),
@@ -295,6 +300,74 @@ export class ToolRegistryService {
       default:
         throw new BadRequestException('WRITE tool không được hỗ trợ');
     }
+  }
+
+  /**
+   * Ghi danh GỘP nhiều học viên vào 1 lớp: validate lớp 1 lần rồi thêm từng
+   * người. Partial success — người trùng/lỗi chỉ fail dòng đó, người còn lại
+   * vẫn được ghi. Trả kết quả từng dòng để FE hiển thị ✓/⚠/✗.
+   */
+  private async assignStudentsToClass(
+    tenantId: number,
+    input: Record<string, unknown>,
+  ) {
+    const classId = this.requireNumber(input.classId, 'classId');
+    const roleInClass = this.optionalString(input.roleInClass) || 'STUDENT';
+    const joinedAt = this.optionalDateString(input.joinedAt);
+    // Validate lớp TRƯỚC vòng lặp: lớp sai/đóng thì fail cả batch ngay, không
+    // tạo ra kết quả nửa vời khó hiểu.
+    const courseClass: any = await this.coursesService.findOneClass(
+      tenantId,
+      classId,
+    );
+
+    const userIds = (input.userIds as unknown[])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
+
+    const items: Array<{
+      userId: number;
+      studentName: string | null;
+      status: 'SUCCESS' | 'ALREADY_IN_CLASS' | 'ERROR';
+      message: string | null;
+    }> = [];
+
+    for (const userId of userIds) {
+      try {
+        const enrollment: any = await this.coursesService.addStudentToClass(
+          tenantId,
+          classId,
+          { userId, roleInClass, joinedAt },
+        );
+        items.push({
+          userId,
+          studentName: enrollment?.user?.fullName || null,
+          status: 'SUCCESS',
+          message: null,
+        });
+      } catch (error: any) {
+        const message =
+          error?.response?.message || error?.message || 'Lỗi không xác định';
+        items.push({
+          userId,
+          studentName: null,
+          status:
+            error instanceof ConflictException ? 'ALREADY_IN_CLASS' : 'ERROR',
+          message: String(message),
+        });
+      }
+    }
+
+    return {
+      bulk: true,
+      classId,
+      className: courseClass?.title || courseClass?.classCode || null,
+      courseId: courseClass?.courseId ?? courseClass?.course?.id ?? null,
+      courseName: courseClass?.course?.title || null,
+      total: items.length,
+      successCount: items.filter((item) => item.status === 'SUCCESS').length,
+      items,
+    };
   }
 
   /**

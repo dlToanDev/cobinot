@@ -25,6 +25,14 @@ type CopilotSession = {
   } | null;
 };
 
+type CopilotSessionsResponse = {
+  items: CopilotSession[];
+  hasMore: boolean;
+};
+
+// Mỗi lần chỉ tải 1 trang; bấm "Xem thêm" để tải trang kế.
+const SESSIONS_PAGE_SIZE = 10;
+
 function getErrorMessage(err: unknown, fallback: string): string {
   if (err && typeof err === 'object' && 'response' in err) {
     const response = (
@@ -53,7 +61,9 @@ function formatDateTime(value: string): string {
 export default function CopilotSessionsPage() {
   const router = useRouter();
   const [sessions, setSessions] = useState<CopilotSession[]>([]);
+  const [hasMore, setHasMore] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState('');
   // id của phiên đang thực hiện thao tác (đóng/xóa) để disable đúng nút.
   const [busyId, setBusyId] = useState<number | null>(null);
@@ -62,14 +72,42 @@ export default function CopilotSessionsPage() {
     setLoading(true);
     setError('');
     try {
-      const res = await apiClient.get('/copilot/sessions');
-      setSessions((res.data as CopilotSession[]) || []);
+      const res = await apiClient.get(
+        `/copilot/sessions?limit=${SESSIONS_PAGE_SIZE}&offset=0`,
+      );
+      const data = res.data as CopilotSessionsResponse;
+      setSessions(data.items || []);
+      setHasMore(Boolean(data.hasMore));
     } catch (err: unknown) {
       setError(getErrorMessage(err, 'Không thể tải danh sách phiên chat'));
     } finally {
       setLoading(false);
     }
   }, []);
+
+  const loadMoreSessions = useCallback(async () => {
+    setLoadingMore(true);
+    setError('');
+    try {
+      const res = await apiClient.get(
+        `/copilot/sessions?limit=${SESSIONS_PAGE_SIZE}&offset=${sessions.length}`,
+      );
+      const data = res.data as CopilotSessionsResponse;
+      setSessions((current) => {
+        // Offset có thể lệch khi có phiên mới/bị xóa -> lọc trùng theo id.
+        const seen = new Set(current.map((item) => item.id));
+        return [
+          ...current,
+          ...(data.items || []).filter((item) => !seen.has(item.id)),
+        ];
+      });
+      setHasMore(Boolean(data.hasMore));
+    } catch (err: unknown) {
+      setError(getErrorMessage(err, 'Không thể tải thêm phiên chat'));
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [sessions.length]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -217,7 +255,8 @@ export default function CopilotSessionsPage() {
             </p>
           </div>
         ) : (
-          <ul className="space-y-3">
+          <>
+            <ul className="space-y-3">
             {sessions.map((session) => {
               const isActive = session.status === 'ACTIVE';
               const hasPending = Boolean(session.state?.pending_action);
@@ -303,7 +342,23 @@ export default function CopilotSessionsPage() {
                 </li>
               );
             })}
-          </ul>
+            </ul>
+            {hasMore && (
+              <div className="mt-4 flex justify-center">
+                <button
+                  type="button"
+                  onClick={() => void loadMoreSessions()}
+                  disabled={loadingMore}
+                  className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-4 py-2 text-sm font-medium text-slate-600 shadow-sm transition hover:border-slate-300 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {loadingMore && (
+                    <LoaderCircle size={16} className="animate-spin" />
+                  )}
+                  {loadingMore ? 'Đang tải...' : 'Xem thêm'}
+                </button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>
