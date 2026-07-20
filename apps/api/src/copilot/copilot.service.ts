@@ -352,6 +352,26 @@ export class CopilotService {
       if (handled) return handled;
     }
 
+    // Lưới an toàn: vừa hiển thị danh sách KHÓA để chọn (từ rule hoặc từ LLM
+    // ask_clarification) nhưng không có state machine nào giữ mạch -> câu trả
+    // lời "1"/"ID 93"/tên khóa vẫn phải chốt được khóa deterministic, không
+    // rơi xuống LLM (LLM hết quota là kẹt luôn).
+    if (
+      !state.pending_action &&
+      !state.pending_enrollment_context &&
+      (state.last_candidates?.courses?.length || 0) > 1
+    ) {
+      const handled = await this.handleCourseCandidateReply(
+        actor,
+        sessionId,
+        state,
+        content,
+        userMessage.id,
+        startedAt,
+      );
+      if (handled) return handled;
+    }
+
     // Suggestion WRITE action: KHÔNG execute ngay. Đưa qua preview/confirm
     // giống flow chat thường (lưu pending_action rồi trả preview_card).
     const suggestionPending = this.pendingActionFromSuggestion(action);
@@ -1318,7 +1338,7 @@ export class CopilotService {
         row.course?.title || row.course?.name || `#${row.courseId}`;
       const className = row.courseClass?.title || row.courseClass?.name;
       return [
-        'Đã ghi danh học viên vào khóa thành công.',
+        'Đã ghi danh học viên vào lớp trong khóa thành công.',
         '',
         bullet('Học viên', studentName),
         bullet('Khóa', courseName),
@@ -1371,7 +1391,8 @@ export class CopilotService {
       create_course: 'Tạo khóa học mới',
       create_class: 'Tạo lớp học mới',
       assign_student_to_class: 'Thêm học viên vào lớp học',
-      assign_student_to_course: 'Ghi danh học viên vào khóa học',
+      assign_student_to_course:
+        'Ghi danh học viên vào khóa học (vào lớp trong khóa)',
     };
     return {
       tool_name: action.action,
@@ -1722,6 +1743,22 @@ export class CopilotService {
         return {
           message: 'Vui lòng chọn lớp học.',
           errors: { classId: 'Vui lòng chọn lớp học.' },
+        };
+      }
+    }
+    if (toolName === 'assign_student_to_course') {
+      // classId KHÔNG bắt buộc: execute tự resolve lớp trong khóa, hoặc
+      // trả COURSE_HAS_MULTIPLE_CLASSES để user chọn lớp cụ thể.
+      if (!Number(input.userId || 0)) {
+        return {
+          message: 'Vui lòng chọn học viên.',
+          errors: { userId: 'Vui lòng chọn học viên.' },
+        };
+      }
+      if (!Number(input.courseId || 0)) {
+        return {
+          message: 'Vui lòng chọn khóa học.',
+          errors: { courseId: 'Vui lòng chọn khóa học.' },
         };
       }
     }
@@ -2304,6 +2341,115 @@ export class CopilotService {
   }
 
   /**
+   * User chọn 1 khóa từ danh sách candidates vừa hiển thị ("1", "id 93", tên
+   * khóa) khi KHÔNG có state machine nào khác giữ mạch. Chỉ nhận câu trả lời
+   * NGẮN và rõ ràng là lựa chọn — câu chat khác trả null để nhánh sau xử lý.
+   * Có pending_course_choice (intent gốc là xem danh sách) -> chọn xong trả
+   * KẾT QUẢ luôn, không dừng ở "đã chọn khóa".
+   */
+  private async handleCourseCandidateReply(
+    actor: ActorPayload,
+    sessionId: number,
+    state: DecisionContext,
+    content: string,
+    userMessageId: number,
+    startedAt: number,
+  ) {
+    // Câu dài gần như chắc chắn là yêu cầu mới, không phải chọn từ danh sách.
+    if (this.normalizeText(content).split(/\s+/).length > 6) return null;
+
+    const chosen = this.resolveClassChoice(
+      content,
+      state.last_candidates?.courses || [],
+    );
+    if (!chosen) return null;
+
+    const basePatch: Partial<DecisionContext> = {
+      selected_course_id: Number(chosen.id),
+      last_selected_course: chosen,
+      pending_clarification: null,
+      pending_course_choice: null,
+      // Đã chốt -> xóa danh sách chờ chọn để "1" ở lượt sau không bị hiểu nhầm.
+      last_candidates: { courses: [] },
+    };
+
+    // Đi tiếp intent gốc: user đang muốn XEM DANH SÁCH -> trả bảng luôn.
+    const choiceCtx = state.pending_course_choice;
+    if (choiceCtx) {
+      let outcome: DeterministicOutcome | null = null;
+      try {
+        outcome =
+          choiceCtx.intent === 'list_students'
+            ? await this.deterministic.listCourseStudents(
+                actor.tenantId,
+                Number(chosen.id),
+                chosen.label,
+                choiceCtx.studentKeyword || '',
+              )
+            : await this.deterministic.listCourseClasses(
+                actor.tenantId,
+                Number(chosen.id),
+                chosen.label,
+                choiceCtx.classKeyword || '',
+                choiceCtx.classType,
+              );
+      } catch {
+        outcome = null;
+      }
+      if (outcome) {
+        const response: CopilotResponse =
+          outcome.type === 'student_table'
+            ? {
+                type: 'student_table',
+                title: outcome.title,
+                message: outcome.message,
+                scope: outcome.scope,
+                students: outcome.students,
+              }
+            : outcome.type === 'class_table'
+              ? {
+                  type: 'class_table',
+                  title: outcome.title,
+                  message: outcome.message,
+                  classes: outcome.classes,
+                }
+              : {
+                  type: 'text_message',
+                  message: (outcome as any).message,
+                };
+        return this.saveAssistantTurn({
+          sessionId,
+          userMessageId,
+          startedAt,
+          response,
+          state: this.mergeState(state, {
+            ...basePatch,
+            ...outcome.contextPatch,
+          }),
+        });
+      }
+    }
+
+    const response: CopilotResponse = {
+      type: 'text_message',
+      message:
+        `Đã chọn khóa "${chosen.label}" (ID: ${chosen.id}).\n\n` +
+        'Bạn có thể nói tiếp, ví dụ:\n' +
+        '- "thêm học viên <tên> vào khóa này"\n' +
+        '- "tạo lớp trong khóa này"\n' +
+        '- "xem danh sách lớp trong khóa này"\n' +
+        '- "xem danh sách học viên trong khóa này"',
+    };
+    return this.saveAssistantTurn({
+      sessionId,
+      userMessageId,
+      startedAt,
+      response,
+      state: this.mergeState(state, basePatch),
+    });
+  }
+
+  /**
    * Xử lý user chọn lớp khi khóa có nhiều lớp (pending_enrollment_context).
    * - Hủy -> clear context.
    * - Chọn được lớp (theo số thứ tự hoặc tên) -> tạo preview assign_student_to_course
@@ -2373,6 +2519,67 @@ export class CopilotService {
         ...(chosenStudents.length === 1
           ? { selected_student_id: Number(chosenStudents[0].id) }
           : {}),
+      };
+      if (outcome.type === 'pending_write') {
+        return this.savePendingWriteTurn({
+          actor,
+          sessionId,
+          state: this.mergeState(state, basePatch),
+          pending: outcome.pending,
+          userMessageId,
+          startedAt,
+          contextPatch: outcome.contextPatch,
+        });
+      }
+      const response: CopilotResponse =
+        outcome.type === 'clarification'
+          ? {
+              type: 'clarification',
+              message: outcome.message,
+              missing_fields: outcome.missingFields,
+              intent: outcome.intent,
+              entities: {},
+            }
+          : { type: 'text_message', message: (outcome as any).message };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, {
+          ...basePatch,
+          ...outcome.contextPatch,
+        }),
+      });
+    }
+
+    // Đang chờ chọn KHÓA (nhiều khóa trùng tên): resolve theo số thứ tự/tên/ID
+    // rồi đi tiếp liệt kê lớp của khóa đã chọn — không rơi xuống LLM/fallback
+    // (fallback từng đem "1"/"ID 93" đi tìm học viên).
+    if (!ctx.courseId && ctx.candidateCourses?.length) {
+      const chosenCourse = this.resolveClassChoice(
+        content,
+        ctx.candidateCourses,
+      );
+      if (!chosenCourse) return null;
+
+      let outcome: DeterministicOutcome | null = null;
+      try {
+        outcome = await this.deterministic.resolveEnrollCourseReply(
+          actor.tenantId,
+          ctx,
+          { id: Number(chosenCourse.id), label: chosenCourse.label },
+        );
+      } catch {
+        outcome = null;
+      }
+      if (!outcome) return null;
+
+      const basePatch: Partial<DecisionContext> = {
+        pending_enrollment_context: null,
+        pending_clarification: null,
+        selected_course_id: Number(chosenCourse.id),
+        last_selected_course: chosenCourse,
       };
       if (outcome.type === 'pending_write') {
         return this.savePendingWriteTurn({
@@ -2668,10 +2875,23 @@ export class CopilotService {
       return candidates[idx];
     }
 
+    // "id 93" / "id: 93": chọn theo ID thật (danh sách hiển thị có kèm ID).
+    const byIdMatch = text.match(/\bid\s*:?\s*(\d+)/);
+    if (byIdMatch) {
+      const byId = candidates.find(
+        (c) => Number(c.id) === parseInt(byIdMatch[1], 10),
+      );
+      if (byId) return byId;
+    }
+
     const byName = candidates.find((c) => {
       const label = this.normalizeText(String(c.label || ''));
       const code = this.normalizeText(
-        String((c.metadata as any)?.classCode || ''),
+        String(
+          (c.metadata as any)?.classCode ||
+            (c.metadata as any)?.courseCode ||
+            '',
+        ),
       );
       return (label && text.includes(label)) || (code && text.includes(code));
     });

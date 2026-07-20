@@ -1213,7 +1213,7 @@ export default function CopilotPage() {
           data.tool_name === "remove_student_from_class";
         const enrollmentTitle =
           data.tool_name === "assign_student_to_course"
-            ? "Thông tin ghi danh vào khóa học"
+            ? "Thông tin ghi danh vào lớp trong khóa"
             : data.tool_name === "assign_student_to_class"
               ? "Thông tin thêm vào lớp"
               : "Thông tin lớp học";

@@ -645,7 +645,7 @@ export function CopilotResultCard({
     update_course: "Đã cập nhật khóa học",
     create_class: "Đã tạo lớp học",
     update_class: "Đã cập nhật lớp học",
-    assign_student_to_course: "Đã ghi danh vào khóa học",
+    assign_student_to_course: "Đã ghi danh vào lớp trong khóa",
     assign_student_to_class: "Đã thêm học viên vào lớp",
     remove_student_from_class: "Đã xóa học viên khỏi lớp",
     delete_students: "Đã xóa học viên",

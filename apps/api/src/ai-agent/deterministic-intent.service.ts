@@ -51,7 +51,7 @@ export type DeterministicOutcome =
       type: 'student_table';
       title: string;
       message?: string;
-      scope: 'course' | 'class';
+      scope: 'course' | 'class' | 'system';
       students: StudentTableRow[];
       contextPatch: Partial<DecisionContext>;
     }
@@ -1286,7 +1286,10 @@ export class DeterministicIntentService {
     const opt = state.last_selected_course || state.last_created_course || null;
     const id = Number(state.selected_course_id) || Number(opt?.id) || 0;
     if (!id) return null;
-    return { id, label: String(opt?.label || `#${id}`) };
+    // Chỉ dùng label của option khi nó đúng là khóa có id này — tránh ghép
+    // id mới (từ selected_course_id) với tên của khóa cũ trong ngữ cảnh.
+    const label = opt && Number(opt.id) === id ? opt.label : `#${id}`;
+    return { id, label: String(label) };
   }
 
   // ---- Change class type ----------------------------------------------------
@@ -2973,12 +2976,91 @@ export class DeterministicIntentService {
         );
       }
       if (courses.length > 1) {
-        return this.chooseFrom('course', courses);
+        // Nhiều khóa trùng tên: hỏi chọn khóa nhưng PHẢI lưu
+        // pending_enrollment_context (giữ học viên đã resolve) — giống case
+        // nhiều lớp trùng tên. Nếu chỉ dùng chooseFrom thì câu trả lời
+        // "1"/"ID 93" rơi xuống LLM/fallback và mất mạch ghi danh.
+        const courseOptions = this.toOptions(courses);
+        const studentList: any[] = Array.isArray(student) ? student : [student];
+        const names = studentList
+          .map((s) => s.fullName || s.name || `học viên #${s.id}`)
+          .join(', ');
+        return {
+          type: 'clarification',
+          message:
+            `${formatCandidateList('course', courses)}\n` +
+            `Bạn muốn thêm ${names} vào khóa nào?`,
+          missingFields: ['courseId'],
+          intent: 'assign_student_to_class',
+          contextPatch: {
+            last_intent: 'assign_student_to_class',
+            pending_enrollment_context: {
+              userId: studentList.length === 1 ? Number(studentList[0].id) : 0,
+              ...(studentList.length > 1
+                ? { userIds: studentList.map((s) => Number(s.id)) }
+                : {}),
+              studentLabels: studentList.map(
+                (s) => s.fullName || s.name || `#${s.id}`,
+              ),
+              courseId: 0,
+              candidateClasses: [],
+              candidateCourses: courseOptions,
+            },
+            last_candidates: { courses: courseOptions },
+          },
+        };
       }
       courseId = Number(courses[0].id);
       courseLabel = String(courses[0].title || courses[0].courseCode || '');
     }
 
+    return this.enrollIntoResolvedCourse(
+      tenantId,
+      student,
+      courseId,
+      courseLabel,
+    );
+  }
+
+  /**
+   * User trả lời CHỌN KHÓA (số thứ tự/tên/ID) khi đang có
+   * pending_enrollment_context.candidateCourses. Học viên đã resolve từ trước;
+   * đi tiếp phần liệt kê lớp của khóa vừa chọn.
+   */
+  async resolveEnrollCourseReply(
+    tenantId: number,
+    ctx: PendingEnrollmentContext,
+    course: { id: number; label: string },
+  ): Promise<DeterministicOutcome | null> {
+    const students = ctx.userIds?.length
+      ? ctx.userIds.map((id, index) => ({
+          id,
+          fullName: ctx.studentLabels?.[index] || `#${id}`,
+        }))
+      : ctx.userId
+        ? [
+            {
+              id: ctx.userId,
+              fullName: ctx.studentLabels?.[0] || `#${ctx.userId}`,
+            },
+          ]
+        : [];
+    if (!students.length) return null;
+    return this.enrollIntoResolvedCourse(
+      tenantId,
+      students.length === 1 ? students[0] : students,
+      course.id,
+      course.label,
+    );
+  }
+
+  /** Khóa đã chốt -> liệt kê lớp: 0 lớp báo tạo lớp, 1 lớp preview luôn, nhiều lớp hỏi chọn. */
+  private async enrollIntoResolvedCourse(
+    tenantId: number,
+    student: any,
+    courseId: number,
+    courseLabel: string,
+  ): Promise<DeterministicOutcome> {
     const classes = await this.coursesService.searchClasses(tenantId, '', {
       courseId,
     });
@@ -2986,7 +3068,16 @@ export class DeterministicIntentService {
       return {
         type: 'message',
         message: `Khóa "${courseLabel || `#${courseId}`}" chưa có lớp nào nên chưa thể thêm học viên. Bạn tạo lớp trong khóa này trước nhé.`,
-        contextPatch: { last_intent: 'assign_student_to_class' },
+        contextPatch: {
+          last_intent: 'assign_student_to_class',
+          // Nhớ khóa vừa nhắc tới: user thường nói tiếp "tạo lớp trong khóa
+          // này" — không patch thì resolveContextCourse rơi về khóa cũ.
+          selected_course_id: courseId,
+          last_selected_course: {
+            id: courseId,
+            label: courseLabel || `#${courseId}`,
+          },
+        },
       };
     }
     if (classes.length === 1) {
@@ -3043,45 +3134,138 @@ export class DeterministicIntentService {
   private parseListStudents(
     norm: string,
     origTokens: string[],
-  ): { scope: 'course' | 'class'; keyword: string } | null {
+  ): {
+    scope: 'course' | 'class' | 'system';
+    keyword: string;
+    /** Lọc học viên theo tên/email/SĐT: "tìm học viên TUẤN trong khóa X". */
+    studentKeyword: string;
+  } | null {
     if (!STUDENT_RE.test(norm)) return null;
-    if (!COURSE_RE.test(norm) && !CLASS_RE.test(norm)) return null;
     if (!LIST_STUDENTS_VERB_RE.test(norm)) return null;
     if (MODIFY_VERB_RE.test(norm)) return null;
     if (CREATE_VERB_RE.test(norm)) return null;
 
     const normTokens = origTokens.map((token) => toSearchKey(token));
-    let scope: 'course' | 'class' | null = null;
-    let start = -1;
+
+    // Vị trí KẾT THÚC cụm "học viên/hv/hs..." đầu tiên (để cắt keyword học viên).
+    let studentEnd = -1;
     for (let i = 0; i < normTokens.length; i += 1) {
+      if (
+        ['hocvien', 'hv', 'hs', 'student', 'learner'].includes(normTokens[i])
+      ) {
+        studentEnd = i + 1;
+        break;
+      }
+      if (
+        normTokens[i] === 'hoc' &&
+        ['vien', 'sinh'].includes(normTokens[i + 1] || '')
+      ) {
+        studentEnd = i + 2;
+        break;
+      }
+    }
+
+    let scope: 'course' | 'class' | 'system' | null = null;
+    let start = -1;
+    let markerIndex = normTokens.length;
+    for (let i = Math.max(studentEnd, 0); i < normTokens.length; i += 1) {
       if (['lop', 'class'].includes(normTokens[i])) {
         scope = 'class';
         start = i + 1;
+        markerIndex = i;
         break;
       }
       if (['khoa', 'course'].includes(normTokens[i])) {
         scope = 'course';
         start = i + 1;
+        markerIndex = i;
         break;
       }
     }
-    if (!scope || start < 0) return null;
+
+    // Keyword học viên = phần giữa "học viên" và marker khóa/lớp, bỏ từ nối và
+    // cụm "tất cả/toàn bộ" ("tìm học viên tuấn trong khóa test" -> "tuấn").
+    // Cụm 2 từ phải bỏ THEO CẶP: bỏ token đơn 'toan'/'ca' sẽ nuốt mất tên
+    // riêng như "Toàn".
+    const SKIP_SINGLE = new Set([
+      'trong', 'o', 'thuoc', 'cua', 'tai', 'ten', 'la', 'co',
+      'het', 'cac', 'nhung', 'all',
+    ]);
+    const SKIP_PAIRS = [
+      ['tat', 'ca'],
+      ['toan', 'bo'],
+      ['danh', 'sach'],
+    ];
+    const kwTokens: string[] = [];
+    for (let i = studentEnd; i >= 0 && i < markerIndex; i += 1) {
+      const key = toSearchKey(origTokens[i] || '');
+      const nextKey = toSearchKey(origTokens[i + 1] || '');
+      if (
+        i + 1 < markerIndex &&
+        SKIP_PAIRS.some(([a, b]) => key === a && nextKey === b)
+      ) {
+        i += 1;
+        continue;
+      }
+      if (SKIP_SINGLE.has(key)) continue;
+      kwTokens.push(origTokens[i]);
+    }
+    const studentKeyword =
+      studentEnd >= 0
+        ? this.stripPoliteTail(kwTokens.join(' ').trim())
+        : '';
+
+    if (!scope || start < 0) {
+      // Không nêu khóa/lớp: chỉ nhận scope TOÀN HỆ THỐNG khi có tín hiệu "xem
+      // tất cả/danh sách" và không kèm tên cụ thể — "tìm học viên An" vẫn đi
+      // flow search thường (trả candidates để chọn).
+      const hasAllSignal =
+        /(^|\s)(tat ca|toan bo|danh sach|ds|liet ke|all)(\s|$)/.test(norm);
+      if (hasAllSignal && !studentKeyword) {
+        return { scope: 'system', keyword: '', studentKeyword: '' };
+      }
+      return null;
+    }
 
     // "khóa học X"/"lớp học X" -> bỏ "học" ngay sau marker.
     if (toSearchKey(origTokens[start] || '') === 'hoc') start += 1;
     const keyword = this.stripPoliteTail(
       origTokens.slice(start).join(' ').trim(),
     );
-    return { scope, keyword };
+    return { scope, keyword, studentKeyword };
   }
 
   private async handleListStudents(
     tenantId: number,
     state: DecisionContext,
-    parsed: { scope: 'course' | 'class'; keyword: string },
+    parsed: {
+      scope: 'course' | 'class' | 'system';
+      keyword: string;
+      studentKeyword: string;
+    },
   ): Promise<DeterministicOutcome> {
-    const { scope, keyword } = parsed;
+    const { scope, keyword, studentKeyword } = parsed;
     const useContext = !keyword || this.isContextRefPhrase(keyword);
+
+    // Toàn hệ thống: "tìm tất cả học viên", "danh sách học viên".
+    if (scope === 'system') {
+      const students = await this.usersService.findAllStudents(tenantId, {
+        keyword: studentKeyword || undefined,
+      });
+      return this.buildStudentTable({
+        scope: 'system',
+        label: 'toàn hệ thống',
+        contextPatch: {},
+        filterKeyword: studentKeyword,
+        // Chặn payload quá lớn; UI phân trang 10 học viên/trang.
+        rows: (students || []).slice(0, 100).map((s: any) => ({
+          id: Number(s.id) || 0,
+          fullName: String(s.fullName || `#${s.id}`),
+          email: s.email ?? null,
+          phone: s.phone ?? null,
+        })),
+      });
+    }
 
     if (scope === 'class') {
       let classId = 0;
@@ -3124,6 +3308,7 @@ export class DeterministicIntentService {
         scope: 'class',
         label: classLabel,
         contextPatch: { selected_class_id: classId },
+        filterKeyword: studentKeyword,
         rows: (rows || []).map((row: any) => ({
           id: Number(row.student?.id) || 0,
           fullName: String(row.student?.fullName || `#${row.student?.id}`),
@@ -3179,7 +3364,11 @@ export class DeterministicIntentService {
         return this.notFound('course', keyword, this.toOptions([]));
       }
       if (courses.length > 1) {
-        return this.chooseFrom('course', courses);
+        // Nhớ intent gốc: chọn khóa xong phải hiện danh sách LUÔN.
+        return this.chooseFromCourseWithContinuation(courses, {
+          intent: 'list_students',
+          studentKeyword,
+        });
       }
       courseId = Number(courses[0].id);
       courseLabel = String(
@@ -3187,45 +3376,123 @@ export class DeterministicIntentService {
       );
     }
 
+    return this.listCourseStudents(
+      tenantId,
+      courseId,
+      courseLabel,
+      studentKeyword,
+    );
+  }
+
+  /**
+   * Bảng học viên của MỘT khóa đã chốt. Public để CopilotService gọi tiếp sau
+   * khi user chọn khóa từ danh sách candidates.
+   */
+  async listCourseStudents(
+    tenantId: number,
+    courseId: number,
+    courseLabel: string,
+    studentKeyword: string,
+  ): Promise<DeterministicOutcome> {
     const rows = await this.coursesService.getCourseStudents(
       tenantId,
       courseId,
     );
+    const enrollmentRows: StudentTableRow[] = (rows || []).map((row: any) => ({
+      id: Number(row.student?.id) || 0,
+      fullName: String(row.student?.fullName || `#${row.student?.id}`),
+      email: row.student?.email ?? null,
+      phone: row.student?.phone ?? null,
+      className: row.classTitle ?? null,
+      classType: row.classType ?? null,
+      roleInClass: row.roleInClass ?? null,
+      joinedAt: row.joinedAt ? new Date(row.joinedAt).toISOString() : null,
+    }));
+
+    // Gộp 1 DÒNG / HỌC VIÊN: học nhiều lớp trong khóa thì cột Lớp ghi
+    // "Toán 3, Tiếng Bỉ 1" thay vì lặp lại học viên mỗi lớp một dòng.
+    const byStudent = new Map<number, StudentTableRow>();
+    for (const row of enrollmentRows) {
+      const existing = byStudent.get(row.id);
+      if (!existing) {
+        byStudent.set(row.id, { ...row });
+        continue;
+      }
+      const classNames = (existing.className || '')
+        .split(', ')
+        .filter(Boolean);
+      if (row.className && !classNames.includes(row.className)) {
+        classNames.push(row.className);
+        existing.className = classNames.join(', ');
+        // Nhiều lớp có thể khác loại -> bỏ badge loại lớp cho dòng gộp.
+        existing.classType = null;
+      }
+    }
+
     return this.buildStudentTable({
       scope: 'course',
       label: courseLabel,
       contextPatch: { selected_course_id: courseId },
-      rows: (rows || []).map((row: any) => ({
-        id: Number(row.student?.id) || 0,
-        fullName: String(row.student?.fullName || `#${row.student?.id}`),
-        email: row.student?.email ?? null,
-        phone: row.student?.phone ?? null,
-        className: row.classTitle ?? null,
-        classType: row.classType ?? null,
-        roleInClass: row.roleInClass ?? null,
-        joinedAt: row.joinedAt ? new Date(row.joinedAt).toISOString() : null,
-      })),
+      filterKeyword: studentKeyword,
+      rows: Array.from(byStudent.values()),
     });
+  }
+
+  /** chooseFrom('course') + lưu intent gốc để chọn khóa xong đi tiếp luôn. */
+  private chooseFromCourseWithContinuation(
+    courses: any[],
+    choice: NonNullable<DecisionContext['pending_course_choice']>,
+  ): DeterministicOutcome {
+    const outcome = this.chooseFrom('course', courses);
+    return {
+      ...outcome,
+      contextPatch: {
+        ...outcome.contextPatch,
+        pending_course_choice: choice,
+      },
+    };
   }
 
   /** Dựng outcome bảng học viên + lưu candidates để follow-up "chọn số 2". */
   private buildStudentTable(params: {
-    scope: 'course' | 'class';
+    scope: 'course' | 'class' | 'system';
     label: string;
     rows: StudentTableRow[];
     contextPatch: Partial<DecisionContext>;
+    /** Có -> chỉ giữ học viên khớp tên/email/SĐT (không phân biệt dấu). */
+    filterKeyword?: string;
   }): DeterministicOutcome {
-    if (params.rows.length === 0) {
+    const scopeLabel =
+      params.scope === 'course'
+        ? `khóa "${params.label}"`
+        : params.scope === 'class'
+          ? `lớp "${params.label}"`
+          : 'hệ thống';
+
+    const filterKey = toSearchKey(params.filterKeyword || '');
+    const rows = filterKey
+      ? params.rows.filter((row) =>
+          toSearchKey(
+            [row.fullName, row.email || '', row.phone || ''].join(' '),
+          ).includes(filterKey),
+        )
+      : params.rows;
+
+    if (rows.length === 0) {
       return {
         type: 'message',
-        message: `${params.scope === 'course' ? 'Khóa' : 'Lớp'} "${params.label}" chưa có học viên nào.`,
+        message: filterKey
+          ? `Không tìm thấy học viên nào khớp "${params.filterKeyword}" trong ${scopeLabel}.`
+          : params.scope === 'system'
+            ? 'Hệ thống chưa có học viên nào.'
+            : `${params.scope === 'course' ? 'Khóa' : 'Lớp'} "${params.label}" chưa có học viên nào.`,
         contextPatch: params.contextPatch,
       };
     }
 
     const seen = new Set<number>();
     const options: EntityOption[] = [];
-    for (const row of params.rows) {
+    for (const row of rows) {
       if (!row.id || seen.has(row.id)) continue;
       seen.add(row.id);
       if (options.length < 10) {
@@ -3240,15 +3507,22 @@ export class DeterministicIntentService {
     }
     const uniqueCount = seen.size;
 
+    const title =
+      params.scope === 'system'
+        ? 'Danh sách học viên toàn hệ thống'
+        : `Danh sách học viên ${params.scope === 'course' ? 'khóa' : 'lớp'} ${params.label}`;
+    const message = filterKey
+      ? `Tìm thấy ${uniqueCount} học viên khớp "${params.filterKeyword}" trong ${scopeLabel}.`
+      : params.scope === 'course' && uniqueCount !== rows.length
+        ? `${uniqueCount} học viên · ${rows.length} lượt ghi danh (một học viên có thể học nhiều lớp).`
+        : `Sĩ số hiện tại: ${uniqueCount} học viên.`;
+
     return {
       type: 'student_table',
-      title: `Danh sách học viên ${params.scope === 'course' ? 'khóa' : 'lớp'} ${params.label}`,
-      message:
-        params.scope === 'course' && uniqueCount !== params.rows.length
-          ? `${uniqueCount} học viên · ${params.rows.length} lượt ghi danh (một học viên có thể học nhiều lớp).`
-          : `Sĩ số hiện tại: ${uniqueCount} học viên.`,
+      title,
+      message,
       scope: params.scope,
-      students: params.rows,
+      students: rows,
       contextPatch: {
         ...params.contextPatch,
         last_intent: 'search_student',
@@ -3267,7 +3541,16 @@ export class DeterministicIntentService {
   private parseListClasses(
     norm: string,
     origTokens: string[],
-  ): { courseKeyword: string; classKeyword: string } | null {
+  ): {
+    courseKeyword: string;
+    classKeyword: string;
+    /** "lớp THEO TUẦN/LUYỆN ĐỀ" -> lọc theo LOẠI lớp, không phải tên lớp. */
+    classType?: 'WEEKLY' | 'EXAM_PRACTICE';
+    /** "trong (cả) hệ thống" -> bỏ qua khóa trong ngữ cảnh, liệt kê tất cả. */
+    systemWide?: boolean;
+    /** Câu có nhắc tới "khóa" không — không nhắc thì KHÔNG lấy khóa ngữ cảnh. */
+    mentionsCourse?: boolean;
+  } | null {
     if (STUDENT_RE.test(norm)) return null;
     if (!CLASS_RE.test(norm)) return null;
     if (
@@ -3312,16 +3595,100 @@ export class DeterministicIntentService {
     if (classKeyword && this.isContextRefPhrase(classKeyword)) {
       classKeyword = '';
     }
-    return { courseKeyword, classKeyword };
+
+    // "theo tuần"/"luyện đề" trong phần tên lớp -> đó là LOẠI lớp: tách ra
+    // làm filter type, phần còn lại (nếu có) mới là keyword tên lớp.
+    let classType: 'WEEKLY' | 'EXAM_PRACTICE' | undefined;
+    const kwNorm = toSearchKey(classKeyword);
+    if (/(^|\s)(luyen de|exam)(\s|$)/.test(kwNorm)) {
+      classType = 'EXAM_PRACTICE';
+    } else if (/(^|\s)(theo tuan|hang tuan|weekly)(\s|$)/.test(kwNorm)) {
+      classType = 'WEEKLY';
+    }
+    if (classType) {
+      const tokens = classKeyword.split(/\s+/).filter(Boolean);
+      const cleaned: string[] = [];
+      for (let i = 0; i < tokens.length; i += 1) {
+        const key = toSearchKey(tokens[i]);
+        const next = toSearchKey(tokens[i + 1] || '');
+        if ((key === 'theo' || key === 'hang') && next === 'tuan') {
+          i += 1;
+          continue;
+        }
+        if (key === 'luyen' && next === 'de') {
+          i += 1;
+          continue;
+        }
+        if (['weekly', 'exam', 'practice'].includes(key)) continue;
+        cleaned.push(tokens[i]);
+      }
+      classKeyword = cleaned.join(' ').trim();
+    }
+
+    // "trong (cả/toàn) hệ thống" -> cắt cụm đó khỏi keyword khóa/lớp.
+    const systemWide = /(^|\s)(he thong)(\s|$)/.test(norm);
+    if (systemWide) {
+      const stripSystem = (value: string) => {
+        const tokens = value.split(/\s+/).filter(Boolean);
+        const norms = tokens.map((t) => toSearchKey(t));
+        let cut = -1;
+        for (let i = 0; i < norms.length - 1; i += 1) {
+          if (norms[i] === 'he' && norms[i + 1] === 'thong') {
+            cut = i;
+            break;
+          }
+        }
+        if (cut < 0) return value.trim();
+        while (
+          cut > 0 &&
+          ['trong', 'ca', 'toan', 'o'].includes(norms[cut - 1])
+        ) {
+          cut -= 1;
+        }
+        return tokens.slice(0, cut).join(' ').trim();
+      };
+      courseKeyword = stripSystem(courseKeyword);
+      classKeyword = stripSystem(classKeyword);
+    }
+
+    return {
+      courseKeyword,
+      classKeyword,
+      classType,
+      systemWide,
+      mentionsCourse: khoaIdx >= 0,
+    };
   }
 
   private async handleListClasses(
     tenantId: number,
     state: DecisionContext,
-    parsed: { courseKeyword: string; classKeyword: string },
+    parsed: {
+      courseKeyword: string;
+      classKeyword: string;
+      classType?: 'WEEKLY' | 'EXAM_PRACTICE';
+      systemWide?: boolean;
+      mentionsCourse?: boolean;
+    },
   ): Promise<DeterministicOutcome> {
     let courseId = 0;
     let courseLabel = '';
+
+    // Toàn hệ thống khi: nói rõ "hệ thống", HOẶC câu không hề nhắc tới khóa
+    // ("xem ds lớp luyện đề") — không được tự lấy khóa trong ngữ cảnh, muốn
+    // xem theo khóa user sẽ nói "khóa này"/"trong khóa X".
+    if (
+      !parsed.courseKeyword &&
+      (parsed.systemWide || !parsed.mentionsCourse)
+    ) {
+      return this.listCourseClasses(
+        tenantId,
+        0,
+        '',
+        parsed.classKeyword,
+        parsed.classType,
+      );
+    }
 
     const wantsContextCourse =
       !parsed.courseKeyword || this.isContextRefPhrase(parsed.courseKeyword);
@@ -3334,7 +3701,12 @@ export class DeterministicIntentService {
         return this.notFound('course', parsed.courseKeyword, this.toOptions([]));
       }
       if (courses.length > 1) {
-        return this.chooseFrom('course', courses);
+        // Nhớ intent gốc: chọn khóa xong phải hiện danh sách lớp LUÔN.
+        return this.chooseFromCourseWithContinuation(courses, {
+          intent: 'list_classes',
+          classKeyword: parsed.classKeyword,
+          ...(parsed.classType ? { classType: parsed.classType } : {}),
+        });
       }
       courseId = Number(courses[0].id);
       courseLabel = String(
@@ -3372,21 +3744,50 @@ export class DeterministicIntentService {
       }
     }
 
+    return this.listCourseClasses(
+      tenantId,
+      courseId,
+      courseLabel,
+      parsed.classKeyword,
+      parsed.classType,
+    );
+  }
+
+  /**
+   * Bảng lớp học của MỘT khóa đã chốt (courseId = 0 -> mọi lớp trong hệ
+   * thống), lọc được theo LOẠI lớp (theo tuần/luyện đề). Public để
+   * CopilotService gọi tiếp sau khi user chọn khóa.
+   */
+  async listCourseClasses(
+    tenantId: number,
+    courseId: number,
+    courseLabel: string,
+    classKeyword: string,
+    classType?: 'WEEKLY' | 'EXAM_PRACTICE',
+  ): Promise<DeterministicOutcome> {
     const classes = await this.coursesService.searchClasses(
       tenantId,
-      parsed.classKeyword,
-      courseId ? { courseId } : {},
+      classKeyword,
+      {
+        ...(courseId ? { courseId } : {}),
+        ...(classType ? { type: classType } : {}),
+      },
     );
 
+    const typeLabel = classType
+      ? classType === 'WEEKLY'
+        ? ' theo tuần'
+        : ' luyện đề'
+      : '';
     const title = courseId
-      ? `Danh sách lớp khóa ${courseLabel}`
-      : 'Danh sách lớp học';
+      ? `Danh sách lớp${typeLabel} khóa ${courseLabel}`
+      : `Danh sách lớp${typeLabel} toàn hệ thống`;
     if (!classes.length) {
       return {
         type: 'message',
         message: courseId
-          ? `Khóa "${courseLabel}" chưa có lớp nào${parsed.classKeyword ? ` khớp "${parsed.classKeyword}"` : ''}.`
-          : 'Chưa có lớp học nào trong hệ thống.',
+          ? `Khóa "${courseLabel}" chưa có lớp${typeLabel} nào${classKeyword ? ` khớp "${classKeyword}"` : ''}.`
+          : `Hệ thống chưa có lớp${typeLabel} nào${classKeyword ? ` khớp "${classKeyword}"` : ''}.`,
         contextPatch: courseId ? { selected_course_id: courseId } : {},
       };
     }

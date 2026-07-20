@@ -232,9 +232,11 @@ export class AgentRunnerService {
     args: Record<string, unknown>,
   ): string {
     if (toolName === 'assign_student_to_course') {
+      // Ghi danh khóa thực chất là ghi ClassEnrollment vào một lớp trong
+      // khóa — nói rõ trong summary để user không tưởng có enrollment cấp khóa.
       return `Ghi danh học viên #${args.userId ?? '?'} vào khóa học #${
         args.courseId ?? '?'
-      }`;
+      } (vào lớp trong khóa)`;
     }
 
     if (toolName === 'create_course') {
@@ -259,7 +261,8 @@ export class AgentRunnerService {
       update_class: 'Cập nhật lớp học',
       close_class: 'Đóng lớp học',
       assign_student_to_class: 'Thêm học viên vào lớp',
-      assign_student_to_course: 'Ghi danh học viên vào khóa học',
+      assign_student_to_course:
+        'Ghi danh học viên vào khóa học (vào lớp trong khóa)',
       remove_student_from_class: 'Xóa học viên khỏi lớp',
       remove_student_from_course_classes:
         'Xóa học viên khỏi các lớp trong khóa',
@@ -299,8 +302,9 @@ export class AgentRunnerService {
     lastReadResult: unknown,
   ): Partial<DecisionContext> {
     if (!lastReadResult || typeof lastReadResult !== 'object') return {};
-    const { toolName, result } = lastReadResult as {
+    const { toolName, args, result } = lastReadResult as {
       toolName?: AiToolName;
+      args?: Record<string, unknown>;
       result?: unknown;
     };
 
@@ -308,13 +312,30 @@ export class AgentRunnerService {
       return { last_candidates: { students: this.toOptions(result) } };
     }
     if (toolName === 'search_course' && Array.isArray(result)) {
+      // Tìm ra đúng 1 khóa -> ghi nhận luôn là khóa đang nói tới, để follow-up
+      // kiểu "tạo lớp trong khóa này/đó" không rơi về khóa cũ trong ngữ cảnh.
+      if (result.length === 1) {
+        const option = this.toSingleOption(result[0]);
+        if (option) {
+          return {
+            last_candidates: { courses: this.toOptions(result) },
+            last_selected_course: option as any,
+            selected_course_id: option.id,
+          };
+        }
+      }
       return { last_candidates: { courses: this.toOptions(result) } };
     }
     if (toolName === 'search_class' && Array.isArray(result)) {
       return { last_candidates: { classes: this.toOptions(result) } };
     }
     if (toolName === 'get_course_classes' && Array.isArray(result)) {
-      return { last_candidates: { classes: this.toOptions(result) } };
+      // Ghi nhận khóa vừa được xem lớp — cùng lý do với search_course ở trên.
+      const courseId = Number(args?.courseId) || 0;
+      return {
+        last_candidates: { classes: this.toOptions(result) },
+        ...(courseId ? { selected_course_id: courseId } : {}),
+      };
     }
     if (toolName === 'get_class_students' && Array.isArray(result)) {
       return { last_candidates: { students: this.toOptions(result) } };

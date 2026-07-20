@@ -14,7 +14,7 @@ const ACTION_TITLES: Record<string, string> = {
   create_student: "Tạo học viên",
   update_student: "Cập nhật học viên",
   assign_student_to_class: "Thêm học viên vào lớp",
-  assign_student_to_course: "Ghi danh vào khóa học",
+  assign_student_to_course: "Ghi danh vào khóa học (chọn lớp trong khóa)",
   remove_student_from_class: "Xóa học viên khỏi lớp",
   delete_students: "Xóa học viên",
   delete_courses: "Xóa khóa học",

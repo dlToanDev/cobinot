@@ -34,6 +34,8 @@ describe('CopilotService', () => {
     parseStudentInfo: jest.fn(),
     resolveClassCourseReply: jest.fn(),
     resolveEnrollStudentReply: jest.fn(),
+    listCourseStudents: jest.fn(),
+    listCourseClasses: jest.fn(),
     buildCreateClassPending: jest.fn((params: any) => ({
       tool_name: 'create_class',
       input: {
@@ -1678,7 +1680,7 @@ describe('CopilotService', () => {
       pendingAction: {
         tool_name: 'assign_student_to_course',
         input: { userId: 1, courseId: 10 },
-        summary: 'Ghi danh học viên #1 vào khóa học #10',
+        summary: 'Ghi danh học viên #1 vào khóa học #10 (vào lớp trong khóa)',
         status: 'waiting_confirm',
       },
       contextPatch: {},
@@ -1716,7 +1718,7 @@ describe('CopilotService', () => {
         pending_action: {
           tool_name: 'assign_student_to_course',
           input: { userId: 1, courseId: 10 },
-          summary: 'Ghi danh học viên #1 vào khóa học #10',
+          summary: 'Ghi danh học viên #1 vào khóa học #10 (vào lớp trong khóa)',
           intent: 'assign_student_to_course',
         },
       },
@@ -1755,6 +1757,223 @@ describe('CopilotService', () => {
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     expect(updateArg.data.state.pending_action).toBeNull();
     expect(updateArg.data.state.selected_course_id).toBe(10);
+  });
+
+  it('trả lời "1" khi vừa hiển thị danh sách khóa -> chốt khóa deterministic, KHÔNG gọi LLM', async () => {
+    mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
+      id: 1,
+      tenantId: 10,
+      userId: 20,
+      status: 'ACTIVE',
+      state: {
+        last_candidates: {
+          courses: [
+            { id: 93, label: 'Testtt', metadata: { courseCode: 'TESTTT' } },
+            { id: 89, label: 'Test', metadata: { courseCode: 'TEST' } },
+          ],
+        },
+      },
+    });
+    mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
+      id: 100,
+      role: 'user',
+      content: '1',
+    });
+    mockPrisma.aiAgentSession.update.mockResolvedValue({ id: 1, state: {} });
+    mockPrisma.aiCopilotTurnEvent.create.mockResolvedValue({ id: 1 });
+
+    const result = await service.createTurn(
+      { tenantId: 10, userId: 20, role: 'ADMIN' },
+      1,
+      '1',
+    );
+
+    expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    expect((result.response as any).message).toContain('Đã chọn khóa "Testtt"');
+
+    const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
+    expect(updateArg.data.state.selected_course_id).toBe(93);
+    expect(updateArg.data.state.last_candidates.courses).toEqual([]);
+  });
+
+  it('đang xem DANH SÁCH học viên, chọn "1" -> trả bảng học viên của khóa LUÔN', async () => {
+    mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
+      id: 1,
+      tenantId: 10,
+      userId: 20,
+      status: 'ACTIVE',
+      state: {
+        last_candidates: {
+          courses: [
+            { id: 93, label: 'Testtt' },
+            { id: 89, label: 'Test' },
+          ],
+        },
+        pending_course_choice: { intent: 'list_students', studentKeyword: '' },
+      },
+    });
+    mockDeterministic.listCourseStudents.mockResolvedValue({
+      type: 'student_table',
+      title: 'Danh sách học viên khóa Testtt',
+      message: 'Sĩ số hiện tại: 1 học viên.',
+      scope: 'course',
+      students: [{ id: 7, fullName: 'Nguyen Anh Tu' }],
+      contextPatch: { selected_course_id: 93 },
+    });
+    mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
+      id: 100,
+      role: 'user',
+      content: '1',
+    });
+    mockPrisma.aiAgentSession.update.mockResolvedValue({ id: 1, state: {} });
+    mockPrisma.aiCopilotTurnEvent.create.mockResolvedValue({ id: 1 });
+
+    const result = await service.createTurn(
+      { tenantId: 10, userId: 20, role: 'ADMIN' },
+      1,
+      '1',
+    );
+
+    expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    expect(mockDeterministic.listCourseStudents).toHaveBeenCalledWith(
+      10,
+      93,
+      'Testtt',
+      '',
+    );
+    expect(result.response.type).toBe('student_table');
+    expect((result.response as any).students).toHaveLength(1);
+
+    const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
+    expect(updateArg.data.state.pending_course_choice).toBeNull();
+    expect(updateArg.data.state.selected_course_id).toBe(93);
+  });
+
+  it('đang xem DANH SÁCH lớp, chọn "2" -> trả bảng lớp của khóa LUÔN', async () => {
+    mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
+      id: 1,
+      tenantId: 10,
+      userId: 20,
+      status: 'ACTIVE',
+      state: {
+        last_candidates: {
+          courses: [
+            { id: 93, label: 'Testtt' },
+            { id: 89, label: 'Test' },
+          ],
+        },
+        pending_course_choice: { intent: 'list_classes', classKeyword: '' },
+      },
+    });
+    mockDeterministic.listCourseClasses.mockResolvedValue({
+      type: 'class_table',
+      title: 'Danh sách lớp khóa Test',
+      message: '2 lớp.',
+      classes: [
+        { id: 5, title: 'Test A1' },
+        { id: 6, title: 'Test A2' },
+      ],
+      contextPatch: { selected_course_id: 89 },
+    });
+    mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
+      id: 100,
+      role: 'user',
+      content: '2',
+    });
+    mockPrisma.aiAgentSession.update.mockResolvedValue({ id: 1, state: {} });
+    mockPrisma.aiCopilotTurnEvent.create.mockResolvedValue({ id: 1 });
+
+    const result = await service.createTurn(
+      { tenantId: 10, userId: 20, role: 'ADMIN' },
+      1,
+      '2',
+    );
+
+    expect(mockDeterministic.listCourseClasses).toHaveBeenCalledWith(
+      10,
+      89,
+      'Test',
+      '',
+      undefined,
+    );
+    expect(result.response.type).toBe('class_table');
+  });
+
+  it('trả lời "ID: 89" khi vừa hiển thị danh sách khóa -> chốt đúng khóa theo ID', async () => {
+    mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
+      id: 1,
+      tenantId: 10,
+      userId: 20,
+      status: 'ACTIVE',
+      state: {
+        last_candidates: {
+          courses: [
+            { id: 93, label: 'Testtt' },
+            { id: 89, label: 'Test' },
+          ],
+        },
+      },
+    });
+    mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
+      id: 100,
+      role: 'user',
+      content: 'ID: 89',
+    });
+    mockPrisma.aiAgentSession.update.mockResolvedValue({ id: 1, state: {} });
+    mockPrisma.aiCopilotTurnEvent.create.mockResolvedValue({ id: 1 });
+
+    const result = await service.createTurn(
+      { tenantId: 10, userId: 20, role: 'ADMIN' },
+      1,
+      'ID: 89',
+    );
+
+    expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    expect((result.response as any).message).toContain('Đã chọn khóa "Test"');
+
+    const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
+    expect(updateArg.data.state.selected_course_id).toBe(89);
+  });
+
+  it('confirm assign_student_to_course thiếu userId thì trả validation_error, không ghi DB (full mode)', async () => {
+    process.env.AGENT_MINI_MODE = 'false';
+    mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
+      id: 1,
+      tenantId: 10,
+      userId: 20,
+      status: 'ACTIVE',
+      state: {
+        pending_action: {
+          tool_name: 'assign_student_to_course',
+          input: { courseId: 10 },
+          summary: 'Ghi danh học viên vào khóa học (vào lớp trong khóa)',
+          intent: 'assign_student_to_course',
+        },
+      },
+    });
+    mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
+      id: 101,
+      role: 'assistant',
+      content: '{}',
+    });
+    mockPrisma.aiAgentSession.update.mockResolvedValue({ id: 1, state: {} });
+    mockPrisma.aiCopilotTurnEvent.create.mockResolvedValue({ id: 1 });
+
+    const result = await service.confirm(
+      { tenantId: 10, userId: 20, role: 'ADMIN' },
+      1,
+    );
+
+    expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    expect((result.response as any).status).toBe('validation_error');
+    expect((result.response as any).message).toBe('Vui lòng chọn học viên.');
+
+    // Pending action được giữ lại (kèm lỗi) để user bổ sung rồi confirm lại.
+    const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
+    expect(updateArg.data.state.pending_action.status).toBe('validation_error');
+    expect(updateArg.data.state.pending_action.validation_errors).toEqual({
+      userId: 'Vui lòng chọn học viên.',
+    });
   });
 
   it('confirm assign_student_to_course lỗi nhiều lớp thì chuyển sang clarification chọn lớp (full mode)', async () => {

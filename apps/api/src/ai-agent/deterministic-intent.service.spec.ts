@@ -3,6 +3,7 @@ import { DeterministicIntentService } from './deterministic-intent.service';
 describe('DeterministicIntentService', () => {
   const usersService = {
     searchStudents: jest.fn(),
+    findAllStudents: jest.fn(),
   };
   const coursesService = {
     searchCourses: jest.fn(),
@@ -1250,6 +1251,53 @@ describe('DeterministicIntentService', () => {
     }
   });
 
+  it('ghi danh "vào KHÓA" nhiều KHÓA trùng tên -> clarification chọn khóa, GIỮ học viên trong context', async () => {
+    usersService.searchStudents.mockResolvedValue([
+      { id: 3, fullName: 'Tiến' },
+    ]);
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 89, title: 'Test', courseCode: 'TEST' },
+      { id: 93, title: 'Testtt', courseCode: 'TESTTT' },
+    ]);
+    const outcome = await service.resolve(1, {}, 'thêm tiến vào khóa test');
+    // Chưa chốt khóa thì chưa được liệt kê lớp.
+    expect(coursesService.searchClasses).not.toHaveBeenCalled();
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.missingFields).toEqual(['courseId']);
+      expect(outcome.intent).toBe('assign_student_to_class');
+      const ctx = outcome.contextPatch.pending_enrollment_context as any;
+      expect(ctx.userId).toBe(3);
+      expect(ctx.courseId).toBe(0);
+      expect(ctx.candidateCourses?.map((c: any) => c.id)).toEqual([89, 93]);
+    }
+  });
+
+  it('resolveEnrollCourseReply: chọn khóa xong, khóa có 1 lớp -> pending assign_student_to_class', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 8, title: 'Test A1' },
+    ]);
+    const outcome = await service.resolveEnrollCourseReply(
+      1,
+      {
+        userId: 3,
+        studentLabels: ['Tiến'],
+        courseId: 0,
+        candidateClasses: [],
+        candidateCourses: [],
+      },
+      { id: 93, label: 'Testtt' },
+    );
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, '', {
+      courseId: 93,
+    });
+    expect(outcome?.type).toBe('pending_write');
+    if (outcome?.type === 'pending_write') {
+      expect(outcome.pending.tool_name).toBe('assign_student_to_class');
+      expect(outcome.pending.input).toEqual({ userId: 3, classId: 8 });
+    }
+  });
+
   it('ghi danh "vào KHÓA" chỉ có 1 lớp -> pending assign_student_to_class luôn', async () => {
     usersService.searchStudents.mockResolvedValue([
       { id: 3, fullName: 'Tiến' },
@@ -1455,6 +1503,279 @@ describe('DeterministicIntentService', () => {
     if (outcome?.type === 'student_table') {
       expect(outcome.scope).toBe('class');
       expect(outcome.students[0].fullName).toBe('Nguyễn Thị Hà Xuyên');
+    }
+  });
+
+  it('xem ds học viên nhưng NHIỀU KHÓA trùng tên -> hỏi chọn khóa + lưu pending_course_choice', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 93, title: 'Testtt', courseCode: 'TESTTT' },
+      { id: 89, title: 'Test', courseCode: 'TEST' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'cho tôi xem danh sách học viên trong khóa test',
+    );
+
+    expect(outcome?.type).toBe('clarification');
+    if (outcome?.type === 'clarification') {
+      expect(outcome.contextPatch.pending_course_choice).toEqual({
+        intent: 'list_students',
+        studentKeyword: '',
+      });
+      expect(
+        (outcome.contextPatch.last_candidates as any)?.courses?.map(
+          (c: any) => c.id,
+        ),
+      ).toEqual([93, 89]);
+    }
+  });
+
+  it('listCourseStudents: gọi trực tiếp với khóa đã chốt -> trả bảng học viên', async () => {
+    coursesService.getCourseStudents.mockResolvedValue([
+      {
+        classTitle: 'Toán 3',
+        roleInClass: 'STUDENT',
+        student: { id: 7, fullName: 'Nguyen Anh Tu' },
+      },
+    ]);
+
+    const outcome = await service.listCourseStudents(1, 93, 'Testtt', '');
+
+    expect(coursesService.getCourseStudents).toHaveBeenCalledWith(1, 93);
+    expect(outcome.type).toBe('student_table');
+    if (outcome.type === 'student_table') {
+      expect(outcome.title).toContain('Testtt');
+      expect(outcome.students).toHaveLength(1);
+    }
+  });
+
+  it('học viên học NHIỀU LỚP trong khóa -> gộp 1 dòng, cột Lớp nối tên các lớp', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 86, title: 'Anh Văn' },
+    ]);
+    coursesService.getCourseStudents.mockResolvedValue([
+      {
+        classTitle: 'Toán 3',
+        classType: 'WEEKLY',
+        roleInClass: 'STUDENT',
+        student: { id: 7, fullName: 'Nguyen Anh Tu', email: 'tu@gmail.com' },
+      },
+      {
+        classTitle: 'Tiếng Bỉ 1',
+        classType: 'EXAM_PRACTICE',
+        roleInClass: 'STUDENT',
+        student: { id: 7, fullName: 'Nguyen Anh Tu', email: 'tu@gmail.com' },
+      },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'xem danh sách học viên trong khóa anh văn',
+    );
+
+    expect(outcome?.type).toBe('student_table');
+    if (outcome?.type === 'student_table') {
+      expect(outcome.students).toHaveLength(1);
+      expect(outcome.students[0].className).toBe('Toán 3, Tiếng Bỉ 1');
+      // Hai lớp khác loại -> không hiện badge loại lớp cho dòng gộp.
+      expect(outcome.students[0].classType).toBeNull();
+    }
+  });
+
+  it('"tìm học viên <tên> trong khóa X" -> bảng học viên ĐÃ LỌC theo keyword', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 86, title: 'Toán Cao Cấp' },
+    ]);
+    coursesService.getCourseStudents.mockResolvedValue([
+      {
+        classTitle: 'Toán 3',
+        roleInClass: 'STUDENT',
+        student: { id: 1, fullName: 'Toàn Hoàng', email: 'toan1@gmail.com' },
+      },
+      {
+        classTitle: 'Toán 3',
+        roleInClass: 'STUDENT',
+        student: { id: 2, fullName: 'Nguyễn Thị Hà Xuyên' },
+      },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tìm học viên toàn trong khóa toán cao cấp',
+    );
+
+    expect(outcome?.type).toBe('student_table');
+    if (outcome?.type === 'student_table') {
+      expect(outcome.scope).toBe('course');
+      expect(outcome.students).toHaveLength(1);
+      expect(outcome.students[0].fullName).toBe('Toàn Hoàng');
+      expect(outcome.message).toContain('khớp "toàn"');
+    }
+  });
+
+  it('"tìm học viên <tên> trong khóa X" không ai khớp -> message, không trả bảng', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 86, title: 'Toán Cao Cấp' },
+    ]);
+    coursesService.getCourseStudents.mockResolvedValue([
+      {
+        classTitle: 'Toán 3',
+        roleInClass: 'STUDENT',
+        student: { id: 2, fullName: 'Nguyễn Thị Hà Xuyên' },
+      },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tìm học viên minh trong khóa toán cao cấp',
+    );
+
+    expect(outcome?.type).toBe('message');
+    if (outcome?.type === 'message') {
+      expect(outcome.message).toContain('Không tìm thấy học viên nào khớp');
+    }
+  });
+
+  it('"tìm tất cả học viên trong khóa X" -> bảng ĐẦY ĐỦ (không lọc)', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 86, title: 'Toán Cao Cấp' },
+    ]);
+    coursesService.getCourseStudents.mockResolvedValue([
+      { student: { id: 1, fullName: 'Toàn Hoàng' } },
+      { student: { id: 2, fullName: 'Nguyễn Thị Hà Xuyên' } },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'tìm tất cả học viên trong khóa toán cao cấp',
+    );
+
+    expect(outcome?.type).toBe('student_table');
+    if (outcome?.type === 'student_table') {
+      expect(outcome.students).toHaveLength(2);
+    }
+  });
+
+  it('"tìm tất cả học viên" (không nêu khóa/lớp) -> bảng học viên TOÀN HỆ THỐNG', async () => {
+    usersService.findAllStudents.mockResolvedValue([
+      { id: 1, fullName: 'Toàn Hoàng', email: 'toan1@gmail.com' },
+      { id: 2, fullName: 'Nguyễn Thị Hà Xuyên' },
+      { id: 3, fullName: 'Trần Văn Trính' },
+    ]);
+
+    const outcome = await service.resolve(1, {}, 'tìm tất cả học viên');
+
+    expect(usersService.findAllStudents).toHaveBeenCalledWith(1, {
+      keyword: undefined,
+    });
+    expect(outcome?.type).toBe('student_table');
+    if (outcome?.type === 'student_table') {
+      expect(outcome.scope).toBe('system');
+      expect(outcome.title).toContain('toàn hệ thống');
+      expect(outcome.students).toHaveLength(3);
+    }
+  });
+
+  it('"xem ds lớp THEO TUẦN trong khóa X" -> lọc theo LOẠI lớp, không phải tên', async () => {
+    coursesService.searchCourses.mockResolvedValue([
+      { id: 86, title: 'Anh Văn' },
+    ]);
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 44, title: 'Anh Văn 1', type: 'WEEKLY', status: 'ACTIVE' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {},
+      'cho tôi xem danh sách lớp theo tuần trong khóa anh văn',
+    );
+
+    // keyword tên lớp phải RỖNG, "theo tuần" chuyển thành filter type.
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, '', {
+      courseId: 86,
+      type: 'WEEKLY',
+    });
+    expect(outcome?.type).toBe('class_table');
+    if (outcome?.type === 'class_table') {
+      expect(outcome.title).toContain('theo tuần');
+      expect(outcome.classes).toHaveLength(1);
+    }
+  });
+
+  it('"xem ds lớp luyện đề trong cả hệ thống" -> bỏ qua khóa trong ngữ cảnh, lọc toàn hệ thống', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 44, title: 'Luyện đề IELTS', type: 'EXAM_PRACTICE' },
+      { id: 45, title: 'Luyện đề Toán', type: 'EXAM_PRACTICE' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      // Có khóa trong ngữ cảnh nhưng user nói "hệ thống" -> phải bỏ qua.
+      { last_selected_course: { id: 86, label: 'Anh Văn' } },
+      'xem danh sách lớp luyện đề trong cả hệ thống',
+    );
+
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, '', {
+      type: 'EXAM_PRACTICE',
+    });
+    expect(coursesService.searchCourses).not.toHaveBeenCalled();
+    expect(outcome?.type).toBe('class_table');
+    if (outcome?.type === 'class_table') {
+      expect(outcome.title).toContain('toàn hệ thống');
+      expect(outcome.classes).toHaveLength(2);
+    }
+  });
+
+  it('"xem ds lớp luyện đề" KHÔNG nhắc khóa -> toàn hệ thống dù ngữ cảnh đang có khóa', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 44, title: 'Luyện đề IELTS', type: 'EXAM_PRACTICE' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      // Ngữ cảnh đang có khóa Testtt nhưng câu không nhắc "khóa" -> bỏ qua.
+      {
+        selected_course_id: 93,
+        last_selected_course: { id: 93, label: 'Testtt' },
+      },
+      'cho tôi xem danh sách lớp luyện đề',
+    );
+
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, '', {
+      type: 'EXAM_PRACTICE',
+    });
+    expect(outcome?.type).toBe('class_table');
+    if (outcome?.type === 'class_table') {
+      expect(outcome.title).toContain('toàn hệ thống');
+    }
+  });
+
+  it('"xem ds lớp trong KHÓA NÀY" -> vẫn lấy khóa từ ngữ cảnh', async () => {
+    coursesService.searchClasses.mockResolvedValue([
+      { id: 44, title: 'Test A1', type: 'WEEKLY' },
+    ]);
+
+    const outcome = await service.resolve(
+      1,
+      {
+        selected_course_id: 93,
+        last_selected_course: { id: 93, label: 'Testtt' },
+      },
+      'xem danh sách lớp trong khóa này',
+    );
+
+    expect(coursesService.searchClasses).toHaveBeenCalledWith(1, '', {
+      courseId: 93,
+    });
+    expect(outcome?.type).toBe('class_table');
+    if (outcome?.type === 'class_table') {
+      expect(outcome.title).toContain('Testtt');
     }
   });
 

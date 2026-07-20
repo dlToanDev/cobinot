@@ -432,8 +432,11 @@ export class ToolRegistryService {
         tenantId,
         courseId,
       );
-      const activeClasses = classes.filter((c: any) =>
-        ['ACTIVE', 'OPEN', 'ONGOING'].includes(String(c.status)),
+      // Chỉ lớp ACTIVE mới ghi danh được — phải khớp guard trong
+      // CoursesService.addStudentToClass, nếu không sẽ chọn được lớp
+      // ở đây rồi fail lúc ghi.
+      const activeClasses = classes.filter(
+        (c: any) => String(c.status) === 'ACTIVE',
       );
 
       if (activeClasses.length === 0) {

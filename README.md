@@ -1,6 +1,6 @@
 # Hxstu
 
-Hxstu là hệ thống quản lý trung tâm đào tạo cho
+Hxstu là hệ thống quản lý trung tâm đào tạo (học viên, khóa học, lớp học, ghi danh) kèm AI Copilot thao tác nghiệp vụ bằng tiếng Việt.
 
 Đây là monorepo dùng pnpm Workspaces và Turborepo, gồm frontend Next.js, backend NestJS và package TypeScript dùng chung.
 
@@ -13,7 +13,7 @@ Hxstu là hệ thống quản lý trung tâm đào tạo cho
 - [Cài đặt nhanh](#cài-đặt-nhanh)
 - [Scripts](#scripts)
 - [Database và Prisma](#database-và-prisma)
-- [AI Copilot](#ai-copilot)
+- [AI Copilot mini](#ai-copilot-mini)
 - [Routes giao diện](#routes-giao-diện)
 - [Kiểm tra trước khi bàn giao](#kiểm-tra-trước-khi-bàn-giao)
 - [Xử lý lỗi thường gặp](#xử-lý-lỗi-thường-gặp)
@@ -27,7 +27,7 @@ Hxstu là hệ thống quản lý trung tâm đào tạo cho
 - Quản lý khóa học và trạng thái khóa học.
 - Quản lý lớp học thuộc khóa học, học viên trong lớp và trạng thái lớp.
 - Quản lý ghi danh học viên vào khóa học/lớp học.
-- AI Copilot mini hỗ trợ 4 nghiệp vụ: tạo học viên, tạo khóa học, tạo lớp học trong khóa (WEEKLY/EXAM_PRACTICE), thêm học viên vào lớp học (mọi thao tác ghi đều qua preview → confirm).
+- AI Copilot mini: tạo/cập nhật học viên, khóa học, lớp học (WEEKLY/EXAM_PRACTICE), ghi danh học viên vào lớp — mọi thao tác ghi đều qua preview → confirm; kèm tra cứu deterministic (tìm theo keyword, bảng danh sách học viên/lớp theo khóa hoặc toàn hệ thống, lọc lớp theo loại, phân trang 10 dòng/trang).
 - Lưu phiên chat, lịch sử tin nhắn, action log, audit log và turn event của Copilot.
 - Cô lập dữ liệu theo trung tâm thông qua `tenantId`.
 
@@ -277,35 +277,53 @@ pnpm --filter api exec prisma studio
 
 ## AI Copilot mini
 
-Copilot mini nhận yêu cầu tiếng Việt từ admin. Bản mini **hỗ trợ 4 nghiệp vụ**:
+Copilot mini nhận yêu cầu tiếng Việt từ admin.
+
+**Nghiệp vụ GHI dữ liệu** (đều qua preview → confirm, không ghi DB ngay):
 
 1. Tạo học viên
 2. Tạo khóa học
 3. Tạo lớp học trong khóa — 2 loại: `WEEKLY` (học theo tuần), `EXAM_PRACTICE` (luyện đề)
 4. Thêm/ghi danh học viên vào **lớp học** (`assign_student_to_class`)
+5. Cập nhật học viên / khóa học / lớp học (`update_student`, `update_course`, `update_class`)
 
-Ghi danh luôn thực hiện ở cấp LỚP; user nói "thêm vào khóa X" sẽ được hỏi lại
-lớp cụ thể (không tự chọn lớp).
+**Nghiệp vụ TRA CỨU** (deterministic — chạy được cả khi AI lỗi/hết quota):
+
+- Tìm học viên/khóa/lớp theo keyword; danh sách nhiều kết quả cho phép chọn bằng
+  số thứ tự ("1"), `ID: 93` hoặc tên/mã — chọn xong đi tiếp đúng mạch (ghi danh,
+  xem danh sách...), không rơi xuống LLM.
+- Bảng học viên theo khóa/lớp hoặc **toàn hệ thống**, lọc theo tên/email/SĐT
+  ("tìm học viên tuấn trong khóa X"), gộp 1 dòng/học viên (cột Lớp nối tên các
+  lớp), phân trang 10 dòng/trang.
+- Bảng lớp theo khóa hoặc toàn hệ thống, lọc theo **loại lớp** ("theo tuần"/
+  "luyện đề"). Câu không nhắc tới khóa thì mặc định toàn hệ thống; muốn theo
+  ngữ cảnh phải nói "khóa này".
+
+**Domain ghi danh: khóa ≠ lớp.** Mọi ghi danh là bản ghi `ClassEnrollment` gắn
+với một LỚP (`UserCourse` là model legacy). "Thêm vào khóa X": khóa có đúng 1
+lớp `ACTIVE` → tạo preview ghi danh vào lớp đó luôn; nhiều lớp → hỏi chọn lớp;
+chưa có lớp `ACTIVE` → gợi ý tạo lớp trước. Chỉ lớp `status = ACTIVE` mới ghi
+danh được.
 
 Xem chi tiết trong:
 
-- [docs/COPILOT_AGENT_ARCHITECTURE.md](docs/COPILOT_AGENT_ARCHITECTURE.md)
-- [docs/COPILOT_MINI_ACCEPTANCE_CHECKLIST.md](docs/COPILOT_MINI_ACCEPTANCE_CHECKLIST.md)
-- [docs/COPILOT_MINI_MANUAL_TEST_SCRIPT.md](docs/COPILOT_MINI_MANUAL_TEST_SCRIPT.md)
+- [docs/AI_AGENT_ARCHITECTURE.md](docs/AI_AGENT_ARCHITECTURE.md) — kiến trúc AI agent hiện tại
+- [docs/MANUAL_TEST_GHI_DANH_COPILOT.md](docs/MANUAL_TEST_GHI_DANH_COPILOT.md) — kịch bản test tay
 
 ### Scope
 
-Trong mini mode (`AGENT_MINI_MODE=true`), mọi tool ngoài 4 nghiệp vụ trên
-(`update_student`, `update_course`, `delete_students`, `delete_courses`,
-`update_class`, `close_class`, `assign_student_to_course`,
-`remove_student_from_*`) bị **ẩn khỏi LLM và bị chặn ở backend** (cả khi tạo
-pending lẫn khi confirm). User yêu cầu ngoài phạm vi sẽ nhận câu trả lời
-"Chức năng này chưa được bật trong bản Copilot mini."
+Trong mini mode (`AGENT_MINI_MODE=true`), các tool ngoài danh sách mini
+(`delete_students`, `delete_courses`, `close_class`, `assign_student_to_course`,
+`remove_student_from_class`, `remove_student_from_course_classes`,
+`get_class_students`) bị **ẩn khỏi LLM và bị chặn ở backend** (cả khi tạo
+pending lẫn khi confirm; pending cũ chứa tool bị cấm sẽ bị hủy). User yêu cầu
+ngoài phạm vi sẽ nhận câu trả lời "Tính năng này chưa được bật trong bản
+Copilot mini."
 
 ### Tool list (mini)
 
 - READ: `search_student`, `get_student_detail`, `search_course`, `get_course_detail`, `get_course_classes`, `search_class`, `get_class_detail`
-- WRITE: `create_student`, `create_course`, `create_class`, `assign_student_to_class`
+- WRITE: `create_student`, `create_course`, `create_class`, `update_student`, `update_course`, `update_class`, `assign_student_to_class`
 - Đặc biệt: `ask_clarification`
 
 Danh sách này khớp 1-1 với `MINI_AGENT_TOOL_NAMES` trong
@@ -445,7 +463,8 @@ Nội dung assistant đã được lưu trong lịch sử chat. Hãy tạo phiê
 ## Tài liệu bổ sung
 
 - [Hướng dẫn setup chi tiết](docs/SetUp.md)
-- [AI Agent Service Flow](docs/AiAgentServiceFlow.md)
+- [Kiến trúc AI Agent](docs/AI_AGENT_ARCHITECTURE.md)
+- [Kịch bản test tay Copilot ghi danh](docs/MANUAL_TEST_GHI_DANH_COPILOT.md)
 
 ## Bảo mật
 

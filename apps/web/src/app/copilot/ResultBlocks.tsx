@@ -597,6 +597,92 @@ type StudentTableRow = {
   joinedAt?: string | null;
 };
 
+/** Số dòng tối đa mỗi trang của các bảng danh sách. */
+const TABLE_PAGE_SIZE = 10;
+
+/** Khung header + footer phân trang dùng chung cho các bảng danh sách. */
+function TableHeader({
+  title,
+  message,
+  count,
+  unit,
+}: {
+  title: string;
+  message?: string;
+  count: number;
+  unit: string;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3 border-b border-zinc-100 bg-zinc-50/60 px-4 py-3">
+      <div className="min-w-0">
+        <h4 className="truncate text-[13px] font-semibold text-zinc-900">
+          {title}
+        </h4>
+        {message && (
+          <p className="mt-0.5 text-xs leading-4 text-zinc-500">{message}</p>
+        )}
+      </div>
+      <span className="shrink-0 whitespace-nowrap rounded-full bg-white px-2.5 py-1 text-[11px] font-semibold text-zinc-600 ring-1 ring-inset ring-zinc-200">
+        {count} {unit}
+      </span>
+    </div>
+  );
+}
+
+function TablePagination({
+  page,
+  pageCount,
+  unit,
+  onChange,
+}: {
+  page: number;
+  pageCount: number;
+  unit: string;
+  onChange: (page: number) => void;
+}) {
+  if (pageCount <= 1) return null;
+  return (
+    <div className="flex items-center justify-between gap-2 border-t border-zinc-100 bg-zinc-50/40 px-4 py-2">
+      <span className="text-[11px] text-zinc-500">
+        Trang {page + 1}/{pageCount} · tối đa {TABLE_PAGE_SIZE} {unit}/trang
+      </span>
+      <div className="flex items-center gap-1">
+        {Array.from({ length: pageCount }, (_, i) => (
+          <button
+            key={i}
+            type="button"
+            onClick={() => onChange(i)}
+            className={`min-w-7 rounded-lg px-2 py-1 text-[12px] font-medium transition-colors ${
+              i === page
+                ? "bg-zinc-900 text-white"
+                : "bg-white text-zinc-600 ring-1 ring-inset ring-zinc-200 hover:bg-zinc-100"
+            }`}
+          >
+            {i + 1}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** Badge loại lớp: Theo tuần / Luyện đề — không cho gãy dòng. */
+function ClassTypeBadge({ type }: { type?: string | null }) {
+  if (!type) return null;
+  const exam = type === "EXAM_PRACTICE";
+  return (
+    <span
+      className={`inline-flex items-center whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${
+        exam
+          ? "bg-amber-50 text-amber-700 ring-amber-200"
+          : "bg-sky-50 text-sky-700 ring-sky-200"
+      }`}
+    >
+      {exam ? "Luyện đề" : "Theo tuần"}
+    </span>
+  );
+}
+
 /** Bảng học viên trong khóa/lớp (response type "student_table" từ copilot). */
 export function StudentTableBlock({
   title,
@@ -608,6 +694,13 @@ export function StudentTableBlock({
   students: StudentTableRow[];
 }) {
   const rows = Array.isArray(students) ? students : [];
+  const [page, setPage] = React.useState(0);
+  const pageCount = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedRows = rows.slice(
+    safePage * TABLE_PAGE_SIZE,
+    (safePage + 1) * TABLE_PAGE_SIZE,
+  );
   const withClassColumn = rows.some((row) => row.className);
   const formatDate = (value?: string | null) => {
     if (!value) return "—";
@@ -618,66 +711,75 @@ export function StudentTableBlock({
   };
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white">
-      <div className="flex items-center justify-between gap-2 border-b border-zinc-100 px-4 py-2.5">
-        <div className="min-w-0">
-          <h4 className="truncate text-[13px] font-semibold text-zinc-900">
-            {title || "Danh sách học viên"}
-          </h4>
-          {message && (
-            <p className="mt-0.5 text-xs leading-4 text-zinc-500">{message}</p>
-          )}
-        </div>
-        <span className="shrink-0 rounded-md bg-zinc-100 px-1.5 py-0.5 text-[11px] font-medium text-zinc-500">
-          {rows.length}
-        </span>
-      </div>
+    <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm">
+      <TableHeader
+        title={title || "Danh sách học viên"}
+        message={message}
+        count={rows.length}
+        unit="học viên"
+      />
       <div className="overflow-x-auto">
         <table className="w-full text-left text-[13px]">
           <thead>
-            <tr className="border-b border-zinc-100 bg-zinc-50/60 text-[11px] uppercase tracking-wide text-zinc-500">
-              <th className="px-4 py-2 font-medium">#</th>
-              <th className="px-3 py-2 font-medium">Họ tên</th>
-              <th className="px-3 py-2 font-medium">Email</th>
-              <th className="px-3 py-2 font-medium">SĐT</th>
+            <tr className="border-b border-zinc-100 text-[11px] uppercase tracking-wide text-zinc-400">
+              <th className="w-10 px-4 py-2.5 font-medium">#</th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Họ tên
+              </th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Liên hệ
+              </th>
               {withClassColumn && (
-                <th className="px-3 py-2 font-medium">Lớp</th>
+                <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                  Lớp
+                </th>
               )}
-              <th className="px-3 py-2 font-medium">Ngày vào lớp</th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Ngày vào lớp
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
-            {rows.map((row, index) => (
-              <tr key={`${row.id}-${row.className || index}`}>
-                <td className="px-4 py-2 text-zinc-400">{index + 1}</td>
-                <td className="px-3 py-2">
-                  <span className="font-medium text-zinc-900">
-                    {row.fullName}
-                  </span>
-                  <span className="ml-1.5 font-mono text-[10px] text-zinc-400">
-                    #{row.id}
-                  </span>
-                  {row.roleInClass && row.roleInClass !== "STUDENT" && (
-                    <span className="ml-1.5 rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-700">
-                      {row.roleInClass}
-                    </span>
-                  )}
+            {pagedRows.map((row, index) => (
+              <tr
+                key={`${row.id}-${row.className || index}`}
+                className="transition-colors hover:bg-zinc-50/70"
+              >
+                <td className="px-4 py-2.5 text-zinc-400 tabular-nums">
+                  {safePage * TABLE_PAGE_SIZE + index + 1}
                 </td>
-                <td className="px-3 py-2 text-zinc-600">{row.email || "—"}</td>
-                <td className="px-3 py-2 text-zinc-600">{row.phone || "—"}</td>
+                <td className="px-3 py-2.5">
+                  <div className="flex items-center gap-1.5">
+                    <span className="font-medium text-zinc-900">
+                      {row.fullName}
+                    </span>
+                    {row.roleInClass && row.roleInClass !== "STUDENT" && (
+                      <span className="whitespace-nowrap rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
+                        {row.roleInClass}
+                      </span>
+                    )}
+                  </div>
+                  <div className="mt-0.5 font-mono text-[10px] text-zinc-400">
+                    #{row.id}
+                  </div>
+                </td>
+                <td className="px-3 py-2.5">
+                  <div className="text-zinc-600">{row.email || "—"}</div>
+                  <div className="mt-0.5 whitespace-nowrap text-xs text-zinc-400 tabular-nums">
+                    {row.phone || ""}
+                  </div>
+                </td>
                 {withClassColumn && (
-                  <td className="px-3 py-2 text-zinc-600">
-                    {row.className || "—"}
+                  <td className="px-3 py-2.5 text-zinc-600">
+                    <span>{row.className || "—"}</span>
                     {row.classType && (
-                      <span className="ml-1 rounded bg-zinc-100 px-1 py-0.5 text-[10px] text-zinc-500">
-                        {row.classType === "EXAM_PRACTICE"
-                          ? "Luyện đề"
-                          : "Theo tuần"}
+                      <span className="ml-1.5">
+                        <ClassTypeBadge type={row.classType} />
                       </span>
                     )}
                   </td>
                 )}
-                <td className="px-3 py-2 text-zinc-600">
+                <td className="whitespace-nowrap px-3 py-2.5 text-zinc-600 tabular-nums">
                   {formatDate(row.joinedAt)}
                 </td>
               </tr>
@@ -685,6 +787,12 @@ export function StudentTableBlock({
           </tbody>
         </table>
       </div>
+      <TablePagination
+        page={safePage}
+        pageCount={pageCount}
+        unit="học viên"
+        onChange={setPage}
+      />
     </div>
   );
 }
@@ -704,6 +812,27 @@ type ClassTableRow = {
   endDate?: string | null;
 };
 
+/** Badge trạng thái lớp có chấm màu — không cho gãy dòng. */
+function ClassStatusBadge({ status }: { status?: string | null }) {
+  const active = status === "ACTIVE";
+  return (
+    <span
+      className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset ${
+        active
+          ? "bg-emerald-50 text-emerald-700 ring-emerald-200"
+          : "bg-zinc-100 text-zinc-500 ring-zinc-200"
+      }`}
+    >
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          active ? "bg-emerald-500" : "bg-zinc-400"
+        }`}
+      />
+      {active ? "Đang hoạt động" : status || "—"}
+    </span>
+  );
+}
+
 /** Bảng lớp học của khóa (response type "class_table" từ copilot). */
 export function ClassTableBlock({
   title,
@@ -715,92 +844,100 @@ export function ClassTableBlock({
   classes: ClassTableRow[];
 }) {
   const rows = Array.isArray(classes) ? classes : [];
+  const [page, setPage] = React.useState(0);
+  const pageCount = Math.max(1, Math.ceil(rows.length / TABLE_PAGE_SIZE));
+  const safePage = Math.min(page, pageCount - 1);
+  const pagedRows = rows.slice(
+    safePage * TABLE_PAGE_SIZE,
+    (safePage + 1) * TABLE_PAGE_SIZE,
+  );
   // Cột "Khóa" chỉ hiện khi bảng gộp lớp từ nhiều khóa khác nhau.
   const courseTitles = new Set(rows.map((row) => row.courseTitle || ""));
   const withCourseColumn = courseTitles.size > 1;
 
   return (
-    <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white">
-      <div className="flex items-center justify-between gap-2 border-b border-zinc-100 px-4 py-2.5">
-        <div className="min-w-0">
-          <h4 className="truncate text-[13px] font-semibold text-zinc-900">
-            {title || "Danh sách lớp học"}
-          </h4>
-          {message && (
-            <p className="mt-0.5 text-xs leading-4 text-zinc-500">{message}</p>
-          )}
-        </div>
-        <span className="shrink-0 rounded-md bg-zinc-100 px-1.5 py-0.5 text-[11px] font-medium text-zinc-500">
-          {rows.length}
-        </span>
-      </div>
+    <div className="overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-sm">
+      <TableHeader
+        title={title || "Danh sách lớp học"}
+        message={message}
+        count={rows.length}
+        unit="lớp"
+      />
       <div className="overflow-x-auto">
         <table className="w-full text-left text-[13px]">
           <thead>
-            <tr className="border-b border-zinc-100 bg-zinc-50/60 text-[11px] uppercase tracking-wide text-zinc-500">
-              <th className="px-4 py-2 font-medium">#</th>
-              <th className="px-3 py-2 font-medium">Tên lớp</th>
-              <th className="px-3 py-2 font-medium">Loại</th>
+            <tr className="border-b border-zinc-100 text-[11px] uppercase tracking-wide text-zinc-400">
+              <th className="w-10 px-4 py-2.5 font-medium">#</th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Tên lớp
+              </th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Loại
+              </th>
               {withCourseColumn && (
-                <th className="px-3 py-2 font-medium">Khóa</th>
+                <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                  Khóa
+                </th>
               )}
-              <th className="px-3 py-2 font-medium">Giáo viên</th>
-              <th className="px-3 py-2 font-medium">Sĩ số</th>
-              <th className="px-3 py-2 font-medium">Trạng thái</th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Giáo viên
+              </th>
+              <th className="whitespace-nowrap px-3 py-2.5 text-center font-medium">
+                Sĩ số
+              </th>
+              <th className="whitespace-nowrap px-3 py-2.5 font-medium">
+                Trạng thái
+              </th>
             </tr>
           </thead>
           <tbody className="divide-y divide-zinc-100">
-            {rows.map((row, index) => (
-              <tr key={row.id}>
-                <td className="px-4 py-2 text-zinc-400">{index + 1}</td>
-                <td className="px-3 py-2">
-                  <span className="font-medium text-zinc-900">{row.title}</span>
+            {pagedRows.map((row, index) => (
+              <tr key={row.id} className="transition-colors hover:bg-zinc-50/70">
+                <td className="px-4 py-2.5 text-zinc-400 tabular-nums">
+                  {safePage * TABLE_PAGE_SIZE + index + 1}
+                </td>
+                <td className="px-3 py-2.5">
+                  <div className="font-medium text-zinc-900">{row.title}</div>
                   {row.classCode && (
-                    <span className="ml-1.5 font-mono text-[10px] text-zinc-400">
+                    <div className="mt-0.5 max-w-52 truncate font-mono text-[10px] uppercase tracking-wide text-zinc-400">
                       {row.classCode}
-                    </span>
+                    </div>
                   )}
                 </td>
-                <td className="px-3 py-2">
-                  <span
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                      row.type === "EXAM_PRACTICE"
-                        ? "bg-amber-50 text-amber-700"
-                        : "bg-sky-50 text-sky-700"
-                    }`}
-                  >
-                    {row.type === "EXAM_PRACTICE" ? "Luyện đề" : "Theo tuần"}
-                  </span>
+                <td className="px-3 py-2.5">
+                  <ClassTypeBadge type={row.type || "WEEKLY"} />
                 </td>
                 {withCourseColumn && (
-                  <td className="px-3 py-2 text-zinc-600">
+                  <td className="px-3 py-2.5 text-zinc-600">
                     {row.courseTitle || "—"}
                   </td>
                 )}
-                <td className="px-3 py-2 text-zinc-600">
-                  {row.teacherName || "Chưa phân công"}
+                <td className="px-3 py-2.5">
+                  {row.teacherName ? (
+                    <span className="text-zinc-700">{row.teacherName}</span>
+                  ) : (
+                    <span className="italic text-zinc-400">Chưa phân công</span>
+                  )}
                 </td>
-                <td className="px-3 py-2 text-zinc-600">
-                  {row.studentCount ?? 0}
-                </td>
-                <td className="px-3 py-2">
-                  <span
-                    className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                      row.status === "ACTIVE"
-                        ? "bg-emerald-50 text-emerald-700"
-                        : "bg-zinc-100 text-zinc-500"
-                    }`}
-                  >
-                    {row.status === "ACTIVE"
-                      ? "Đang hoạt động"
-                      : row.status || "—"}
+                <td className="px-3 py-2.5 text-center">
+                  <span className="inline-flex min-w-6 justify-center rounded-md bg-zinc-100 px-1.5 py-0.5 text-[11px] font-semibold text-zinc-700 tabular-nums">
+                    {row.studentCount ?? 0}
                   </span>
+                </td>
+                <td className="px-3 py-2.5">
+                  <ClassStatusBadge status={row.status} />
                 </td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
+      <TablePagination
+        page={safePage}
+        pageCount={pageCount}
+        unit="lớp"
+        onChange={setPage}
+      />
     </div>
   );
 }

@@ -116,6 +116,8 @@ export interface PendingEnrollmentContext {
   candidateClasses: EntityOption[];
   /** Nhiều học viên trùng tên: danh sách chờ chọn (theo số thứ tự hoặc tên). */
   candidateStudents?: EntityOption[];
+  /** Nhiều khóa trùng tên: danh sách chờ chọn; chọn xong mới liệt kê lớp. */
+  candidateCourses?: EntityOption[];
   /** Đích ghi danh gốc, giữ lại để đi tiếp sau khi user chọn học viên. */
   targetType?: 'course' | 'class';
   targetKeyword?: string;
@@ -222,7 +224,7 @@ export type CopilotResponse =
       type: 'student_table';
       title: string;
       message?: string;
-      scope: 'course' | 'class';
+      scope: 'course' | 'class' | 'system';
       students: StudentTableRow[];
       suggestions?: ProactiveSuggestion[];
     }
@@ -299,6 +301,17 @@ export interface DecisionContext {
   pending_clarification?: PendingClarification | null;
   duplicate_student_context?: DuplicateStudentContext | null;
   pending_enrollment_context?: PendingEnrollmentContext | null;
+  /**
+   * Đang chờ user CHỌN KHÓA từ danh sách candidates để đi tiếp intent gốc
+   * (xem danh sách học viên/lớp của khóa). Chọn xong phải trả kết quả luôn,
+   * không dừng ở "đã chọn khóa".
+   */
+  pending_course_choice?: {
+    intent: 'list_students' | 'list_classes';
+    studentKeyword?: string;
+    classKeyword?: string;
+    classType?: 'WEEKLY' | 'EXAM_PRACTICE';
+  } | null;
   pending_class_creation?: PendingClassCreationContext | null;
   pending_student_update?: PendingStudentUpdateContext | null;
   /** Idempotency key của pending action ĐÃ execute gần nhất (chống double-submit). */
