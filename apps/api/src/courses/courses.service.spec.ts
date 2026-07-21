@@ -197,6 +197,59 @@ describe('CoursesService', () => {
       );
     });
 
+    it('không ghi ngày bắt đầu -> mặc định là HÔM NAY (ngày tạo lớp)', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      prisma.courseClass.findFirst.mockResolvedValue(null);
+      prisma.courseClass.create.mockResolvedValue(classMock);
+
+      await service.createClass(10, {
+        courseId: 1,
+        title: 'Evening A',
+        type: 'WEEKLY',
+      });
+
+      const createArg = prisma.courseClass.create.mock.calls[0][0];
+      expect(createArg.data.startDate).toBeInstanceOf(Date);
+      const today = new Date();
+      expect(createArg.data.startDate.toDateString()).toBe(
+        today.toDateString(),
+      );
+      expect(createArg.data.endDate).toBeNull();
+    });
+
+    it('ghi rõ ngày bắt đầu -> dùng đúng ngày đó, không bị đè bằng hôm nay', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      prisma.courseClass.findFirst.mockResolvedValue(null);
+      prisma.courseClass.create.mockResolvedValue(classMock);
+
+      await service.createClass(10, {
+        courseId: 1,
+        title: 'Evening A',
+        type: 'WEEKLY',
+        startDate: '2026-08-01',
+        endDate: '2026-10-01',
+      });
+
+      const createArg = prisma.courseClass.create.mock.calls[0][0];
+      expect(createArg.data.startDate).toEqual(new Date('2026-08-01'));
+      expect(createArg.data.endDate).toEqual(new Date('2026-10-01'));
+    });
+
+    it('không ghi ngày bắt đầu nhưng ngày kết thúc TRƯỚC hôm nay -> báo lỗi', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      prisma.courseClass.findFirst.mockResolvedValue(null);
+
+      await expect(
+        service.createClass(10, {
+          courseId: 1,
+          title: 'Evening A',
+          type: 'WEEKLY',
+          endDate: '2020-01-01',
+        }),
+      ).rejects.toThrow('Ngày kết thúc không được trước ngày bắt đầu');
+      expect(prisma.courseClass.create).not.toHaveBeenCalled();
+    });
+
     it('tạo lớp mới -> TỰ ĐỘNG thêm học viên đang có trong khóa vào lớp (khử trùng userId)', async () => {
       prisma.course.findFirst.mockResolvedValue(courseMock);
       prisma.courseClass.findFirst.mockResolvedValue(null);

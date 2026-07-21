@@ -107,7 +107,7 @@ Nhận diện và xử lý **không cần LLM**:
 | Tìm kiếm | "tìm học viên An" | search DB; **học viên → bảng `student_table`** (kể cả khi chỉ 1 kết quả), khóa/lớp → danh sách candidates (chọn bằng số/ID/tên) |
 | Xem CHI TIẾT | "xem chi tiết lớp Tiếng Bỉ", "thông tin khóa X", "chi tiết học viên Y", click từ card ("Xem chi tiết ... #id") | outcome `read_result` → render như tool_result của LLM (`get_class_detail` kèm `sessions` lịch học, `get_course_detail`, `get_student_detail`) — nhận cả `#id` lẫn tên |
 | Tạo học viên | "tạo học viên Nguyễn A, a@gmail.com" | parse tên/email/SĐT/ngày sinh/địa chỉ → preview |
-| Tạo khóa / lớp | "tạo lớp Test33 trong khóa X" | resolve khóa (theo tên hoặc ngữ cảnh) → preview; thiếu tên thì hỏi và LƯU draft. Confirm xong `createClass` **tự thêm học viên của khóa vào lớp mới** |
+| Tạo khóa / lớp | "tạo lớp Test33 trong khóa X" | resolve khóa (theo tên hoặc ngữ cảnh) → preview; thiếu tên thì hỏi và LƯU draft. `startDate` bỏ trống → mặc định HÔM NAY (ngày tạo lớp). Confirm xong `createClass` **tự thêm học viên của khóa vào lớp mới** |
 | Ghi danh | "thêm A vào lớp/khóa X", "thêm A, B và C vào lớp X" | resolve học viên (1 người/gộp nhiều người) + đích → preview ghi danh CẢ KHÓA hoặc hỏi chọn |
 | Gán giáo viên | "giáo viên A cầm khóa X" / "gv A phụ trách lớp B" | khóa → preview `assign_teacher_to_course` (tất cả lớp ACTIVE); lớp → preview `update_class` chỉ lớp đó |
 | Xem DS học viên | "xem ds học viên khóa X", "tìm học viên tuấn trong khóa X", "tìm tất cả học viên" | bảng `student_table`: theo khóa/lớp/**toàn hệ thống**, lọc keyword tên/email/SĐT, gộp 1 dòng/học viên |

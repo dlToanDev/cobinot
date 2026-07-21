@@ -281,7 +281,9 @@ Copilot mini nhận yêu cầu tiếng Việt từ admin.
 
 1. Tạo học viên
 2. Tạo khóa học
-3. Tạo lớp học trong khóa — 2 loại: `WEEKLY` (học theo tuần), `EXAM_PRACTICE` (luyện đề)
+3. Tạo lớp học trong khóa — 2 loại: `WEEKLY` (học theo tuần), `EXAM_PRACTICE`
+   (luyện đề). Không ghi ngày bắt đầu → mặc định là NGÀY TẠO LỚP (hôm nay);
+   ghi ngày khác thì dùng đúng ngày đó
 4. Ghi danh học viên vào **khóa học** (`assign_student_to_course`) — tự thêm vào
    **TẤT CẢ lớp đang hoạt động (ACTIVE)** của khóa; không còn ghi danh theo lớp
 5. Cập nhật học viên / khóa học / lớp học (`update_student`, `update_course`, `update_class`)

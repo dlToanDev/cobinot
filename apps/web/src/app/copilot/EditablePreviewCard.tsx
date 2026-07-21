@@ -188,12 +188,18 @@ export default function EditablePreviewCard({
     rawFormInput.type
       ? { ...rawFormInput, classType: rawFormInput.type }
       : rawFormInput;
-  // "Ngày vào lớp" mặc định là HÔM NAY (thời điểm ghi danh),
+  // "Ngày vào lớp" (ghi danh) và "Ngày bắt đầu" (tạo lớp) mặc định là HÔM NAY,
   // user vẫn sửa được trước khi Xác nhận. Backend cũng default now() nếu trống.
-  const formInput =
-    data.tool_name === "assign_student_to_course" && !formInputBase.joinedAt
-      ? { ...formInputBase, joinedAt: todayLocalDate() }
-      : formInputBase;
+  let formInput = formInputBase;
+  if (
+    data.tool_name === "assign_student_to_course" &&
+    !formInputBase.joinedAt
+  ) {
+    formInput = { ...formInput, joinedAt: todayLocalDate() };
+  }
+  if (data.tool_name === "create_class" && !formInputBase.startDate) {
+    formInput = { ...formInput, startDate: todayLocalDate() };
+  }
   const relatedCourses = Array.isArray(data.related_courses)
     ? data.related_courses
     : [];
@@ -574,8 +580,9 @@ export default function EditablePreviewCard({
               {renderField("description", "Mô tả lớp học", "textarea")}
             </div>
             <p className="text-xs leading-5 text-zinc-400 sm:col-span-2">
-              Cần chọn khóa học, tên lớp và loại lớp. Giáo viên, ngày và lịch
-              học có thể để trống và cập nhật sau.
+              Cần chọn khóa học, tên lớp và loại lớp. Ngày bắt đầu để trống sẽ
+              mặc định là HÔM NAY; giáo viên, ngày kết thúc và lịch học có thể
+              bổ sung sau.
             </p>
           </div>
         );

@@ -474,6 +474,22 @@ export class CoursesService {
 
     this.validateClassDates(input.startDate, input.endDate);
 
+    // Ngày bắt đầu mặc định = HÔM NAY (ngày tạo lớp) nếu user không ghi;
+    // user ghi ngày khác thì dùng đúng ngày đó.
+    const startDate =
+      input.startDate && !isNaN(new Date(input.startDate).getTime())
+        ? new Date(input.startDate)
+        : new Date();
+    const endDate =
+      input.endDate && !isNaN(new Date(input.endDate).getTime())
+        ? new Date(input.endDate)
+        : null;
+    if (endDate && startDate.getTime() > endDate.getTime()) {
+      throw new BadRequestException(
+        'Ngày kết thúc không được trước ngày bắt đầu (bỏ trống ngày bắt đầu thì mặc định là hôm nay).',
+      );
+    }
+
     return this.prisma.$transaction(async (tx) => {
       const courseClass = await tx.courseClass.create({
         data: {
@@ -486,8 +502,8 @@ export class CoursesService {
           teacherName: input.teacherName
             ? normalizeTitleCase(input.teacherName)
             : null,
-          startDate: input.startDate && !isNaN(new Date(input.startDate).getTime()) ? new Date(input.startDate) : null,
-          endDate: input.endDate && !isNaN(new Date(input.endDate).getTime()) ? new Date(input.endDate) : null,
+          startDate,
+          endDate,
           status: 'ACTIVE',
         },
         include: { course: true },
