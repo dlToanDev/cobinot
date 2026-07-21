@@ -34,6 +34,8 @@ describe('CopilotService', () => {
     parseStudentInfo: jest.fn(),
     resolveClassCourseReply: jest.fn(),
     resolveEnrollStudentReply: jest.fn(),
+    resolveEnrollCourseReply: jest.fn(),
+    resolveEnrollClassReply: jest.fn(),
     listCourseStudents: jest.fn(),
     listCourseClasses: jest.fn(),
     buildCreateClassPending: jest.fn((params: any) => ({
@@ -70,6 +72,8 @@ describe('CopilotService', () => {
     mockDeterministic.parseStudentInfo.mockReturnValue({ fullName: '' });
     mockDeterministic.resolveClassCourseReply.mockResolvedValue(null);
     mockDeterministic.resolveEnrollStudentReply.mockResolvedValue(null);
+    mockDeterministic.resolveEnrollCourseReply.mockResolvedValue(null);
+    mockDeterministic.resolveEnrollClassReply.mockResolvedValue(null);
     service = new CopilotService(
       mockPrisma as any,
       mockToolRegistry as any,
@@ -1976,7 +1980,7 @@ describe('CopilotService', () => {
     });
   });
 
-  it('confirm assign_student_to_course lỗi nhiều lớp thì chuyển sang clarification chọn lớp (full mode)', async () => {
+  it('confirm pending assign_student_to_class CŨ (tool đã xóa) -> hủy pending, KHÔNG execute', async () => {
     process.env.AGENT_MINI_MODE = 'false';
     mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
       id: 1,
@@ -1984,29 +1988,15 @@ describe('CopilotService', () => {
       userId: 20,
       status: 'ACTIVE',
       state: {
+        // Session trước khi deploy còn pending ghi danh theo lớp.
         pending_action: {
-          tool_name: 'assign_student_to_course',
-          input: { userId: 1, courseId: 10 },
-          summary: 'Ghi danh',
-          intent: 'assign_student_to_course',
+          tool_name: 'assign_student_to_class',
+          input: { userId: 1, classId: 5 },
+          summary: 'Thêm học viên vào lớp',
+          intent: 'assign_student_to_class',
         },
       },
     });
-    const multiClassError: any = new Error('multiple');
-    multiClassError.response = {
-      code: 'COURSE_HAS_MULTIPLE_CLASSES',
-      message: 'Khóa học này có nhiều lớp.',
-      classes: [
-        { id: 5, label: 'IELTS tối', classCode: 'IELTS_T', status: 'ACTIVE' },
-        {
-          id: 6,
-          label: 'IELTS cuối tuần',
-          classCode: 'IELTS_CT',
-          status: 'ACTIVE',
-        },
-      ],
-    };
-    mockToolRegistry.execute.mockRejectedValue(multiClassError);
     mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
       id: 101,
       role: 'assistant',
@@ -2023,16 +2013,18 @@ describe('CopilotService', () => {
       1,
     );
 
-    expect(result.response.type).toBe('clarification');
+    expect(mockToolRegistry.execute).not.toHaveBeenCalled();
+    expect(result.response.type).toBe('error');
+    expect((result.response as any).code).toBe('TOOL_REMOVED');
+    expect((result.response as any).message).toContain(
+      'không còn được hỗ trợ',
+    );
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     expect(updateArg.data.state.pending_action).toBeNull();
-    expect(
-      updateArg.data.state.pending_enrollment_context.candidateClasses,
-    ).toHaveLength(2);
-    expect(updateArg.data.state.pending_enrollment_context.courseId).toBe(10);
+    expect(updateArg.data.state.pending_enrollment_context).toBeNull();
   });
 
-  it('user chọn lớp sau khi nhiều lớp thì tạo preview assign_student_to_class kèm classId (full mode)', async () => {
+  it('user chọn lớp khi nhiều lớp trùng tên -> preview ghi danh CẢ KHÓA của lớp được chọn (full mode)', async () => {
     process.env.AGENT_MINI_MODE = 'false';
     mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
       id: 1,
@@ -2044,11 +2036,33 @@ describe('CopilotService', () => {
           userId: 1,
           courseId: 10,
           candidateClasses: [
+            { id: 5, label: 'IELTS tối', metadata: { courseId: 10 } },
+            { id: 6, label: 'IELTS cuối tuần', metadata: { courseId: 10 } },
+          ],
+        },
+      },
+    });
+    mockDeterministic.resolveEnrollClassReply.mockResolvedValue({
+      type: 'pending_write',
+      pending: {
+        tool_name: 'assign_student_to_course',
+        input: { userId: 1, courseId: 10 },
+        display_input: {
+          userId: 1,
+          courseId: 10,
+          courseName: 'IELTS',
+          classes: [
             { id: 5, label: 'IELTS tối' },
             { id: 6, label: 'IELTS cuối tuần' },
           ],
         },
+        summary:
+          'Ghi danh học viên #1 vào 2 lớp của khóa IELTS: IELTS tối, IELTS cuối tuần',
+        intent: 'assign_student_to_course',
+        status: 'waiting_confirm',
+        severity: 'default',
       },
+      contextPatch: { selected_course_id: 10 },
     });
     mockPrisma.aiAgentSessionMessage.create
       .mockResolvedValueOnce({ id: 100, role: 'user', content: 'chọn lớp 2' })
@@ -2067,10 +2081,22 @@ describe('CopilotService', () => {
 
     expect(mockToolRegistry.execute).not.toHaveBeenCalled();
     expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    // Lớp được chọn chỉ dùng để suy ra khóa.
+    expect(mockDeterministic.resolveEnrollClassReply).toHaveBeenCalledWith(
+      10,
+      expect.objectContaining({ userId: 1 }),
+      expect.objectContaining({ id: 6, label: 'IELTS cuối tuần' }),
+    );
     expect(result.response.type).toBe('preview_card');
 
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
-    expect(updateArg.data.state.pending_action.input.classId).toBe(6);
+    expect(updateArg.data.state.pending_action.tool_name).toBe(
+      'assign_student_to_course',
+    );
+    expect(updateArg.data.state.pending_action.input).toEqual({
+      userId: 1,
+      courseId: 10,
+    });
     expect(updateArg.data.state.pending_enrollment_context).toBeNull();
   });
 
@@ -2103,6 +2129,25 @@ describe('CopilotService', () => {
         },
       },
     });
+    mockDeterministic.resolveEnrollClassReply.mockResolvedValue({
+      type: 'pending_write',
+      pending: {
+        tool_name: 'assign_student_to_course',
+        input: { userId: 124, courseId: 91 },
+        display_input: {
+          userId: 124,
+          courseId: 91,
+          courseName: 'Anh Văn',
+          classes: [{ id: 50, label: 'Test 1' }],
+        },
+        summary:
+          'Ghi danh học viên #124 vào 1 lớp của khóa Anh Văn: Test 1 (hệ thống ghi danh theo khóa, gồm lớp Test 1)',
+        intent: 'assign_student_to_course',
+        status: 'waiting_confirm',
+        severity: 'default',
+      },
+      contextPatch: { selected_course_id: 91 },
+    });
     mockPrisma.aiAgentSessionMessage.create
       .mockResolvedValueOnce({ id: 100, role: 'user', content: '1' })
       .mockResolvedValueOnce({ id: 101, role: 'assistant', content: '{}' });
@@ -2117,14 +2162,18 @@ describe('CopilotService', () => {
 
     expect(mockToolRegistry.execute).not.toHaveBeenCalled();
     expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    // Lớp "1" (id 50, khóa 91) được chọn CHỈ để suy ra khóa.
+    expect(mockDeterministic.resolveEnrollClassReply).toHaveBeenCalledWith(
+      10,
+      expect.objectContaining({ userId: 124 }),
+      expect.objectContaining({ id: 50, label: 'Test 1' }),
+    );
     expect(result.response.type).toBe('preview_card');
 
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     const pending = updateArg.data.state.pending_action;
-    expect(pending.tool_name).toBe('assign_student_to_class');
-    expect(pending.input).toEqual({ userId: 124, classId: 50 });
-    expect(pending.display_input.courseId).toBe(91);
-    expect(pending.summary).toContain('khóa #91');
+    expect(pending.tool_name).toBe('assign_student_to_course');
+    expect(pending.input).toEqual({ userId: 124, courseId: 91 });
     expect(updateArg.data.state.pending_enrollment_context).toBeNull();
   });
 
@@ -2155,15 +2204,20 @@ describe('CopilotService', () => {
     mockDeterministic.resolveEnrollStudentReply.mockResolvedValue({
       type: 'pending_write',
       pending: {
-        tool_name: 'assign_student_to_class',
-        input: { userId: 132, classId: 7 },
-        display_input: { userId: 132, classId: 7, className: 'hehe' },
-        summary: 'Thêm học viên Toan H vào lớp hehe',
-        intent: 'assign_student_to_class',
+        tool_name: 'assign_student_to_course',
+        input: { userId: 132, courseId: 20 },
+        display_input: {
+          userId: 132,
+          courseId: 20,
+          courseName: 'Tiếng Bỉ',
+          classes: [{ id: 7, label: 'hehe' }],
+        },
+        summary: 'Ghi danh Toan H vào 1 lớp của khóa Tiếng Bỉ: hehe',
+        intent: 'assign_student_to_course',
         status: 'waiting_confirm',
         severity: 'default',
       },
-      contextPatch: { selected_class_id: 7 },
+      contextPatch: { selected_course_id: 20 },
     });
     mockPrisma.aiAgentSessionMessage.create
       .mockResolvedValueOnce({ id: 100, role: 'user', content: '1' })
@@ -2188,8 +2242,8 @@ describe('CopilotService', () => {
 
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     const pending = updateArg.data.state.pending_action;
-    expect(pending.tool_name).toBe('assign_student_to_class');
-    expect(pending.input).toEqual({ userId: 132, classId: 7 });
+    expect(pending.tool_name).toBe('assign_student_to_course');
+    expect(pending.input).toEqual({ userId: 132, courseId: 20 });
     expect(updateArg.data.state.pending_enrollment_context).toBeNull();
     expect(updateArg.data.state.selected_student_id).toBe(132);
   });
@@ -2221,24 +2275,26 @@ describe('CopilotService', () => {
     mockDeterministic.resolveEnrollStudentReply.mockResolvedValue({
       type: 'pending_write',
       pending: {
-        tool_name: 'assign_student_to_class',
-        input: { userIds: [132, 127, 114], classId: 50 },
+        tool_name: 'assign_student_to_course',
+        input: { userIds: [132, 127, 114], courseId: 91 },
         display_input: {
           userIds: [132, 127, 114],
-          classId: 50,
-          className: 'Test 1',
+          courseId: 91,
+          courseName: 'Anh Văn',
+          classes: [{ id: 50, label: 'Test 1' }],
           students: [
             { id: 132, label: 'Toan H', email: null },
             { id: 127, label: 'Toan Haha', email: null },
             { id: 114, label: 'Toàn Hoàng', email: null },
           ],
         },
-        summary: 'Thêm 3 học viên (Toan H, Toan Haha, Toàn Hoàng) vào lớp Test 1',
-        intent: 'assign_student_to_class',
+        summary:
+          'Ghi danh 3 học viên (Toan H, Toan Haha, Toàn Hoàng) vào 1 lớp của khóa Anh Văn: Test 1',
+        intent: 'assign_student_to_course',
         status: 'waiting_confirm',
         severity: 'default',
       },
-      contextPatch: { selected_class_id: 50 },
+      contextPatch: { selected_course_id: 91 },
     });
     mockPrisma.aiAgentSessionMessage.create
       .mockResolvedValueOnce({ id: 100, role: 'user', content: '1,3,5' })
@@ -2268,12 +2324,12 @@ describe('CopilotService', () => {
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     expect(updateArg.data.state.pending_action.input).toEqual({
       userIds: [132, 127, 114],
-      classId: 50,
+      courseId: 91,
     });
     expect(updateArg.data.state.pending_enrollment_context).toBeNull();
   });
 
-  it('ghi danh GỘP nhiều học viên + nhiều lớp trùng tên: chọn lớp xong tạo preview userIds', async () => {
+  it('ghi danh GỘP nhiều học viên + nhiều lớp trùng tên: chọn lớp xong tạo preview userIds CẢ KHÓA', async () => {
     process.env.AGENT_MINI_MODE = 'true';
     mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
       id: 1,
@@ -2293,6 +2349,29 @@ describe('CopilotService', () => {
         },
       },
     });
+    mockDeterministic.resolveEnrollClassReply.mockResolvedValue({
+      type: 'pending_write',
+      pending: {
+        tool_name: 'assign_student_to_course',
+        input: { userIds: [3, 132], courseId: 89 },
+        display_input: {
+          userIds: [3, 132],
+          courseId: 89,
+          courseName: 'Test',
+          classes: [{ id: 40, label: 'Test 1' }],
+          students: [
+            { id: 3, label: 'Tiến', email: null },
+            { id: 132, label: 'Toan H', email: null },
+          ],
+        },
+        summary:
+          'Ghi danh 2 học viên (Tiến, Toan H) vào 1 lớp của khóa Test: Test 1',
+        intent: 'assign_student_to_course',
+        status: 'waiting_confirm',
+        severity: 'default',
+      },
+      contextPatch: { selected_course_id: 89 },
+    });
     mockPrisma.aiAgentSessionMessage.create
       .mockResolvedValueOnce({ id: 100, role: 'user', content: '2' })
       .mockResolvedValueOnce({ id: 101, role: 'assistant', content: '{}' });
@@ -2306,15 +2385,20 @@ describe('CopilotService', () => {
     );
 
     expect(mockAgentRunner.run).not.toHaveBeenCalled();
+    expect(mockDeterministic.resolveEnrollClassReply).toHaveBeenCalledWith(
+      10,
+      expect.objectContaining({ userIds: [3, 132] }),
+      expect.objectContaining({ id: 40, label: 'Test 1' }),
+    );
     expect(result.response.type).toBe('preview_card');
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     const pending = updateArg.data.state.pending_action;
-    expect(pending.input).toEqual({ userIds: [3, 132], classId: 40 });
+    expect(pending.input).toEqual({ userIds: [3, 132], courseId: 89 });
     expect(pending.summary).toContain('2 học viên (Tiến, Toan H)');
     expect(updateArg.data.state.pending_enrollment_context).toBeNull();
   });
 
-  it('confirm bản nháp GỘP: partial success -> message báo cáo từng dòng ✓/⚠, chốt ngữ cảnh lớp', async () => {
+  it('confirm bản nháp GỘP cả khóa: partial success -> message báo cáo từng dòng ✓/⚠, chốt ngữ cảnh khóa', async () => {
     process.env.AGENT_MINI_MODE = 'true';
     mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
       id: 1,
@@ -2323,28 +2407,36 @@ describe('CopilotService', () => {
       status: 'ACTIVE',
       state: {
         pending_action: {
-          tool_name: 'assign_student_to_class',
-          input: { userIds: [3, 132], classId: 8 },
-          summary: 'Thêm 2 học viên vào lớp',
-          intent: 'assign_student_to_class',
+          tool_name: 'assign_student_to_course',
+          input: { userIds: [3, 132], courseId: 20 },
+          summary: 'Ghi danh 2 học viên vào khóa',
+          intent: 'assign_student_to_course',
         },
       },
     });
     mockToolRegistry.execute.mockResolvedValue({
       bulk: true,
-      classId: 8,
-      className: 'Tiếng Bỉ 1',
       courseId: 20,
       courseName: 'Tiếng Bỉ',
       total: 2,
       successCount: 1,
       items: [
-        { userId: 3, studentName: 'Tiến', status: 'SUCCESS', message: null },
+        {
+          userId: 3,
+          studentName: 'Tiến',
+          status: 'SUCCESS',
+          enrolled: [{ classId: 8, classTitle: 'Tiếng Bỉ 1' }],
+          skippedExisting: [],
+          message: null,
+        },
         {
           userId: 132,
           studentName: null,
-          status: 'ALREADY_IN_CLASS',
-          message: 'Người dùng đã có trong lớp này',
+          status: 'ALREADY_IN_COURSE',
+          enrolled: [],
+          skippedExisting: [],
+          message:
+            'Học viên đã có mặt trong tất cả lớp đang hoạt động của khóa học này.',
         },
       ],
     });
@@ -2364,23 +2456,24 @@ describe('CopilotService', () => {
     expect(mockToolRegistry.execute).toHaveBeenCalledWith(
       1,
       expect.anything(),
-      'assign_student_to_class',
-      expect.objectContaining({ userIds: [3, 132], classId: 8 }),
+      'assign_student_to_course',
+      expect.objectContaining({ userIds: [3, 132], courseId: 20 }),
     );
     expect(result.response.type).toBe('tool_result');
-    expect(result.response.message).toContain('1/2 thêm thành công');
-    expect(result.response.message).toContain('✓ Tiến — đã thêm vào lớp');
+    expect(result.response.message).toContain('1/2 ghi danh thành công');
     expect(result.response.message).toContain(
-      '⚠ học viên #132 — đã có trong lớp từ trước',
+      '✓ Tiến — đã thêm vào 1 lớp: Tiếng Bỉ 1',
+    );
+    expect(result.response.message).toContain(
+      '⚠ học viên #132 — đã có trong tất cả lớp của khóa từ trước',
     );
 
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     expect(updateArg.data.state.pending_action).toBeNull();
-    expect(updateArg.data.state.selected_class_id).toBe(8);
     expect(updateArg.data.state.selected_course_id).toBe(20);
   });
 
-  it('mini mode: preview + confirm assign_student_to_class execute đúng input và set context lớp', async () => {
+  it('mini mode: preview + confirm assign_student_to_course execute đúng input, message liệt kê per-class', async () => {
     process.env.AGENT_MINI_MODE = 'true';
     mockPrisma.aiAgentSession.findFirst.mockResolvedValue({
       id: 1,
@@ -2389,25 +2482,25 @@ describe('CopilotService', () => {
       status: 'ACTIVE',
       state: {
         pending_action: {
-          tool_name: 'assign_student_to_class',
-          input: { userId: 3, classId: 8 },
-          summary: 'Thêm học viên Tiến vào lớp Tiếng Bỉ 1',
-          intent: 'assign_student_to_class',
+          tool_name: 'assign_student_to_course',
+          input: { userId: 3, courseId: 20 },
+          summary: 'Ghi danh Tiến vào 2 lớp của khóa Tiếng Bỉ',
+          intent: 'assign_student_to_course',
         },
       },
     });
     mockToolRegistry.execute.mockResolvedValue({
       id: 55,
       userId: 3,
-      classId: 8,
-      roleInClass: 'STUDENT',
+      studentId: 3,
+      courseId: 20,
       user: { id: 3, fullName: 'Tiến' },
-      courseClass: {
-        id: 8,
-        title: 'Tiếng Bỉ 1',
-        courseId: 20,
-        course: { id: 20, title: 'Tiếng Bỉ' },
-      },
+      course: { id: 20, title: 'Tiếng Bỉ' },
+      totalActiveClasses: 2,
+      enrolled: [
+        { classId: 8, classTitle: 'Tiếng Bỉ 1', enrollmentId: 55 },
+      ],
+      skippedExisting: [{ classId: 9, classTitle: 'Tiếng Bỉ 2' }],
     });
     mockPrisma.aiAgentSessionMessage.create.mockResolvedValue({
       id: 101,
@@ -2428,18 +2521,24 @@ describe('CopilotService', () => {
     expect(mockToolRegistry.execute).toHaveBeenCalledWith(
       1,
       { tenantId: 10, userId: 20, role: 'ADMIN' },
-      'assign_student_to_class',
-      expect.objectContaining({ userId: 3, classId: 8 }),
+      'assign_student_to_course',
+      expect.objectContaining({ userId: 3, courseId: 20 }),
     );
     expect(result.response.type).toBe('tool_result');
+    // Message BẮT BUỘC liệt kê per-class: đã thêm / đã có sẵn.
     expect((result.response as any).message).toContain(
-      'Đã thêm học viên vào lớp thành công',
+      'Đã ghi danh học viên vào 1/2 lớp đang hoạt động của khóa',
+    );
+    expect((result.response as any).message).toContain(
+      '✓ Tiếng Bỉ 1 — đã thêm',
+    );
+    expect((result.response as any).message).toContain(
+      '⚠ Tiếng Bỉ 2 — đã có sẵn từ trước',
     );
 
     const updateArg = mockPrisma.aiAgentSession.update.mock.calls[0][0];
     expect(updateArg.data.state.pending_action).toBeNull();
     expect(updateArg.data.state.selected_student_id).toBe(3);
-    expect(updateArg.data.state.selected_class_id).toBe(8);
     expect(updateArg.data.state.selected_course_id).toBe(20);
   });
 

@@ -13,8 +13,8 @@ const ACTION_TITLES: Record<string, string> = {
   update_class: "Cập nhật lớp học",
   create_student: "Tạo học viên",
   update_student: "Cập nhật học viên",
-  assign_student_to_class: "Thêm học viên vào lớp",
-  assign_student_to_course: "Ghi danh vào khóa học (chọn lớp trong khóa)",
+  assign_student_to_course: "Ghi danh vào khóa học (tất cả lớp trong khóa)",
+  assign_teacher_to_course: "Gán giáo viên phụ trách khóa (tất cả lớp)",
   remove_student_from_class: "Xóa học viên khỏi lớp",
   delete_students: "Xóa học viên",
   delete_courses: "Xóa khóa học",
@@ -66,6 +66,7 @@ type CourseClassOption = {
   classCode?: string | null;
   courseId?: number | string;
   courseTitle?: string;
+  status?: string | null;
 };
 
 type StudentOption = {
@@ -156,7 +157,8 @@ export default function EditablePreviewCard({
     "update_student",
     "update_course",
     "update_class",
-    "assign_student_to_class",
+    "assign_student_to_course",
+    "assign_teacher_to_course",
   ].includes(data.tool_name);
 
   const pendingAction = data.pending_action || {};
@@ -186,10 +188,10 @@ export default function EditablePreviewCard({
     rawFormInput.type
       ? { ...rawFormInput, classType: rawFormInput.type }
       : rawFormInput;
-  // "Ngày vào lớp" mặc định là HÔM NAY (thời điểm thêm học viên vào lớp),
+  // "Ngày vào lớp" mặc định là HÔM NAY (thời điểm ghi danh),
   // user vẫn sửa được trước khi Xác nhận. Backend cũng default now() nếu trống.
   const formInput =
-    data.tool_name === "assign_student_to_class" && !formInputBase.joinedAt
+    data.tool_name === "assign_student_to_course" && !formInputBase.joinedAt
       ? { ...formInputBase, joinedAt: todayLocalDate() }
       : formInputBase;
   const relatedCourses = Array.isArray(data.related_courses)
@@ -257,7 +259,7 @@ export default function EditablePreviewCard({
         .filter((value) => Number.isFinite(value) && value > 0)
     : [];
   const isBulkAssign =
-    data.tool_name === "assign_student_to_class" && bulkUserIds.length > 0;
+    data.tool_name === "assign_student_to_course" && bulkUserIds.length > 0;
   const bulkStudentDirectory = new Map<
     number,
     { label: string; email: string | null }
@@ -286,9 +288,12 @@ export default function EditablePreviewCard({
 
   useEffect(() => {
     if (
-      ["create_class", "update_class", "assign_student_to_class"].includes(
-        data.tool_name,
-      )
+      [
+        "create_class",
+        "update_class",
+        "assign_student_to_course",
+        "assign_teacher_to_course",
+      ].includes(data.tool_name)
     ) {
       apiClient
         .get("/courses")
@@ -315,6 +320,8 @@ export default function EditablePreviewCard({
                             : null,
                         courseId: course.id,
                         courseTitle: course.title,
+                        status:
+                          typeof cls.status === "string" ? cls.status : null,
                       }))
                     : [],
                 )
@@ -327,7 +334,7 @@ export default function EditablePreviewCard({
         .catch(() => {});
     }
 
-    if (data.tool_name === "assign_student_to_class") {
+    if (data.tool_name === "assign_student_to_course") {
       apiClient
         .get("/students")
         .then((res) => {
@@ -611,7 +618,33 @@ export default function EditablePreviewCard({
             </div>
           </div>
         );
-      case "assign_student_to_class":
+      case "assign_student_to_course": {
+        // Danh sách lớp đích READ-ONLY: ưu tiên lớp ACTIVE của khóa đang chọn
+        // (đã fetch); fallback về display_input.classes do backend liệt kê.
+        const fetchedActive = classes.filter(
+          (c) =>
+            Number(c.courseId) === selectedCourseId &&
+            (!c.status || c.status === "ACTIVE"),
+        );
+        const displayClasses = (data.display_input?.classes ??
+          pendingAction.display_input?.classes) as unknown;
+        const fallbackClasses = Array.isArray(displayClasses)
+          ? displayClasses
+              .filter((item) => isRecord(item))
+              .map((item) => ({
+                id: (item as Record<string, unknown>).id as number | string,
+                label: String(
+                  (item as Record<string, unknown>).label ||
+                    `#${(item as Record<string, unknown>).id}`,
+                ),
+              }))
+          : [];
+        const targetClasses = fetchedActive.length
+          ? fetchedActive.map((c) => ({
+              id: c.id,
+              label: c.title || c.classCode || `#${c.id}`,
+            }))
+          : fallbackClasses;
         return (
           <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
             <div className="sm:col-span-2">
@@ -675,22 +708,49 @@ export default function EditablePreviewCard({
             </div>
 
             <div className="sm:col-span-2">
-              <FieldLabel label="Lớp học" required />
+              <FieldLabel label="Khóa học" required />
               <select
-                name="classId"
-                value={String(formData.classId || "")}
+                name="courseId"
+                value={selectedCourseValue}
                 onChange={handleChange}
-                className={inputClass(Boolean(validationErrors.classId))}
+                className={inputClass(Boolean(validationErrors.courseId))}
               >
-                <option value="">-- Chọn lớp học --</option>
-                {classes.map((c) => (
+                <option value="">-- Chọn khóa học --</option>
+                {courseOptions.map((c) => (
                   <option key={c.id} value={c.id}>
-                    {c.title} ({c.classCode}) - Khóa:{" "}
-                    {c.courseTitle || `Khóa #${c.courseId}`}
+                    {c.courseCode ? `${c.title} (${c.courseCode})` : c.title}
                   </option>
                 ))}
               </select>
-              <FieldError error={validationErrors.classId} />
+              <FieldError error={validationErrors.courseId} />
+            </div>
+
+            <div className="sm:col-span-2">
+              <FieldLabel
+                label={`Lớp sẽ được ghi danh (${targetClasses.length})`}
+              />
+              {targetClasses.length ? (
+                <ul className="divide-y divide-zinc-100 rounded-[10px] border border-zinc-200 bg-zinc-50/60">
+                  {targetClasses.map((cls) => (
+                    <li
+                      key={cls.id}
+                      className="px-3 py-2 text-[13px] text-zinc-800"
+                    >
+                      {cls.label}{" "}
+                      <span className="text-zinc-400">(#{cls.id})</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="rounded-[10px] border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs leading-5 text-amber-800">
+                  Khóa này chưa có lớp đang hoạt động — cần tạo lớp trước khi
+                  ghi danh.
+                </p>
+              )}
+              <p className="mt-1 text-[11px] leading-4 text-zinc-400">
+                Học viên sẽ được thêm vào TẤT CẢ lớp đang hoạt động của khóa.
+                Lớp mở thêm sau này trong khóa cũng tự có học viên của khóa.
+              </p>
             </div>
 
             {renderField("roleInClass", "Vai trò trong lớp", "select", false, [
@@ -705,6 +765,85 @@ export default function EditablePreviewCard({
             {renderField("joinedAt", "Ngày vào lớp", "date")}
           </div>
         );
+      }
+      case "assign_teacher_to_course": {
+        // Danh sách lớp sẽ nhận giáo viên: ưu tiên lớp ACTIVE của khóa đang
+        // chọn (đã fetch), fallback về display_input.classes backend liệt kê.
+        const fetchedActive = classes.filter(
+          (c) =>
+            Number(c.courseId) === selectedCourseId &&
+            (!c.status || c.status === "ACTIVE"),
+        );
+        const displayClasses = (data.display_input?.classes ??
+          pendingAction.display_input?.classes) as unknown;
+        const fallbackClasses = Array.isArray(displayClasses)
+          ? displayClasses
+              .filter((item) => isRecord(item))
+              .map((item) => ({
+                id: (item as Record<string, unknown>).id as number | string,
+                label: String(
+                  (item as Record<string, unknown>).label ||
+                    `#${(item as Record<string, unknown>).id}`,
+                ),
+              }))
+          : [];
+        const targetClasses = fetchedActive.length
+          ? fetchedActive.map((c) => ({
+              id: c.id,
+              label: c.title || c.classCode || `#${c.id}`,
+            }))
+          : fallbackClasses;
+        return (
+          <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2">
+            <div className="sm:col-span-2">
+              {renderField("teacherName", "Giáo viên phụ trách", "text", true)}
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel label="Khóa học" required />
+              <select
+                name="courseId"
+                value={selectedCourseValue}
+                onChange={handleChange}
+                className={inputClass(Boolean(validationErrors.courseId))}
+              >
+                <option value="">-- Chọn khóa học --</option>
+                {courseOptions.map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.courseCode ? `${c.title} (${c.courseCode})` : c.title}
+                  </option>
+                ))}
+              </select>
+              <FieldError error={validationErrors.courseId} />
+            </div>
+            <div className="sm:col-span-2">
+              <FieldLabel
+                label={`Lớp sẽ do giáo viên phụ trách (${targetClasses.length})`}
+              />
+              {targetClasses.length ? (
+                <ul className="divide-y divide-zinc-100 rounded-[10px] border border-zinc-200 bg-zinc-50/60">
+                  {targetClasses.map((cls) => (
+                    <li
+                      key={cls.id}
+                      className="px-3 py-2 text-[13px] text-zinc-800"
+                    >
+                      {cls.label}{" "}
+                      <span className="text-zinc-400">(#{cls.id})</span>
+                    </li>
+                  ))}
+                </ul>
+              ) : (
+                <p className="rounded-[10px] border border-amber-200 bg-amber-50/60 px-3 py-2 text-xs leading-5 text-amber-800">
+                  Khóa này chưa có lớp đang hoạt động — cần tạo lớp trước.
+                </p>
+              )}
+              <p className="mt-1 text-[11px] leading-4 text-zinc-400">
+                Giáo viên sẽ phụ trách TẤT CẢ lớp đang hoạt động của khóa. Muốn
+                đổi giáo viên MỘT lớp, hãy nói rõ tên lớp đó.
+              </p>
+            </div>
+          </div>
+        );
+      }
       default:
         return null;
     }

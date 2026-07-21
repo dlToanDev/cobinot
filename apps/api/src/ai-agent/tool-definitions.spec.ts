@@ -105,15 +105,15 @@ describe('tool-definitions', () => {
       }
     });
 
-    it('mini mode expose đúng tool cho 7 nghiệp vụ (tạo/sửa + ghi danh theo LỚP)', () => {
+    it('mini mode expose đúng tool cho 7 nghiệp vụ (tạo/sửa + ghi danh theo KHÓA)', () => {
       process.env.AGENT_MINI_MODE = 'true';
       const names = getConfiguredAgentTools().map((t) => t.function.name);
 
-      // WRITE: tạo học viên, tạo khóa, tạo lớp, thêm học viên vào lớp.
+      // WRITE: tạo học viên, tạo khóa, tạo lớp, ghi danh học viên vào khóa.
       expect(names).toContain('create_student');
       expect(names).toContain('create_course');
       expect(names).toContain('create_class');
-      expect(names).toContain('assign_student_to_class');
+      expect(names).toContain('assign_student_to_course');
       // WRITE: sửa thông tin học viên/khóa học/lớp học.
       expect(names).toContain('update_student');
       expect(names).toContain('update_course');
@@ -128,14 +128,25 @@ describe('tool-definitions', () => {
       expect(names).toContain('get_class_detail');
       expect(names).toContain('ask_clarification');
 
-      // Ghi danh cấp khóa KHÔNG expose (flow chính là vào lớp).
-      expect(names).not.toContain('assign_student_to_course');
+      // Ghi danh theo LỚP đã bị xóa hẳn khỏi hệ thống.
+      expect(names).not.toContain('assign_student_to_class');
       // Ngoài phạm vi mini: xóa/đóng/gỡ.
       expect(names).not.toContain('delete_students');
       expect(names).not.toContain('delete_courses');
       expect(names).not.toContain('close_class');
       expect(names).not.toContain('remove_student_from_class');
       expect(names).not.toContain('remove_student_from_course_classes');
+    });
+
+    it('assign_student_to_class không còn tồn tại ở bất kỳ danh sách tool nào', () => {
+      expect(WRITE_TOOL_NAMES).not.toContain('assign_student_to_class');
+      expect(READ_TOOL_NAMES).not.toContain('assign_student_to_class');
+      expect(isWriteTool('assign_student_to_class')).toBe(false);
+      expect(
+        FULL_AGENT_TOOLS.some(
+          (tool) => String(tool.function.name) === 'assign_student_to_class',
+        ),
+      ).toBe(false);
     });
 
     it('expose full tool khi AGENT_MINI_MODE=false', () => {

@@ -667,6 +667,27 @@ export class CopilotService {
       });
     }
 
+    // Kết quả READ chi tiết (lớp/khóa) từ deterministic: render như tool_result
+    // của LLM -> FE hiện card chi tiết (ngày giờ, lịch học, thông số).
+    if (outcome.type === 'read_result') {
+      const response: CopilotResponse = {
+        type: 'tool_result',
+        tool_name: outcome.toolName,
+        status: 'SUCCESS',
+        message: outcome.message || '',
+        result: outcome.result,
+        data: outcome.result,
+      };
+      return this.saveAssistantTurn({
+        sessionId,
+        userMessageId,
+        startedAt,
+        response,
+        state: this.mergeState(state, outcome.contextPatch),
+        toolName: outcome.toolName,
+      });
+    }
+
     const response: CopilotResponse =
       outcome.type === 'clarification'
         ? {
@@ -735,6 +756,29 @@ export class CopilotService {
         code: 'IDEMPOTENCY_KEY_MISMATCH',
         message:
           'Bản nháp đã thay đổi so với lúc bạn mở preview. Vui lòng kiểm tra lại bản nháp mới nhất rồi xác nhận.',
+      });
+    }
+
+    // Session cũ còn pending assign_student_to_class (tool đã bị xóa hẳn):
+    // KHÔNG thực thi — hủy pending + hướng user sang ghi danh theo khóa.
+    if (String(pending.tool_name) === 'assign_student_to_class') {
+      const response: CopilotResponse = {
+        type: 'error',
+        message:
+          'Thao tác ghi danh theo lớp không còn được hỗ trợ — hãy thêm học viên vào KHÓA học, ' +
+          'hệ thống sẽ tự ghi danh vào tất cả lớp đang hoạt động của khóa.',
+        code: 'TOOL_REMOVED',
+      };
+      const nextState = this.mergeState(state, {
+        pending_action: null,
+        pending_clarification: null,
+        pending_enrollment_context: null,
+      });
+      return this.saveAssistantTurn({
+        sessionId,
+        startedAt,
+        response,
+        state: nextState,
       });
     }
 
@@ -885,8 +929,7 @@ export class CopilotService {
 
   /**
    * Xử lý lỗi khi confirm một pending action (đặc biệt là ghi danh khóa).
-   * - Khóa nhiều lớp -> chuyển sang clarification chọn lớp (giữ pending_enrollment_context).
-   * - Lỗi không thể retry (đã ghi danh, không có lớp, không tìm thấy) -> clear pending_action.
+   * - Lỗi không thể retry (đã ghi danh đủ, không có lớp, không tìm thấy) -> clear pending_action.
    * - Lỗi khác (tạm thời) -> giữ pending_action để user thử lại.
    */
   private async handleConfirmError(
@@ -898,49 +941,11 @@ export class CopilotService {
   ) {
     const info = this.extractErrorInfo(error);
 
-    // Khóa có nhiều lớp -> hỏi user chọn lớp cụ thể để hoàn tất ghi danh.
-    if (
-      info.code === 'COURSE_HAS_MULTIPLE_CLASSES' &&
-      pending.tool_name === 'assign_student_to_course'
-    ) {
-      const candidateClasses = (info.classes || []).map((c) =>
-        this.classCandidateOption(c),
-      );
-      const enrollmentContext: PendingEnrollmentContext = {
-        userId: Number(pending.input?.userId) || 0,
-        courseId: Number(pending.input?.courseId) || 0,
-        candidateClasses,
-      };
-      const message = this.buildMultiClassMessage(candidateClasses);
-      const response: CopilotResponse = {
-        type: 'clarification',
-        message,
-        missing_fields: ['classId'],
-        intent: 'assign_student_to_course',
-        entities: {},
-      };
-      const nextState = this.mergeState(state, {
-        pending_action: null,
-        pending_enrollment_context: enrollmentContext,
-        pending_clarification: {
-          intent: 'assign_student_to_course',
-          missing_fields: ['classId'],
-          message,
-        },
-        last_candidates: { classes: candidateClasses },
-      });
-      return this.saveAssistantTurn({
-        sessionId,
-        startedAt,
-        response,
-        state: nextState,
-      });
-    }
-
     // Các lỗi không nên retry -> clear pending_action.
     const nonRetryCodes = [
       'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
       'COURSE_HAS_NO_ACTIVE_CLASS',
+      'COURSE_NOT_ACTIVE',
       'STUDENT_NOT_FOUND',
       'COURSE_NOT_FOUND',
     ];
@@ -1282,6 +1287,10 @@ export class CopilotService {
               '\n',
             )
           : null,
+        // Học viên của khóa được TỰ ĐỘNG thêm vào lớp mới.
+        Number(row.autoEnrolledCount) > 0
+          ? `\nĐã tự động thêm ${row.autoEnrolledCount} học viên của khóa vào lớp này.`
+          : null,
         // Nếu tạo tối giản (chỉ tên + khóa), nhắc user có thể bổ sung sau.
         hasExtra
           ? null
@@ -1291,42 +1300,51 @@ export class CopilotService {
         .join('\n');
     }
 
-    if (toolName === 'assign_student_to_class' && row.bulk) {
-      // Kết quả GỘP: báo cáo từng dòng ✓ / ⚠ / ✗, không all-or-nothing.
-      const className = row.className || `#${row.classId}`;
+    if (toolName === 'assign_teacher_to_course') {
+      const courseName = row.course?.title || row.courseName || `#${row.courseId}`;
+      const updated: any[] = Array.isArray(row.updated) ? row.updated : [];
+      return [
+        `Đã giao giáo viên ${row.teacherName} phụ trách ${updated.length}/${row.totalActiveClasses ?? updated.length} lớp đang hoạt động của khóa ${courseName}.`,
+        '',
+        ...updated.map((cls: any) => {
+          const prev =
+            cls.previousTeacherName && cls.previousTeacherName !== row.teacherName
+              ? ` (trước đó: ${cls.previousTeacherName})`
+              : '';
+          return `✓ ${cls.classTitle || `#${cls.classId}`}${prev}`;
+        }),
+      ].join('\n');
+    }
+
+    if (toolName === 'assign_student_to_course' && row.bulk) {
+      // Kết quả GỘP nhiều học viên × cả khóa: báo cáo từng dòng ✓ / ⚠ / ✗.
+      const courseName = row.courseName || `#${row.courseId}`;
       const lines = (Array.isArray(row.items) ? row.items : []).map(
         (item: any) => {
           const name = item.studentName || `học viên #${item.userId}`;
-          if (item.status === 'SUCCESS') return `✓ ${name} — đã thêm vào lớp`;
-          if (item.status === 'ALREADY_IN_CLASS')
-            return `⚠ ${name} — đã có trong lớp từ trước`;
+          if (item.status === 'SUCCESS') {
+            const added = (item.enrolled || [])
+              .map((cls: any) => cls.classTitle)
+              .join(', ');
+            const skipped = (item.skippedExisting || [])
+              .map((cls: any) => cls.classTitle)
+              .join(', ');
+            return (
+              `✓ ${name} — đã thêm vào ${item.enrolled?.length || 0} lớp` +
+              (added ? `: ${added}` : '') +
+              (skipped ? ` · đã có sẵn: ${skipped}` : '')
+            );
+          }
+          if (item.status === 'ALREADY_IN_COURSE')
+            return `⚠ ${name} — đã có trong tất cả lớp của khóa từ trước`;
           return `✗ ${name} — ${item.message || 'lỗi không xác định'}`;
         },
       );
       return [
-        `Đã xử lý ${row.total} học viên cho lớp ${className}: ${row.successCount}/${row.total} thêm thành công.`,
+        `Đã xử lý ${row.total} học viên cho khóa ${courseName}: ${row.successCount}/${row.total} ghi danh thành công.`,
         '',
         ...lines,
       ].join('\n');
-    }
-
-    if (toolName === 'assign_student_to_class') {
-      const studentName =
-        row.user?.fullName || row.user?.name || `#${row.userId}`;
-      const className =
-        row.courseClass?.title || row.courseClass?.name || `#${row.classId}`;
-      const courseName =
-        row.courseClass?.course?.title || row.courseClass?.course?.name;
-      return [
-        'Đã thêm học viên vào lớp thành công.',
-        '',
-        bullet('Học viên', studentName),
-        bullet('Lớp', className),
-        bullet('Khóa', courseName),
-        bullet('Vai trò', row.roleInClass),
-      ]
-        .filter((line) => line !== null)
-        .join('\n');
     }
 
     if (toolName === 'assign_student_to_course') {
@@ -1336,13 +1354,25 @@ export class CopilotService {
         `#${row.studentId ?? row.userId}`;
       const courseName =
         row.course?.title || row.course?.name || `#${row.courseId}`;
-      const className = row.courseClass?.title || row.courseClass?.name;
+      const enrolled: any[] = Array.isArray(row.enrolled) ? row.enrolled : [];
+      const skipped: any[] = Array.isArray(row.skippedExisting)
+        ? row.skippedExisting
+        : [];
+      const classLines = [
+        ...enrolled.map(
+          (cls: any) => `✓ ${cls.classTitle || `#${cls.classId}`} — đã thêm`,
+        ),
+        ...skipped.map(
+          (cls: any) =>
+            `⚠ ${cls.classTitle || `#${cls.classId}`} — đã có sẵn từ trước`,
+        ),
+      ];
       return [
-        'Đã ghi danh học viên vào lớp trong khóa thành công.',
+        `Đã ghi danh học viên vào ${enrolled.length}/${row.totalActiveClasses ?? enrolled.length + skipped.length} lớp đang hoạt động của khóa.`,
         '',
         bullet('Học viên', studentName),
         bullet('Khóa', courseName),
-        bullet('Lớp', className),
+        ...(classLines.length ? ['Danh sách lớp:', ...classLines] : []),
       ]
         .filter((line) => line !== null)
         .join('\n');
@@ -1390,9 +1420,8 @@ export class CopilotService {
       create_student: 'Tạo học viên mới',
       create_course: 'Tạo khóa học mới',
       create_class: 'Tạo lớp học mới',
-      assign_student_to_class: 'Thêm học viên vào lớp học',
       assign_student_to_course:
-        'Ghi danh học viên vào khóa học (vào lớp trong khóa)',
+        'Ghi danh học viên vào khóa học (tất cả lớp đang hoạt động)',
     };
     return {
       tool_name: action.action,
@@ -1729,27 +1758,26 @@ export class CopilotService {
         };
       }
     }
-    if (toolName === 'assign_student_to_class') {
-      const hasBulkUsers =
-        Array.isArray(input.userIds) &&
-        input.userIds.some((id) => Number(id) > 0);
-      if (!hasBulkUsers && !Number(input.userId || 0)) {
+    if (toolName === 'assign_teacher_to_course') {
+      if (!hasText('teacherName')) {
         return {
-          message: 'Vui lòng chọn học viên.',
-          errors: { userId: 'Vui lòng chọn học viên.' },
+          message: 'Vui lòng nhập tên giáo viên.',
+          errors: { teacherName: 'Vui lòng nhập tên giáo viên.' },
         };
       }
-      if (!Number(input.classId || 0)) {
+      if (!Number(input.courseId || 0)) {
         return {
-          message: 'Vui lòng chọn lớp học.',
-          errors: { classId: 'Vui lòng chọn lớp học.' },
+          message: 'Vui lòng chọn khóa học.',
+          errors: { courseId: 'Vui lòng chọn khóa học.' },
         };
       }
     }
     if (toolName === 'assign_student_to_course') {
-      // classId KHÔNG bắt buộc: execute tự resolve lớp trong khóa, hoặc
-      // trả COURSE_HAS_MULTIPLE_CLASSES để user chọn lớp cụ thể.
-      if (!Number(input.userId || 0)) {
+      // Không có classId: execute tự ghi vào TẤT CẢ lớp ACTIVE của khóa.
+      const hasBulkUsers =
+        Array.isArray(input.userIds) &&
+        input.userIds.some((id) => Number(id) > 0);
+      if (!hasBulkUsers && !Number(input.userId || 0)) {
         return {
           message: 'Vui lòng chọn học viên.',
           errors: { userId: 'Vui lòng chọn học viên.' },
@@ -2127,10 +2155,10 @@ export class CopilotService {
         suggestions: [
           {
             id: 'duplicate-use-existing-enroll',
-            title: 'Thêm học viên này vào lớp học',
-            message: `Thêm ${existing.label} vào một lớp học có sẵn.`,
-            intent: 'assign_student_to_class',
-            draft_message: `Thêm học viên ${existing.label} #${existing.id} vào lớp học`,
+            title: 'Ghi danh học viên này vào khóa học',
+            message: `Ghi danh ${existing.label} vào một khóa học (tất cả lớp đang hoạt động).`,
+            intent: 'assign_student_to_course',
+            draft_message: `Thêm học viên ${existing.label} #${existing.id} vào khóa học`,
             priority: 1,
           },
           {
@@ -2620,70 +2648,58 @@ export class CopilotService {
       return null;
     }
 
-    // Đã có classId cụ thể -> dùng assign_student_to_class (ghi danh luôn ở cấp
-    // lớp; _to_course còn bị chặn trong mini mode nên pending đó không confirm được).
-    // courseId trong context có thể là 0 (các lớp trùng tên thuộc nhiều khóa) ->
-    // suy khóa thật từ lớp user vừa chọn.
-    const chosenMeta = (chosen.metadata || {}) as Record<string, any>;
-    const courseId =
-      Number(chosenMeta.courseId ?? chosenMeta.course?.id) ||
-      ctx.courseId ||
-      null;
-    const isBulk = Array.isArray(ctx.userIds) && ctx.userIds.length > 1;
-    const bulkStudents = isBulk
-      ? ctx.userIds!.map((id, index) => ({
-          id,
-          label: ctx.studentLabels?.[index] || `#${id}`,
-          email: null,
-        }))
-      : [];
-    const pending: PendingAction = isBulk
-      ? {
-          tool_name: 'assign_student_to_class',
-          input: {
-            userIds: ctx.userIds,
-            classId: chosen.id,
-          },
-          display_input: {
-            userIds: ctx.userIds,
-            ...(courseId ? { courseId } : {}),
-            classId: chosen.id,
-            className: chosen.label,
-            students: bulkStudents,
-          },
-          summary: `Thêm ${ctx.userIds!.length} học viên (${bulkStudents.map((s) => s.label).join(', ')}) vào lớp ${chosen.label}`,
-          intent: 'assign_student_to_class',
-          status: 'waiting_confirm',
-          severity: 'default',
-        }
-      : {
-          tool_name: 'assign_student_to_class',
-          input: {
-            userId: ctx.userId,
-            classId: chosen.id,
-          },
-          display_input: {
-            userId: ctx.userId,
-            ...(courseId ? { courseId } : {}),
-            classId: chosen.id,
-            className: chosen.label,
-          },
-          summary: `Thêm học viên #${ctx.userId} vào lớp ${chosen.label}${courseId ? ` (khóa #${courseId})` : ''}`,
-          intent: 'assign_student_to_class',
-          status: 'waiting_confirm',
-          severity: 'default',
-        };
-    const clearedState = this.mergeState(state, {
+    // Lớp user chọn chỉ dùng để SUY RA KHÓA — ghi danh luôn ở cấp khóa:
+    // học viên sẽ vào TẤT CẢ lớp ACTIVE của khóa đó (gồm lớp vừa chọn).
+    let outcome: DeterministicOutcome | null = null;
+    try {
+      outcome = await this.deterministic.resolveEnrollClassReply(
+        actor.tenantId,
+        ctx,
+        {
+          id: Number(chosen.id),
+          label: chosen.label,
+          metadata: chosen.metadata,
+        },
+      );
+    } catch {
+      outcome = null;
+    }
+    if (!outcome) return null;
+
+    const basePatch: Partial<DecisionContext> = {
       pending_enrollment_context: null,
       pending_clarification: null,
-    });
-    return this.savePendingWriteTurn({
-      actor,
+    };
+    if (outcome.type === 'pending_write') {
+      return this.savePendingWriteTurn({
+        actor,
+        sessionId,
+        state: this.mergeState(state, basePatch),
+        pending: outcome.pending,
+        userMessageId,
+        startedAt,
+        contextPatch: outcome.contextPatch,
+      });
+    }
+    const response: CopilotResponse =
+      outcome.type === 'clarification'
+        ? {
+            type: 'clarification',
+            message: outcome.message,
+            missing_fields: outcome.missingFields,
+            intent: outcome.intent,
+            entities: {},
+          }
+        : { type: 'text_message', message: (outcome as any).message };
+    return this.saveAssistantTurn({
       sessionId,
-      state: clearedState,
-      pending,
       userMessageId,
       startedAt,
+      response,
+      state: this.mergeState(state, {
+        ...basePatch,
+        ...outcome.contextPatch,
+      }),
     });
   }
 
@@ -2809,31 +2825,6 @@ export class CopilotService {
       userMessageId,
       startedAt,
     });
-  }
-
-  private buildMultiClassMessage(classes: EntityOption[]): string {
-    const rows = classes
-      .map(
-        (c, index) =>
-          `${index + 1}. ${c.label}${c.description ? ` (${c.description})` : ''}`,
-      )
-      .join('\n');
-    return [
-      'Khóa học này có nhiều lớp. Vui lòng chọn lớp cụ thể để ghi danh:',
-      rows,
-      '',
-      'Bạn muốn ghi danh vào lớp nào? (trả lời theo số thứ tự hoặc tên lớp)',
-    ].join('\n');
-  }
-
-  private classCandidateOption(c: any): EntityOption {
-    return {
-      id: Number(c.id),
-      value: Number(c.id),
-      label: String(c.label || c.title || c.classCode || `#${c.id}`),
-      description: [c.classCode, c.status].filter(Boolean).join(' | '),
-      metadata: c,
-    };
   }
 
   /**
@@ -3107,39 +3098,28 @@ export class CopilotService {
           selected_class_id: option?.id || null,
           last_selected_class: option,
         };
-      case 'assign_student_to_class': {
+      case 'assign_teacher_to_course': {
         const row = (result || {}) as any;
-        // Kết quả GỘP nhiều học viên: chỉ chốt ngữ cảnh LỚP (không có "học
-        // viên vừa chọn" duy nhất).
-        if (row.bulk) {
-          return {
-            selected_class_id: Number(row.classId) || null,
-            selected_course_id: Number(row.courseId) || null,
-            last_candidates: { classes: [] },
-          };
-        }
-        // Kết quả từ addStudentToClass: enrollment kèm user + courseClass.course.
         return {
-          selected_student_id: Number(row.userId) || null,
-          selected_class_id: Number(row.classId) || null,
-          selected_course_id:
-            Number(row.courseClass?.courseId ?? row.courseClass?.course?.id) ||
-            null,
-          last_selected_student: this.toEntityOption(row.user),
-          last_selected_class: this.toEntityOption(row.courseClass),
-          last_selected_course: this.toEntityOption(row.courseClass?.course),
-          last_candidates: { classes: [] },
+          selected_course_id: Number(row.courseId) || null,
+          last_selected_course: this.toEntityOption(row.course),
         };
       }
       case 'assign_student_to_course': {
         const row = (result || {}) as any;
+        // Kết quả GỘP nhiều học viên: chỉ chốt ngữ cảnh KHÓA (không có "học
+        // viên vừa chọn" duy nhất).
+        if (row.bulk) {
+          return {
+            selected_course_id: Number(row.courseId) || null,
+            last_candidates: { classes: [] },
+          };
+        }
         return {
           selected_student_id: Number(row.studentId ?? row.userId) || null,
           selected_course_id: Number(row.courseId) || null,
-          selected_class_id: Number(row.classId) || null,
           last_selected_student: this.toEntityOption(row.user),
           last_selected_course: this.toEntityOption(row.course),
-          last_selected_class: this.toEntityOption(row.courseClass),
           last_candidates: { classes: [] },
         };
       }
@@ -3163,8 +3143,16 @@ export class CopilotService {
   ): Promise<ProactiveSuggestion[]> {
     try {
       if (toolName === 'create_class') {
+        // Ghi danh chỉ còn ở cấp KHÓA -> gợi ý thêm học viên vào KHÓA chứa lớp
+        // vừa tạo (học viên sẽ vào tất cả lớp ACTIVE của khóa).
         const newClass = patch.last_created_class;
         if (!newClass?.id) return [];
+        const meta = (newClass.metadata || {}) as Record<string, any>;
+        const courseId = Number(meta.courseId ?? meta.course?.id) || null;
+        if (!courseId) return [];
+        const courseLabel =
+          (typeof meta.course?.title === 'string' && meta.course.title) ||
+          `#${courseId}`;
         const student =
           state.last_created_student ||
           state.last_selected_student ||
@@ -3173,17 +3161,17 @@ export class CopilotService {
         return [
           {
             id: `post-create-class-enroll-${newClass.id}`,
-            title: `Thêm học viên vào lớp ${newClass.label}`,
-            message: `Gợi ý: thêm ${student.label} — học viên tạo gần đây — vào lớp này.`,
-            intent: 'assign_student_to_class',
-            draft_message: `Thêm học viên ${student.label} #${student.id} vào lớp ${newClass.label}`,
+            title: `Thêm học viên vào khóa ${courseLabel}`,
+            message: `Gợi ý: ghi danh ${student.label} — học viên tạo gần đây — vào khóa này (tất cả lớp đang hoạt động).`,
+            intent: 'assign_student_to_course',
+            draft_message: `Thêm học viên ${student.label} #${student.id} vào khóa ${courseLabel}`,
             priority: 1,
             action: {
               type: 'suggestion_action',
-              action: 'assign_student_to_class',
+              action: 'assign_student_to_course',
               input: {
                 userId: Number(student.id),
-                classId: Number(newClass.id),
+                courseId,
               },
               source: 'post_create_class_suggestion',
             },
@@ -3194,25 +3182,25 @@ export class CopilotService {
       if (toolName === 'create_student') {
         const newStudent = patch.last_created_student;
         if (!newStudent?.id) return [];
-        const cls =
-          state.last_created_class ||
-          state.last_selected_class ||
-          (await this.findLatestClassOption(tenantId));
-        if (!cls?.id) return [];
+        const course =
+          state.last_created_course ||
+          state.last_selected_course ||
+          (await this.findLatestCourseOption(tenantId));
+        if (!course?.id) return [];
         return [
           {
             id: `post-create-student-enroll-${newStudent.id}`,
-            title: `Thêm ${newStudent.label} vào lớp ${cls.label}`,
-            message: `Gợi ý: ghi danh học viên vừa tạo vào lớp mới nhất (${cls.label}).`,
-            intent: 'assign_student_to_class',
-            draft_message: `Thêm học viên ${newStudent.label} #${newStudent.id} vào lớp ${cls.label}`,
+            title: `Thêm ${newStudent.label} vào khóa ${course.label}`,
+            message: `Gợi ý: ghi danh học viên vừa tạo vào khóa ${course.label} (tất cả lớp đang hoạt động).`,
+            intent: 'assign_student_to_course',
+            draft_message: `Thêm học viên ${newStudent.label} #${newStudent.id} vào khóa ${course.label}`,
             priority: 1,
             action: {
               type: 'suggestion_action',
-              action: 'assign_student_to_class',
+              action: 'assign_student_to_course',
               input: {
                 userId: Number(newStudent.id),
-                classId: Number(cls.id),
+                courseId: Number(course.id),
               },
               source: 'post_create_student_suggestion',
             },
@@ -3235,14 +3223,14 @@ export class CopilotService {
     return this.toEntityOption(student);
   }
 
-  private async findLatestClassOption(
+  private async findLatestCourseOption(
     tenantId: number,
   ): Promise<EntityOption | null> {
-    const cls = await this.prisma.courseClass.findFirst({
+    const course = await this.prisma.course.findFirst({
       where: { tenantId, status: 'ACTIVE' },
       orderBy: { createdAt: 'desc' },
     });
-    return this.toEntityOption(cls);
+    return this.toEntityOption(course);
   }
 
   private toEntityOption(value: unknown): EntityOption | null {

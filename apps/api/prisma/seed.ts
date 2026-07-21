@@ -34,8 +34,8 @@ async function main() {
   const admin = await prisma.user.create({
     data: {
       tenantId: tenant.id,
-      fullName: 'Nguyễn Văn Admin',
-      email: 'admin@hxstu.edu.vn',
+      fullName: 'ToanXiuuu',
+      email: 'xiuuu@hxstu.com.vn',
       phone: '0988888888',
       password: adminPasswordHash,
       role: 'ADMIN',

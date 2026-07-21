@@ -6,7 +6,6 @@ import {
   Param,
   ParseIntPipe,
   Patch,
-  Post,
   UseGuards,
 } from '@nestjs/common';
 import { Roles } from '../auth/roles.decorator';
@@ -18,7 +17,6 @@ import {
 } from '../common/decorators/get-actor.decorator';
 import { CoursesService } from './courses.service';
 import { UpdateClassDto } from './dto/update-class.dto';
-import { AddStudentToClassDto } from './dto/add-student-to-class.dto';
 
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles('ADMIN')
@@ -59,15 +57,8 @@ export class ClassesController {
     return this.coursesService.getClassStudents(actor.tenantId, id);
   }
 
-  @Post(':id/students')
-  async addStudent(
-    @GetActor() actor: ActorPayload,
-    @Param('id', ParseIntPipe) id: number,
-    @Body() dto: AddStudentToClassDto,
-  ) {
-    return this.coursesService.addStudentToClass(actor.tenantId, id, dto);
-  }
-
+  // POST :id/students đã bị gỡ: ghi danh chỉ còn ở cấp KHÓA (POST /enrollments
+  // ghi vào tất cả lớp ACTIVE). Gỡ học viên khỏi 1 lớp vẫn giữ cho ngoại lệ.
   @Delete(':id/students/:studentId')
   async removeStudent(
     @GetActor() actor: ActorPayload,

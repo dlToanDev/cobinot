@@ -311,7 +311,7 @@ describe('AgentRunnerService', () => {
     expect(result.message).toContain('Bạn muốn thêm học viên nào vào lớp?');
   });
 
-  it('agentic loop 2 bước: search_student READ rồi assign_student_to_class WRITE', async () => {
+  it('agentic loop 2 bước: search_student READ rồi assign_student_to_course WRITE', async () => {
     aiModel.callWithTools
       .mockResolvedValueOnce({
         type: 'tool_call',
@@ -324,15 +324,15 @@ describe('AgentRunnerService', () => {
       .mockResolvedValueOnce({
         type: 'tool_call',
         toolCall: {
-          name: 'assign_student_to_class',
-          args: { userId: 3, classId: 8 },
+          name: 'assign_student_to_course',
+          args: { userId: 3, courseId: 8 },
           callId: 'call_write',
         },
       });
     toolExecutor.executeRead.mockResolvedValue([{ id: 3, fullName: 'An' }]);
 
     const result = await service.run(
-      baseRunInput({ userMessage: 'thêm An vào lớp 8' }),
+      baseRunInput({ userMessage: 'thêm An vào khóa 8' }),
     );
 
     expect(toolExecutor.executeRead).toHaveBeenCalledTimes(1);
@@ -340,8 +340,8 @@ describe('AgentRunnerService', () => {
       expect.objectContaining({
         type: 'pending_write',
         pendingAction: expect.objectContaining({
-          tool_name: 'assign_student_to_class',
-          input: { userId: 3, classId: 8 },
+          tool_name: 'assign_student_to_course',
+          input: { userId: 3, courseId: 8 },
         }),
       }),
     );

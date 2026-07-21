@@ -16,7 +16,6 @@ export default function ClassDetailPage() {
   const [course, setCourse] = useState<any>(null);
   const [classDetail, setClassDetail] = useState<any>(null);
   const [enrolledStudents, setEnrolledStudents] = useState<any[]>([]);
-  const [students, setStudents] = useState<any[]>([]);
   const [allCourses, setAllCourses] = useState<
     Array<{ id: number; title: string; courseCode?: string | null }>
   >([]);
@@ -26,15 +25,10 @@ export default function ClassDetailPage() {
   // Tab State
   const [activeTab, setActiveTab] = useState<"info" | "students" | "schedule" | "assignments">("students");
 
-  // Modals & sub-state
-  const [showAddStudent, setShowAddStudent] = useState(false);
+  // Modals & sub-state (thêm học viên vào LỚP đã bị gỡ — ghi danh chỉ còn ở
+  // cấp KHÓA tại /enrollments/[courseId]; trang này chỉ xem + gỡ học viên).
   const [confirmRemoveStudent, setConfirmRemoveStudent] = useState<any>(null);
   const [studentsLoading, setStudentsLoading] = useState(false);
-
-  // Student Enrollment Fields
-  const [selectedStudentId, setSelectedStudentId] = useState("");
-  const [roleInClass, setRoleInClass] = useState("STUDENT");
-  const [joinedAt, setJoinedAt] = useState(new Date().toISOString().substring(0, 10));
 
   // Edit Class Form fields (Info tab)
   const [editClassCode, setEditClassCode] = useState("");
@@ -77,17 +71,15 @@ export default function ClassDetailPage() {
     setLoading(true);
     setError("");
     try {
-      const [classRes, studentsRes, allStudentsRes, courseRes, coursesRes] =
+      const [classRes, studentsRes, courseRes, coursesRes] =
         await Promise.all([
           apiClient.get(`/classes/${classId}`),
           apiClient.get(`/classes/${classId}/students`),
-          apiClient.get("/students"),
           apiClient.get(`/courses/${courseId}`),
           apiClient.get("/courses"),
         ]);
       setClassDetail(classRes.data);
       setEnrolledStudents(studentsRes.data);
-      setStudents(allStudentsRes.data);
       setCourse(courseRes.data);
       const courseList = Array.isArray(coursesRes.data) ? coursesRes.data : [];
       setAllCourses(courseList);
@@ -162,30 +154,6 @@ export default function ClassDetailPage() {
       setError(err.response?.data?.message || "Không thể cập nhật lớp học");
     } finally {
       setEditLoading(false);
-    }
-  };
-
-  const handleAddStudent = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedStudentId) return;
-    setError("");
-    try {
-      await apiClient.post(`/classes/${classId}/students`, {
-        userId: Number(selectedStudentId),
-        roleInClass,
-        joinedAt,
-      });
-      setSelectedStudentId("");
-      setRoleInClass("STUDENT");
-      setShowAddStudent(false);
-      // refresh student list
-      setStudentsLoading(true);
-      const res = await apiClient.get(`/classes/${classId}/students`);
-      setEnrolledStudents(res.data);
-    } catch (err: any) {
-      alert(err.response?.data?.message || "Không thể thêm học viên");
-    } finally {
-      setStudentsLoading(false);
     }
   };
 
@@ -274,9 +242,6 @@ export default function ClassDetailPage() {
       },
     ];
   };
-
-  const existingStudentIds = new Set(enrolledStudents.map((item) => Number(item.student?.id)));
-  const selectableStudents = students.filter((student) => !existingStudentIds.has(student.id));
 
   return (
     <div className="bg-slate-50 min-h-screen text-slate-800 font-sans flex flex-col">
@@ -547,19 +512,16 @@ export default function ClassDetailPage() {
                     <div className="flex justify-between items-center pb-4 border-b border-slate-100">
                       <div>
                         <h2 className="text-xl font-extrabold text-slate-900">Danh Sách Thành Viên</h2>
-                        <p className="text-slate-500 text-xs font-medium">Ghi danh, bổ nhiệm và quản lý sĩ số lớp học</p>
+                        <p className="text-slate-500 text-xs font-medium">
+                          Xem và quản lý sĩ số lớp học. Thêm học viên được thực hiện tại trang ghi danh khóa (vào tất cả lớp đang hoạt động).
+                        </p>
                       </div>
-                      <button
-                        onClick={() => {
-                          setSelectedStudentId("");
-                          setRoleInClass("STUDENT");
-                          setJoinedAt(new Date().toISOString().substring(0, 10));
-                          setShowAddStudent(true);
-                        }}
-                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-xl shadow-sm transition"
+                      <Link
+                        href={`/enrollments/${courseId}`}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-sm font-bold rounded-xl shadow-sm transition whitespace-nowrap"
                       >
-                        + Thêm học viên
-                      </button>
+                        + Ghi danh vào khóa
+                      </Link>
                     </div>
 
                     {studentsLoading ? (
@@ -568,7 +530,11 @@ export default function ClassDetailPage() {
                       </div>
                     ) : enrolledStudents.length === 0 ? (
                       <div className="p-12 text-center text-slate-400 font-medium">
-                        Lớp học chưa có học viên nào tham gia. Hãy thêm học viên mới.
+                        Lớp học chưa có học viên nào tham gia. Hãy ghi danh học viên tại trang{" "}
+                        <Link href={`/enrollments/${courseId}`} className="text-indigo-600 font-bold hover:underline">
+                          ghi danh khóa
+                        </Link>{" "}
+                        — học viên sẽ được thêm vào tất cả lớp đang hoạt động của khóa.
                       </div>
                     ) : (
                       <div className="overflow-x-auto">
@@ -761,76 +727,6 @@ export default function ClassDetailPage() {
           </div>
         )}
       </div>
-
-      {/* Add Student Modal */}
-      {showAddStudent && (
-        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-in fade-in duration-200">
-          <div className="w-full max-w-md bg-white border border-slate-105 p-6 rounded-2xl shadow-xl relative text-slate-800 animate-in zoom-in-95 duration-200">
-            <h3 className="text-lg font-bold mb-1 text-slate-900">
-              Thêm Học Viên Vào Lớp
-            </h3>
-            <p className="text-slate-500 text-xs mb-5 font-medium">
-              Lớp: <strong className="text-slate-800">{classDetail?.title}</strong>
-            </p>
-            <form onSubmit={handleAddStudent} className="space-y-4">
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Chọn học viên *</label>
-                <select
-                  value={selectedStudentId}
-                  onChange={(e) => setSelectedStudentId(e.target.value)}
-                  className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
-                  required
-                >
-                  <option value="">-- Chọn học viên từ hệ thống --</option>
-                  {selectableStudents.map((student) => (
-                    <option key={student.id} value={student.id}>
-                      {student.fullName} ({student.email || student.phone || "Không có liên hệ"})
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Vai trò trong lớp</label>
-                  <select
-                    value={roleInClass}
-                    onChange={(e) => setRoleInClass(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
-                  >
-                    <option value="STUDENT">Học viên (STUDENT)</option>
-                    <option value="TEACHER">Giáo viên (TEACHER)</option>
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1.5">Ngày tham gia</label>
-                  <input
-                    type="date"
-                    value={joinedAt}
-                    onChange={(e) => setJoinedAt(e.target.value)}
-                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-slate-800 focus:outline-none focus:bg-white focus:border-indigo-600 focus:ring-1 focus:ring-indigo-600 text-sm transition-all duration-150"
-                    required
-                  />
-                </div>
-              </div>
-              <div className="flex justify-end gap-2.5 pt-4 mt-6 border-t border-slate-100">
-                <button
-                  type="button"
-                  onClick={() => setShowAddStudent(false)}
-                  className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-semibold transition cursor-pointer"
-                >
-                  Hủy
-                </button>
-                <button
-                  type="submit"
-                  className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-bold transition shadow-sm cursor-pointer"
-                >
-                  Thêm vào lớp
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Confirm Remove Student Modal */}
       {confirmRemoveStudent && (

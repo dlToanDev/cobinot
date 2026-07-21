@@ -268,22 +268,19 @@ export class ToolRegistryService {
           'CLOSED',
           this.optionalString(input.expectedStatus),
         );
-      case 'assign_student_to_class':
-        // Bản gộp: userIds[] -> thêm từng người, partial success (người lỗi
-        // không làm hỏng người khác), trả kết quả theo từng dòng.
-        if (Array.isArray(input.userIds) && input.userIds.length > 0) {
-          return this.assignStudentsToClass(tenantId, input);
-        }
-        return this.coursesService.addStudentToClass(
+      case 'assign_teacher_to_course':
+        // Giáo viên "cầm khóa" = phụ trách TẤT CẢ lớp ACTIVE của khóa.
+        return this.coursesService.assignTeacherToCourseClasses(
           tenantId,
-          this.requireNumber(input.classId, 'classId'),
-          {
-            userId: this.requireNumber(input.userId, 'userId'),
-            roleInClass: this.optionalString(input.roleInClass) || 'STUDENT',
-            joinedAt: this.optionalDateString(input.joinedAt),
-          },
+          this.requireNumber(input.courseId, 'courseId'),
+          this.requireString(input.teacherName, 'teacherName'),
         );
       case 'assign_student_to_course':
+        // Bản gộp: userIds[] -> ghi danh từng người vào cả khóa, partial
+        // success (người lỗi không làm hỏng người khác).
+        if (Array.isArray(input.userIds) && input.userIds.length > 0) {
+          return this.assignStudentsToCourse(tenantId, input);
+        }
         return this.assignStudentToCourse(tenantId, input);
       case 'remove_student_from_class':
         return this.coursesService.removeStudentFromClass(
@@ -303,79 +300,11 @@ export class ToolRegistryService {
   }
 
   /**
-   * Ghi danh GỘP nhiều học viên vào 1 lớp: validate lớp 1 lần rồi thêm từng
-   * người. Partial success — người trùng/lỗi chỉ fail dòng đó, người còn lại
-   * vẫn được ghi. Trả kết quả từng dòng để FE hiển thị ✓/⚠/✗.
-   */
-  private async assignStudentsToClass(
-    tenantId: number,
-    input: Record<string, unknown>,
-  ) {
-    const classId = this.requireNumber(input.classId, 'classId');
-    const roleInClass = this.optionalString(input.roleInClass) || 'STUDENT';
-    const joinedAt = this.optionalDateString(input.joinedAt);
-    // Validate lớp TRƯỚC vòng lặp: lớp sai/đóng thì fail cả batch ngay, không
-    // tạo ra kết quả nửa vời khó hiểu.
-    const courseClass: any = await this.coursesService.findOneClass(
-      tenantId,
-      classId,
-    );
-
-    const userIds = (input.userIds as unknown[])
-      .map((value) => Number(value))
-      .filter((value) => Number.isFinite(value) && value > 0);
-
-    const items: Array<{
-      userId: number;
-      studentName: string | null;
-      status: 'SUCCESS' | 'ALREADY_IN_CLASS' | 'ERROR';
-      message: string | null;
-    }> = [];
-
-    for (const userId of userIds) {
-      try {
-        const enrollment: any = await this.coursesService.addStudentToClass(
-          tenantId,
-          classId,
-          { userId, roleInClass, joinedAt },
-        );
-        items.push({
-          userId,
-          studentName: enrollment?.user?.fullName || null,
-          status: 'SUCCESS',
-          message: null,
-        });
-      } catch (error: any) {
-        const message =
-          error?.response?.message || error?.message || 'Lỗi không xác định';
-        items.push({
-          userId,
-          studentName: null,
-          status:
-            error instanceof ConflictException ? 'ALREADY_IN_CLASS' : 'ERROR',
-          message: String(message),
-        });
-      }
-    }
-
-    return {
-      bulk: true,
-      classId,
-      className: courseClass?.title || courseClass?.classCode || null,
-      courseId: courseClass?.courseId ?? courseClass?.course?.id ?? null,
-      courseName: courseClass?.course?.title || null,
-      total: items.length,
-      successCount: items.filter((item) => item.status === 'SUCCESS').length,
-      items,
-    };
-  }
-
-  /**
-   * Ghi danh học viên vào KHÓA (contract ngoài cho Agent/FE). Bên trong map sang
-   * class vì DB ghi danh theo class:
-   * validate học viên -> validate khóa -> check trùng ghi danh khóa ->
-   * tìm class ACTIVE của khóa -> 1 class thì ghi danh; nhiều/không có class thì
-   * trả lỗi có code rõ ràng cho CopilotService xử lý.
+   * Ghi danh học viên vào KHÓA = thêm vào TẤT CẢ lớp ACTIVE của khóa tại thời
+   * điểm confirm (lớp mở sau tự có học viên nhờ createClass auto-enroll).
+   * Lớp đã có sẵn được skip,
+   * lớp còn lại vẫn ghi. Logic ghi nằm ở
+   * CoursesService.enrollStudentToAllActiveClasses (dùng chung với REST).
    */
   private async assignStudentToCourse(
     tenantId: number,
@@ -383,14 +312,8 @@ export class ToolRegistryService {
   ) {
     const userId = this.requireNumber(input.userId, 'userId');
     const courseId = this.requireNumber(input.courseId, 'courseId');
-    const explicitClassId = this.optionalNumber(input.classId);
-    const joinedAt = this.optionalDateString(input.joinedAt);
-    const roleInClass = this.optionalString(input.roleInClass) || 'STUDENT';
-    const expireDate = this.optionalDateString(input.expireDate);
-    const allowLatePayment = this.optionalBoolean(input.allowLatePayment);
-    const note = this.optionalString(input.note);
 
-    // 1. Validate học viên
+    // Validate trước để trả code rõ ràng cho CopilotService xử lý.
     try {
       await this.usersService.findOneStudent(tenantId, userId);
     } catch {
@@ -399,8 +322,6 @@ export class ToolRegistryService {
         message: 'Không tìm thấy học viên cần ghi danh.',
       });
     }
-
-    // 2. Validate khóa
     try {
       await this.coursesService.findOneCourse(tenantId, courseId);
     } catch {
@@ -410,98 +331,99 @@ export class ToolRegistryService {
       });
     }
 
-    // 3. Check học viên đã ghi danh khóa này chưa
-    const existingEnrollment = await this.findEnrollmentByStudentAndCourse(
+    return this.coursesService.enrollStudentToAllActiveClasses(
       tenantId,
-      userId,
       courseId,
+      userId,
+      {
+        roleInClass: this.optionalString(input.roleInClass) || 'STUDENT',
+        joinedAt: this.optionalDateString(input.joinedAt),
+        expireDate: this.optionalDateString(input.expireDate),
+        allowLatePayment: this.optionalBoolean(input.allowLatePayment),
+        note: this.optionalString(input.note),
+      },
     );
-    if (existingEnrollment) {
-      throw new ConflictException({
-        code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
-        message: 'Học viên này đã được ghi danh vào khóa học.',
-        studentId: userId,
-        courseId,
+  }
+
+  /**
+   * Ghi danh GỘP nhiều học viên vào cả khóa. Partial success — người trùng/lỗi
+   * chỉ fail dòng đó, người còn lại vẫn được ghi. Trả kết quả từng dòng
+   * (kèm per-class enrolled/skipped) để FE hiển thị ✓/⚠/✗.
+   */
+  private async assignStudentsToCourse(
+    tenantId: number,
+    input: Record<string, unknown>,
+  ) {
+    const courseId = this.requireNumber(input.courseId, 'courseId');
+    const roleInClass = this.optionalString(input.roleInClass) || 'STUDENT';
+    const joinedAt = this.optionalDateString(input.joinedAt);
+    const expireDate = this.optionalDateString(input.expireDate);
+    const allowLatePayment = this.optionalBoolean(input.allowLatePayment);
+    const note = this.optionalString(input.note);
+
+    // Validate khóa TRƯỚC vòng lặp: khóa sai thì fail cả batch ngay.
+    let course: any;
+    try {
+      course = await this.coursesService.findOneCourse(tenantId, courseId);
+    } catch {
+      throw new BadRequestException({
+        code: 'COURSE_NOT_FOUND',
+        message: 'Không tìm thấy khóa học cần ghi danh.',
       });
     }
 
-    // 4. Xác định class đích trong khóa
-    let targetClassId = explicitClassId;
-    if (!targetClassId) {
-      const classes = await this.coursesService.findClassesForCourse(
-        tenantId,
-        courseId,
-      );
-      // Chỉ lớp ACTIVE mới ghi danh được — phải khớp guard trong
-      // CoursesService.addStudentToClass, nếu không sẽ chọn được lớp
-      // ở đây rồi fail lúc ghi.
-      const activeClasses = classes.filter(
-        (c: any) => String(c.status) === 'ACTIVE',
-      );
+    const userIds = (input.userIds as unknown[])
+      .map((value) => Number(value))
+      .filter((value) => Number.isFinite(value) && value > 0);
 
-      if (activeClasses.length === 0) {
-        throw new BadRequestException({
-          code: 'COURSE_HAS_NO_ACTIVE_CLASS',
-          message:
-            'Khóa học này chưa có lớp đang hoạt động nên chưa thể ghi danh học viên.',
-          courseId,
+    const items: Array<{
+      userId: number;
+      studentName: string | null;
+      status: 'SUCCESS' | 'ALREADY_IN_COURSE' | 'ERROR';
+      enrolled: any[];
+      skippedExisting: any[];
+      message: string | null;
+    }> = [];
+
+    for (const userId of userIds) {
+      try {
+        const result: any =
+          await this.coursesService.enrollStudentToAllActiveClasses(
+            tenantId,
+            courseId,
+            userId,
+            { roleInClass, joinedAt, expireDate, allowLatePayment, note },
+          );
+        items.push({
+          userId,
+          studentName: result?.user?.fullName || null,
+          status: 'SUCCESS',
+          enrolled: result?.enrolled || [],
+          skippedExisting: result?.skippedExisting || [],
+          message: null,
+        });
+      } catch (error: any) {
+        const message =
+          error?.response?.message || error?.message || 'Lỗi không xác định';
+        items.push({
+          userId,
+          studentName: null,
+          status:
+            error instanceof ConflictException ? 'ALREADY_IN_COURSE' : 'ERROR',
+          enrolled: [],
+          skippedExisting: [],
+          message: String(message),
         });
       }
-
-      if (activeClasses.length > 1) {
-        throw new BadRequestException({
-          code: 'COURSE_HAS_MULTIPLE_CLASSES',
-          message:
-            'Khóa học này có nhiều lớp. Vui lòng chọn lớp cụ thể để ghi danh.',
-          courseId,
-          classes: activeClasses.map((c: any) => this.toSafeClassOption(c)),
-        });
-      }
-
-      targetClassId = activeClasses[0].id;
     }
 
-    // 5. Ghi danh vào class (dùng service nghiệp vụ, không gọi Prisma trực tiếp)
-    const enrollment = await this.coursesService.addStudentToClass(
-      tenantId,
-      targetClassId,
-      {
-        userId,
-        roleInClass,
-        joinedAt,
-        expireDate,
-        allowLatePayment,
-        note,
-      },
-    );
-
     return {
-      id: enrollment.id,
-      enrollmentId: enrollment.id,
-      studentId: userId,
-      userId,
+      bulk: true,
       courseId,
-      classId: targetClassId,
-      roleInClass: enrollment.roleInClass,
-      joinedAt: enrollment.joinedAt,
-      // Trả giá trị ĐÃ LƯU trong ClassEnrollment (không phải input echo).
-      expireDate: (enrollment as any).expireDate ?? null,
-      allowLatePayment: (enrollment as any).allowLatePayment ?? null,
-      note: (enrollment as any).note ?? null,
-      user: enrollment.user,
-      course: (enrollment as any).courseClass?.course,
-      courseClass: (enrollment as any).courseClass,
-    };
-  }
-
-  private toSafeClassOption(c: any) {
-    return {
-      id: Number(c.id),
-      value: Number(c.id),
-      label: String(c.title || c.classCode || `#${c.id}`),
-      classCode: c.classCode ?? null,
-      status: c.status ?? null,
-      courseId: c.courseId ?? null,
+      courseName: course?.title || course?.courseCode || null,
+      total: items.length,
+      successCount: items.filter((item) => item.status === 'SUCCESS').length,
+      items,
     };
   }
 
@@ -533,9 +455,9 @@ export class ToolRegistryService {
       create_class: { eventType: 'CREATE', entityType: 'COURSE_CLASS' },
       update_class: { eventType: 'UPDATE', entityType: 'COURSE_CLASS' },
       close_class: { eventType: 'CLOSE', entityType: 'COURSE_CLASS' },
-      assign_student_to_class: {
-        eventType: 'ASSIGN',
-        entityType: 'CLASS_ENROLLMENT',
+      assign_teacher_to_course: {
+        eventType: 'UPDATE',
+        entityType: 'COURSE_CLASS',
       },
       assign_student_to_course: {
         eventType: 'ASSIGN',

@@ -71,7 +71,7 @@ export const WRITE_TOOL_NAMES: string[] = [
   'create_class',
   'update_class',
   'close_class',
-  'assign_student_to_class',
+  'assign_teacher_to_course',
   'assign_student_to_course',
   'remove_student_from_class',
   'remove_student_from_course_classes',
@@ -363,23 +363,17 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
   {
     type: 'function',
     function: {
-      name: 'assign_student_to_class',
+      name: 'assign_teacher_to_course',
       description:
-        'Thêm học viên vào một lớp học cụ thể. Nhiều học viên cùng lúc thì dùng userIds (1 lần gọi cho cả nhóm, KHÔNG gọi lặp từng người).',
+        'Gán giáo viên phụ trách cả KHÓA học — cập nhật teacherName cho TẤT CẢ lớp đang hoạt động (ACTIVE) của khóa. ' +
+        'Chỉ dùng khi user nói giáo viên cầm/dạy/phụ trách cả KHÓA; nếu user chỉ định 1 LỚP cụ thể thì dùng update_class với teacherName.',
       parameters: {
         type: 'object',
         properties: {
-          userId: numberField('ID học viên (khi chỉ thêm 1 người)'),
-          userIds: {
-            type: 'array',
-            items: { type: 'number' },
-            description: 'Danh sách ID học viên khi thêm NHIỀU người cùng lúc',
-          },
-          classId: numberField('ID lớp học'),
-          roleInClass: stringField('Vai trò trong lớp', ['STUDENT', 'TEACHER']),
-          joinedAt: stringField('Ngày tham gia dạng YYYY-MM-DD'),
+          courseId: numberField('ID khóa học'),
+          teacherName: stringField('Tên giáo viên phụ trách'),
         },
-        required: ['classId'],
+        required: ['courseId', 'teacherName'],
       },
     },
   },
@@ -388,12 +382,21 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
     function: {
       name: 'assign_student_to_course',
       description:
-        'Ghi danh một học viên vào một khóa học. Dùng khi user nói thêm/ghi danh học viên vào khóa học (không nói rõ lớp cụ thể).',
+        'Ghi danh học viên vào KHÓA học — hệ thống tự thêm vào TẤT CẢ lớp đang hoạt động (ACTIVE) của khóa. ' +
+        'Đây là tool ghi danh DUY NHẤT (không có ghi danh theo lớp). ' +
+        'Nhiều học viên cùng lúc thì dùng userIds (1 lần gọi cho cả nhóm, KHÔNG gọi lặp từng người).',
       parameters: {
         type: 'object',
         properties: {
-          userId: numberField('ID học viên cần ghi danh'),
+          userId: numberField('ID học viên cần ghi danh (khi chỉ 1 người)'),
+          userIds: {
+            type: 'array',
+            items: { type: 'number' },
+            description:
+              'Danh sách ID học viên khi ghi danh NHIỀU người cùng lúc',
+          },
           courseId: numberField('ID khóa học cần ghi danh'),
+          joinedAt: stringField('Ngày tham gia dạng YYYY-MM-DD'),
           expireDate: stringField(
             'Ngày hết hạn học/ghi danh nếu user cung cấp, định dạng ISO yyyy-mm-dd',
           ),
@@ -404,7 +407,7 @@ export const FULL_AGENT_TOOLS: AgentToolDefinition[] = [
           },
           note: stringField('Ghi chú thêm nếu có'),
         },
-        required: ['userId', 'courseId'],
+        required: ['courseId'],
       },
     },
   },
@@ -471,10 +474,10 @@ export function isWriteTool(name: unknown): name is AiToolName {
 /**
  * Danh sách tool được phép trong bản Copilot mini — 7 nghiệp vụ:
  * tạo học viên, tạo khóa học, tạo lớp học trong khóa (WEEKLY/EXAM_PRACTICE),
- * thêm học viên vào LỚP học (assign_student_to_class),
+ * ghi danh học viên vào KHÓA học (assign_student_to_course — tự thêm vào
+ * TẤT CẢ lớp ACTIVE của khóa; ghi danh theo lớp đã bị xóa hẳn),
  * và sửa thông tin học viên/khóa học/lớp học (update_*).
- * Ghi danh cấp khóa (assign_student_to_course) KHÔNG expose để LLM không gọi nhầm;
- * mọi tool xóa/đóng/gỡ vẫn bị chặn.
+ * Mọi tool xóa/đóng/gỡ vẫn bị chặn.
  */
 export const MINI_AGENT_TOOL_NAMES = [
   'search_student',
@@ -490,7 +493,8 @@ export const MINI_AGENT_TOOL_NAMES = [
   'update_student',
   'update_course',
   'update_class',
-  'assign_student_to_class',
+  'assign_teacher_to_course',
+  'assign_student_to_course',
   'ask_clarification',
 ] as const;
 

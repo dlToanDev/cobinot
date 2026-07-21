@@ -512,10 +512,36 @@ export class CoursesService {
         });
       }
 
+      // Ghi danh theo KHÓA: học viên đã có trong khóa được TỰ ĐỘNG thêm vào
+      // lớp mới mở (không phải ghi danh bổ sung thủ công từng lớp).
+      const existingEnrollments = await tx.classEnrollment.findMany({
+        where: {
+          roleInClass: 'STUDENT',
+          courseClass: { tenantId, courseId: input.courseId },
+        },
+        select: { userId: true },
+      });
+      const courseStudentIds = [
+        ...new Set(existingEnrollments.map((item) => item.userId)),
+      ];
+      if (courseStudentIds.length) {
+        await tx.classEnrollment.createMany({
+          data: courseStudentIds.map((userId) => ({
+            userId,
+            classId: courseClass.id,
+            roleInClass: 'STUDENT',
+          })),
+          skipDuplicates: true,
+        });
+      }
+
       return {
         ...courseClass,
         course: courseClass.course || course,
         sessions,
+        // Số học viên của khóa được tự thêm vào lớp mới (hiện trong message).
+        autoEnrolledCount: courseStudentIds.length,
+        studentCount: courseStudentIds.length,
       };
     });
   }
@@ -739,17 +765,24 @@ export class CoursesService {
   async getClassDetail(tenantId: number, classId: number) {
     const courseClass = await this.findOneClass(tenantId, classId);
     const students = await this.getClassStudents(tenantId, classId);
+    // Lịch học kèm giờ/phòng để card chi tiết hiển thị đầy đủ thông số.
+    const sessions = await this.prisma.classSession.findMany({
+      where: { classId },
+      orderBy: [{ dayOfWeek: 'asc' }, { startTime: 'asc' }],
+    });
 
     return {
       ...courseClass,
       students,
       enrollments: students,
+      sessions,
       studentCount: students.length,
       totalMembers: students.length,
       _count: {
         ...(courseClass._count || {}),
         students: students.length,
         enrollments: students.length,
+        sessions: sessions.length,
       },
     };
   }
@@ -800,6 +833,7 @@ export class CoursesService {
         classId,
         roleInClass,
         joinedAt: dto.joinedAt ? new Date(dto.joinedAt) : undefined,
+        endedAt: dto.endedAt ? new Date(dto.endedAt) : undefined,
         expireDate: dto.expireDate ? new Date(dto.expireDate) : undefined,
         allowLatePayment: dto.allowLatePayment,
         note: dto.note,
@@ -809,6 +843,175 @@ export class CoursesService {
         courseClass: { include: { course: true } },
       },
     });
+  }
+
+  /**
+   * Gán giáo viên phụ trách CẢ KHÓA = set teacherName cho TẤT CẢ lớp ACTIVE
+   * của khóa (lớp CLOSED giữ nguyên giáo viên cũ làm lịch sử). Muốn đổi giáo
+   * viên MỘT lớp cụ thể thì dùng updateClass với teacherName như bình thường.
+   */
+  async assignTeacherToCourseClasses(
+    tenantId: number,
+    courseId: number,
+    teacherName: string,
+  ) {
+    const course = await this.findOneCourse(tenantId, courseId);
+    const name = normalizeTitleCase(teacherName.trim());
+    if (!name) {
+      throw new BadRequestException('Thiếu tên giáo viên');
+    }
+
+    const activeClasses = await this.prisma.courseClass.findMany({
+      where: { tenantId, courseId, status: 'ACTIVE' },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (activeClasses.length === 0) {
+      throw new BadRequestException({
+        code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+        message:
+          'Khóa học này chưa có lớp đang hoạt động nên chưa thể gán giáo viên.',
+        courseId,
+      });
+    }
+
+    await this.prisma.courseClass.updateMany({
+      where: { id: { in: activeClasses.map((cls) => cls.id) } },
+      data: { teacherName: name },
+    });
+
+    return {
+      id: course.id,
+      courseId: course.id,
+      course,
+      teacherName: name,
+      totalActiveClasses: activeClasses.length,
+      updated: activeClasses.map((cls) => ({
+        classId: cls.id,
+        classTitle: cls.title || cls.classCode || `#${cls.id}`,
+        classCode: cls.classCode ?? null,
+        previousTeacherName: cls.teacherName ?? null,
+      })),
+    };
+  }
+
+  /**
+   * Ghi danh 1 học viên vào TẤT CẢ lớp ACTIVE của khóa — hàm dùng chung cho
+   * REST POST /enrollments và tool assign_student_to_course của Copilot.
+   * - 0 lớp ACTIVE -> COURSE_HAS_NO_ACTIVE_CLASS (không auto-tạo lớp default).
+   * - Đã có mặt ở TẤT CẢ lớp ACTIVE -> STUDENT_ALREADY_ASSIGNED_TO_COURSE.
+   * - Lớp đã có sẵn -> skippedExisting, lớp còn lại vẫn được ghi.
+   * "Tất cả lớp" = lớp ACTIVE tại thời điểm gọi; chiều ngược lại createClass
+   * tự thêm học viên của khóa vào lớp mới nên 2 chiều luôn đồng bộ.
+   */
+  async enrollStudentToAllActiveClasses(
+    tenantId: number,
+    courseId: number,
+    userId: number,
+    options: {
+      roleInClass?: string;
+      joinedAt?: string;
+      endedAt?: string;
+      expireDate?: string;
+      allowLatePayment?: boolean;
+      note?: string;
+    } = {},
+  ) {
+    const course = await this.findOneCourse(tenantId, courseId);
+    if (course.status !== 'ACTIVE') {
+      throw new BadRequestException({
+        code: 'COURSE_NOT_ACTIVE',
+        message: 'Không thể ghi danh vào khóa học đã đóng/bảo lưu.',
+        courseId,
+      });
+    }
+
+    const roleInClass = options.roleInClass || 'STUDENT';
+    const user = await this.prisma.user.findFirst({
+      where: { id: userId, tenantId },
+    });
+    if (!user) {
+      throw new NotFoundException(
+        'Học viên không tồn tại hoặc không thuộc trung tâm này',
+      );
+    }
+    if (roleInClass === 'STUDENT' && user.role !== 'STUDENT') {
+      throw new BadRequestException('Thành viên này không phải là học viên');
+    }
+
+    const activeClasses = await this.prisma.courseClass.findMany({
+      where: { tenantId, courseId, status: 'ACTIVE' },
+      orderBy: { createdAt: 'asc' },
+    });
+    if (activeClasses.length === 0) {
+      throw new BadRequestException({
+        code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+        message:
+          'Khóa học này chưa có lớp đang hoạt động nên chưa thể ghi danh học viên.',
+        courseId,
+      });
+    }
+
+    const existing = await this.prisma.classEnrollment.findMany({
+      where: {
+        userId,
+        classId: { in: activeClasses.map((cls) => cls.id) },
+      },
+    });
+    const existingClassIds = new Set(existing.map((item) => item.classId));
+    if (existingClassIds.size === activeClasses.length) {
+      throw new ConflictException({
+        code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
+        message:
+          'Học viên đã có mặt trong tất cả lớp đang hoạt động của khóa học này.',
+        studentId: userId,
+        courseId,
+      });
+    }
+
+    const classSummary = (cls: any) => ({
+      classId: Number(cls.id),
+      classTitle: cls.title || cls.classCode || `#${cls.id}`,
+      classCode: cls.classCode ?? null,
+      classType: cls.type ?? null,
+    });
+
+    const enrolled: any[] = [];
+    const skippedExisting: any[] = [];
+    for (const cls of activeClasses) {
+      if (existingClassIds.has(cls.id)) {
+        skippedExisting.push(classSummary(cls));
+        continue;
+      }
+      const enrollment = await this.addStudentToClass(tenantId, cls.id, {
+        userId,
+        roleInClass,
+        joinedAt: options.joinedAt,
+        endedAt: options.endedAt,
+        expireDate: options.expireDate,
+        allowLatePayment: options.allowLatePayment,
+        note: options.note,
+      });
+      enrolled.push({
+        ...classSummary(cls),
+        enrollmentId: enrollment.id,
+        roleInClass: enrollment.roleInClass,
+        joinedAt: enrollment.joinedAt,
+        endedAt: enrollment.endedAt,
+      });
+    }
+
+    return {
+      // id = enrollment đầu tiên vừa tạo (phục vụ audit log entityId).
+      id: enrolled[0]?.enrollmentId ?? null,
+      userId,
+      studentId: userId,
+      courseId,
+      user,
+      course,
+      totalActiveClasses: activeClasses.length,
+      enrolled,
+      skippedExisting,
+    };
   }
 
   async removeStudentFromClass(

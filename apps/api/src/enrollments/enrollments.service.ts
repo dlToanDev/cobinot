@@ -1,16 +1,19 @@
 import {
   Injectable,
   NotFoundException,
-  ConflictException,
   BadRequestException,
 } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { CoursesService } from '../courses/courses.service';
 import { CreateEnrollmentDto } from './dto/create-enrollment.dto';
 import { UpdateEnrollmentDto } from './dto/update-enrollment.dto';
 
 @Injectable()
 export class EnrollmentsService {
-  constructor(private prisma: PrismaService) {}
+  constructor(
+    private prisma: PrismaService,
+    private coursesService: CoursesService,
+  ) {}
 
   async findAll(
     tenantId: number,
@@ -81,6 +84,8 @@ export class EnrollmentsService {
       id: e.id,
       userId: e.userId,
       courseId: e.courseClass.courseId,
+      classId: e.classId,
+      className: e.courseClass.title || e.courseClass.classCode || null,
       roleInCourse: e.roleInClass,
       joinedAt: e.joinedAt,
       endedAt: e.endedAt,
@@ -90,67 +95,12 @@ export class EnrollmentsService {
     }));
   }
 
+  /**
+   * Ghi danh học viên vào KHÓA = thêm vào TẤT CẢ lớp ACTIVE của khóa
+   * (không còn auto-tạo "lớp default"; khóa 0 lớp ACTIVE -> lỗi yêu cầu tạo
+   * lớp trước). Response dạng per-class { enrolled[], skippedExisting[] }.
+   */
   async create(tenantId: number, dto: CreateEnrollmentDto) {
-    // Validate student exists, belongs to tenant, and role is STUDENT
-    const user = await this.prisma.user.findFirst({
-      where: {
-        id: dto.userId,
-        tenantId,
-      },
-    });
-
-    if (!user) {
-      throw new NotFoundException(
-        'Học viên không tồn tại hoặc không thuộc trung tâm này',
-      );
-    }
-
-    if (user.role !== 'STUDENT') {
-      throw new BadRequestException('Thành viên này không phải là học viên');
-    }
-
-    // Validate course exists, belongs to tenant, and status is ACTIVE
-    const course = await this.prisma.course.findFirst({
-      where: {
-        id: dto.courseId,
-        tenantId,
-      },
-    });
-
-    if (!course) {
-      throw new NotFoundException(
-        'Khóa học không tồn tại hoặc không thuộc trung tâm này',
-      );
-    }
-
-    if (course.status !== 'ACTIVE') {
-      throw new BadRequestException(
-        'Không thể đăng ký vào khóa học đã đóng/bảo lưu',
-      );
-    }
-
-    // Find or create the default class of this course
-    let defaultClass = await this.prisma.courseClass.findFirst({
-      where: {
-        courseId: dto.courseId,
-        tenantId,
-        classCode: `${course.courseCode}-DEFAULT`,
-      },
-    });
-
-    if (!defaultClass) {
-      defaultClass = await this.prisma.courseClass.create({
-        data: {
-          tenantId,
-          courseId: course.id,
-          classCode: `${course.courseCode}-DEFAULT`,
-          title: `${course.title} - Lớp mặc định`,
-          type: 'WEEKLY',
-          status: 'ACTIVE',
-        },
-      });
-    }
-
     const joinedAt = dto.joinedAt ? new Date(dto.joinedAt) : new Date();
     const endedAt = dto.endDate ? new Date(dto.endDate) : null;
 
@@ -160,47 +110,16 @@ export class EnrollmentsService {
       );
     }
 
-    // Check duplicate in ClassEnrollment
-    const existing = await this.prisma.classEnrollment.findFirst({
-      where: {
-        userId: dto.userId,
-        classId: defaultClass.id,
-      },
-    });
-
-    if (existing) {
-      throw new ConflictException('Học viên đã tham gia khóa học này từ trước');
-    }
-
-    const enrollment = await this.prisma.classEnrollment.create({
-      data: {
-        userId: dto.userId,
-        classId: defaultClass.id,
+    return this.coursesService.enrollStudentToAllActiveClasses(
+      tenantId,
+      dto.courseId,
+      dto.userId,
+      {
         roleInClass: dto.roleInCourse || 'STUDENT',
-        joinedAt,
-        endedAt,
+        joinedAt: dto.joinedAt,
+        endedAt: dto.endDate,
       },
-      include: {
-        user: true,
-        courseClass: {
-          include: {
-            course: true,
-          },
-        },
-      },
-    });
-
-    return {
-      id: enrollment.id,
-      userId: enrollment.userId,
-      courseId: enrollment.courseClass.courseId,
-      roleInCourse: enrollment.roleInClass,
-      joinedAt: enrollment.joinedAt,
-      endedAt: enrollment.endedAt,
-      createdAt: enrollment.createdAt,
-      user: enrollment.user,
-      course: enrollment.courseClass.course,
-    };
+    );
   }
 
   async remove(tenantId: number, id: number) {

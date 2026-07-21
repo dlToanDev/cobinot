@@ -30,9 +30,9 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     };
     coursesService = {
       findOneCourse: jest.fn().mockResolvedValue({ id: 10, title: 'IELTS' }),
-      findClassesForCourse: jest.fn(),
+      enrollStudentToAllActiveClasses: jest.fn(),
+      assignTeacherToCourseClasses: jest.fn(),
       createClass: jest.fn(),
-      addStudentToClass: jest.fn(),
       updateCourse: jest.fn().mockResolvedValue({
         id: 79,
         title: 'Test 1',
@@ -59,8 +59,10 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     }
   });
 
-  it('chặn khi học viên đã ghi danh khóa (STUDENT_ALREADY_ASSIGNED_TO_COURSE)', async () => {
-    enrollmentsService.findByStudentAndCourse.mockResolvedValue({ id: 99 });
+  it('chặn khi học viên đã có mặt ở TẤT CẢ lớp ACTIVE (STUDENT_ALREADY_ASSIGNED_TO_COURSE)', async () => {
+    const conflict: any = new Error('already');
+    conflict.response = { code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE' };
+    coursesService.enrollStudentToAllActiveClasses.mockRejectedValue(conflict);
 
     await expect(
       service.execute(1, actor, 'assign_student_to_course', {
@@ -72,19 +74,22 @@ describe('ToolRegistryService - assign_student_to_course', () => {
         code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
       }),
     });
-
-    expect(coursesService.addStudentToClass).not.toHaveBeenCalled();
   });
 
-  it('khóa có đúng 1 lớp ACTIVE thì gọi addStudentToClass với classId đó', async () => {
-    coursesService.findClassesForCourse.mockResolvedValue([
-      { id: 5, status: 'ACTIVE', title: 'IELTS tối' },
-    ]);
-    coursesService.addStudentToClass.mockResolvedValue({
+  it('ghi danh cả khóa qua hàm dùng chung, trả kết quả per-class', async () => {
+    coursesService.enrollStudentToAllActiveClasses.mockResolvedValue({
       id: 55,
-      roleInClass: 'STUDENT',
+      userId: 1,
+      studentId: 1,
+      courseId: 10,
       user: { id: 1, fullName: 'A' },
-      courseClass: { id: 5, course: { id: 10 } },
+      course: { id: 10, title: 'IELTS' },
+      totalActiveClasses: 2,
+      enrolled: [
+        { classId: 5, classTitle: 'IELTS tối', enrollmentId: 55 },
+        { classId: 6, classTitle: 'IELTS cuối tuần', enrollmentId: 56 },
+      ],
+      skippedExisting: [],
     });
 
     const result = await service.execute(1, actor, 'assign_student_to_course', {
@@ -92,36 +97,35 @@ describe('ToolRegistryService - assign_student_to_course', () => {
       courseId: 10,
     });
 
-    expect(coursesService.addStudentToClass).toHaveBeenCalledWith(
-      10,
-      5,
-      expect.objectContaining({ userId: 1 }),
-    );
+    expect(
+      coursesService.enrollStudentToAllActiveClasses,
+    ).toHaveBeenCalledWith(10, 10, 1, expect.objectContaining({
+      roleInClass: 'STUDENT',
+    }));
     expect(result).toEqual(
       expect.objectContaining({
         studentId: 1,
         courseId: 10,
-        classId: 5,
-        enrollmentId: 55,
+        totalActiveClasses: 2,
+        enrolled: [
+          expect.objectContaining({ classId: 5 }),
+          expect.objectContaining({ classId: 6 }),
+        ],
+        skippedExisting: [],
       }),
     );
   });
 
-  it('assign_student_to_course truyền expireDate/allowLatePayment/note xuống ClassEnrollment', async () => {
-    coursesService.findClassesForCourse.mockResolvedValue([
-      { id: 5, status: 'ACTIVE', title: 'IELTS tối' },
-    ]);
-    coursesService.addStudentToClass.mockResolvedValue({
+  it('assign_student_to_course truyền expireDate/allowLatePayment/note xuống hàm ghi danh', async () => {
+    coursesService.enrollStudentToAllActiveClasses.mockResolvedValue({
       id: 56,
-      roleInClass: 'STUDENT',
-      expireDate: new Date('2026-12-31'),
-      allowLatePayment: true,
-      note: 'Học viên chuyển từ lớp cũ',
-      user: { id: 1, fullName: 'A' },
-      courseClass: { id: 5, course: { id: 10 } },
+      userId: 1,
+      courseId: 10,
+      enrolled: [],
+      skippedExisting: [],
     });
 
-    const result = await service.execute(1, actor, 'assign_student_to_course', {
+    await service.execute(1, actor, 'assign_student_to_course', {
       userId: 1,
       courseId: 10,
       expireDate: '2026-12-31',
@@ -129,19 +133,14 @@ describe('ToolRegistryService - assign_student_to_course', () => {
       note: 'Học viên chuyển từ lớp cũ',
     });
 
-    expect(coursesService.addStudentToClass).toHaveBeenCalledWith(
+    expect(
+      coursesService.enrollStudentToAllActiveClasses,
+    ).toHaveBeenCalledWith(
       10,
-      5,
+      10,
+      1,
       expect.objectContaining({
-        userId: 1,
         expireDate: '2026-12-31',
-        allowLatePayment: true,
-        note: 'Học viên chuyển từ lớp cũ',
-      }),
-    );
-    expect(result).toEqual(
-      expect.objectContaining({
-        expireDate: new Date('2026-12-31'),
         allowLatePayment: true,
         note: 'Học viên chuyển từ lớp cũ',
       }),
@@ -218,30 +217,37 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     expect(result).toEqual(expect.objectContaining({ id: 79 }));
   });
 
-  it('khóa có nhiều lớp ACTIVE thì báo COURSE_HAS_MULTIPLE_CLASSES', async () => {
-    coursesService.findClassesForCourse.mockResolvedValue([
-      { id: 5, status: 'ACTIVE', title: 'IELTS tối' },
-      { id: 6, status: 'ACTIVE', title: 'IELTS cuối tuần' },
-    ]);
-
-    await expect(
-      service.execute(1, actor, 'assign_student_to_course', {
-        userId: 1,
-        courseId: 10,
-      }),
-    ).rejects.toMatchObject({
-      response: expect.objectContaining({
-        code: 'COURSE_HAS_MULTIPLE_CLASSES',
-      }),
+  it('assign_teacher_to_course gọi service gán GV cho cả khóa', async () => {
+    coursesService.assignTeacherToCourseClasses.mockResolvedValue({
+      id: 10,
+      courseId: 10,
+      teacherName: 'Hoàng Anh Tuấn',
+      totalActiveClasses: 2,
+      updated: [
+        { classId: 5, classTitle: 'IELTS tối' },
+        { classId: 6, classTitle: 'IELTS cuối tuần' },
+      ],
     });
 
-    expect(coursesService.addStudentToClass).not.toHaveBeenCalled();
+    const result: any = await service.execute(
+      1,
+      actor,
+      'assign_teacher_to_course',
+      { courseId: 10, teacherName: 'Hoàng Anh Tuấn' },
+    );
+
+    expect(coursesService.assignTeacherToCourseClasses).toHaveBeenCalledWith(
+      10,
+      10,
+      'Hoàng Anh Tuấn',
+    );
+    expect(result.updated).toHaveLength(2);
   });
 
   it('khóa không có lớp ACTIVE thì báo COURSE_HAS_NO_ACTIVE_CLASS', async () => {
-    coursesService.findClassesForCourse.mockResolvedValue([
-      { id: 5, status: 'CLOSED', title: 'IELTS cũ' },
-    ]);
+    const noClass: any = new Error('no active class');
+    noClass.response = { code: 'COURSE_HAS_NO_ACTIVE_CLASS' };
+    coursesService.enrollStudentToAllActiveClasses.mockRejectedValue(noClass);
 
     await expect(
       service.execute(1, actor, 'assign_student_to_course', {
@@ -255,26 +261,41 @@ describe('ToolRegistryService - assign_student_to_course', () => {
     });
   });
 
-  it('có classId cụ thể thì ghi danh thẳng lớp đó, không cần tìm lớp', async () => {
-    coursesService.addStudentToClass.mockResolvedValue({
-      id: 77,
-      roleInClass: 'STUDENT',
-      user: { id: 1 },
-      courseClass: { id: 6, course: { id: 10 } },
-    });
+  it('bulk userIds: ghi danh từng người vào cả khóa, partial success', async () => {
+    coursesService.enrollStudentToAllActiveClasses
+      .mockResolvedValueOnce({
+        id: 55,
+        userId: 1,
+        courseId: 10,
+        user: { id: 1, fullName: 'A' },
+        enrolled: [{ classId: 5, classTitle: 'IELTS tối', enrollmentId: 55 }],
+        skippedExisting: [],
+      })
+      .mockRejectedValueOnce(
+        Object.assign(new Error('already'), {
+          response: { code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE' },
+        }),
+      );
 
-    const result = await service.execute(1, actor, 'assign_student_to_course', {
-      userId: 1,
-      courseId: 10,
-      classId: 6,
-    });
-
-    expect(coursesService.findClassesForCourse).not.toHaveBeenCalled();
-    expect(coursesService.addStudentToClass).toHaveBeenCalledWith(
-      10,
-      6,
-      expect.objectContaining({ userId: 1 }),
+    const result: any = await service.execute(
+      1,
+      actor,
+      'assign_student_to_course',
+      { userIds: [1, 2], courseId: 10 },
     );
-    expect(result).toEqual(expect.objectContaining({ classId: 6 }));
+
+    expect(
+      coursesService.enrollStudentToAllActiveClasses,
+    ).toHaveBeenCalledTimes(2);
+    expect(result.bulk).toBe(true);
+    expect(result.total).toBe(2);
+    expect(result.successCount).toBe(1);
+    expect(result.items[0]).toEqual(
+      expect.objectContaining({ userId: 1, status: 'SUCCESS' }),
+    );
+    // Lỗi conflict từ hàm ghi danh không phải ConflictException instance ->
+    // vẫn ERROR dòng đó, không làm hỏng người khác.
+    expect(result.items[1].userId).toBe(2);
+    expect(['ALREADY_IN_COURSE', 'ERROR']).toContain(result.items[1].status);
   });
 });

@@ -1,11 +1,8 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { EnrollmentsService } from './enrollments.service';
 import { PrismaService } from '../prisma/prisma.service';
-import {
-  NotFoundException,
-  ConflictException,
-  BadRequestException,
-} from '@nestjs/common';
+import { CoursesService } from '../courses/courses.service';
+import { NotFoundException, BadRequestException } from '@nestjs/common';
 
 describe('EnrollmentsService', () => {
   let service: EnrollmentsService;
@@ -39,6 +36,10 @@ describe('EnrollmentsService', () => {
     },
   };
 
+  const mockCoursesService = {
+    enrollStudentToAllActiveClasses: jest.fn(),
+  };
+
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -46,6 +47,10 @@ describe('EnrollmentsService', () => {
         {
           provide: PrismaService,
           useValue: mockPrismaService,
+        },
+        {
+          provide: CoursesService,
+          useValue: mockCoursesService,
         },
       ],
     }).compile();
@@ -104,6 +109,8 @@ describe('EnrollmentsService', () => {
           id: 1,
           userId: 2,
           courseId: 3,
+          classId: 4,
+          className: null,
           roleInCourse: 'STUDENT',
           joinedAt: mockClassEnrollments[0].joinedAt,
           endedAt: null,
@@ -169,111 +176,41 @@ describe('EnrollmentsService', () => {
       endDate: '2026-07-16T00:00:00.000Z',
     };
 
-    it('should enroll a student successfully if validations pass', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'STUDENT',
-      });
-      mockPrismaService.course.findFirst.mockResolvedValue({
-        id: 3,
-        tenantId: 1,
-        courseCode: 'IELTS',
-        title: 'IELTS Course',
-        status: 'ACTIVE',
-      });
-      mockPrismaService.courseClass.findFirst.mockResolvedValue({
-        id: 4,
-        classCode: 'IELTS-DEFAULT',
-      });
-      mockPrismaService.classEnrollment.findFirst.mockResolvedValue(null);
-      mockPrismaService.classEnrollment.create.mockResolvedValue({
+    it('ghi danh qua hàm dùng chung: vào TẤT CẢ lớp ACTIVE của khóa, response per-class', async () => {
+      const perClassResult = {
         id: 100,
-        userId: dto.userId,
-        classId: 4,
-        roleInClass: 'STUDENT',
-        joinedAt: new Date(dto.joinedAt),
-        endedAt: new Date(dto.endDate),
-        createdAt: new Date(),
-        user: { id: 2 },
-        courseClass: {
-          courseId: 3,
-          course: { id: 3, courseCode: 'IELTS', title: 'IELTS Course' },
-        },
-      });
+        userId: 2,
+        studentId: 2,
+        courseId: 3,
+        user: { id: 2, fullName: 'An' },
+        course: { id: 3, title: 'IELTS Course' },
+        totalActiveClasses: 2,
+        enrolled: [
+          { classId: 4, classTitle: 'Lớp A', enrollmentId: 100 },
+          { classId: 5, classTitle: 'Lớp B', enrollmentId: 101 },
+        ],
+        skippedExisting: [],
+      };
+      mockCoursesService.enrollStudentToAllActiveClasses.mockResolvedValue(
+        perClassResult,
+      );
 
       const result = await service.create(1, dto);
 
-      expect(prisma.user.findFirst).toHaveBeenCalledWith({
-        where: { id: dto.userId, tenantId: 1 },
+      expect(
+        mockCoursesService.enrollStudentToAllActiveClasses,
+      ).toHaveBeenCalledWith(1, 3, 2, {
+        roleInClass: 'STUDENT',
+        joinedAt: dto.joinedAt,
+        endedAt: dto.endDate,
       });
-      expect(prisma.course.findFirst).toHaveBeenCalledWith({
-        where: { id: dto.courseId, tenantId: 1 },
-      });
-      expect(prisma.courseClass.findFirst).toHaveBeenCalledWith({
-        where: {
-          courseId: dto.courseId,
-          tenantId: 1,
-          classCode: 'IELTS-DEFAULT',
-        },
-      });
-      expect(prisma.classEnrollment.findFirst).toHaveBeenCalledWith({
-        where: { userId: dto.userId, classId: 4 },
-      });
-      expect(prisma.classEnrollment.create).toHaveBeenCalledWith({
-        data: {
-          userId: dto.userId,
-          classId: 4,
-          roleInClass: 'STUDENT',
-          joinedAt: new Date(dto.joinedAt),
-          endedAt: new Date(dto.endDate),
-        },
-        include: {
-          user: true,
-          courseClass: {
-            include: {
-              course: true,
-            },
-          },
-        },
-      });
-      expect(result).toBeDefined();
-    });
-
-    it('should throw NotFoundException if student is not found or from a different tenant', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue(null);
-
-      await expect(service.create(1, dto)).rejects.toThrow(NotFoundException);
-    });
-
-    it('should throw BadRequestException if member is not a student', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'TEACHER',
-      });
-
-      await expect(service.create(1, dto)).rejects.toThrow(BadRequestException);
+      expect(result).toEqual(perClassResult);
+      // KHÔNG còn auto-create "lớp default" trong EnrollmentsService.
+      expect(prisma.courseClass.create).not.toHaveBeenCalled();
+      expect(prisma.classEnrollment.create).not.toHaveBeenCalled();
     });
 
     it('should throw BadRequestException if joinedAt is after endDate', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'STUDENT',
-      });
-      mockPrismaService.course.findFirst.mockResolvedValue({
-        id: 3,
-        tenantId: 1,
-        courseCode: 'IELTS',
-        title: 'IELTS Course',
-        status: 'ACTIVE',
-      });
-      mockPrismaService.courseClass.findFirst.mockResolvedValue({
-        id: 4,
-        classCode: 'IELTS-DEFAULT',
-      });
-
       await expect(
         service.create(1, {
           ...dto,
@@ -281,54 +218,21 @@ describe('EnrollmentsService', () => {
           endDate: '2026-07-16T00:00:00.000Z',
         }),
       ).rejects.toThrow(BadRequestException);
+      expect(
+        mockCoursesService.enrollStudentToAllActiveClasses,
+      ).not.toHaveBeenCalled();
     });
 
-    it('should throw NotFoundException if course is not found or from a different tenant', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'STUDENT',
-      });
-      mockPrismaService.course.findFirst.mockResolvedValue(null);
-
-      await expect(service.create(1, dto)).rejects.toThrow(NotFoundException);
-    });
-
-    it('should throw BadRequestException if course is not active', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'STUDENT',
-      });
-      mockPrismaService.course.findFirst.mockResolvedValue({
-        id: 3,
-        tenantId: 1,
-        status: 'CLOSED',
-      });
+    it('propagate lỗi từ hàm dùng chung (vd khóa 0 lớp ACTIVE)', async () => {
+      mockCoursesService.enrollStudentToAllActiveClasses.mockRejectedValue(
+        new BadRequestException({
+          code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+          message:
+            'Khóa học này chưa có lớp đang hoạt động nên chưa thể ghi danh học viên.',
+        }),
+      );
 
       await expect(service.create(1, dto)).rejects.toThrow(BadRequestException);
-    });
-
-    it('should throw ConflictException if student is already enrolled', async () => {
-      mockPrismaService.user.findFirst.mockResolvedValue({
-        id: 2,
-        tenantId: 1,
-        role: 'STUDENT',
-      });
-      mockPrismaService.course.findFirst.mockResolvedValue({
-        id: 3,
-        tenantId: 1,
-        courseCode: 'IELTS',
-        title: 'IELTS Course',
-        status: 'ACTIVE',
-      });
-      mockPrismaService.courseClass.findFirst.mockResolvedValue({
-        id: 4,
-        classCode: 'IELTS-DEFAULT',
-      });
-      mockPrismaService.classEnrollment.findFirst.mockResolvedValue({ id: 10 });
-
-      await expect(service.create(1, dto)).rejects.toThrow(ConflictException);
     });
   });
 

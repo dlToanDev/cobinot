@@ -16,7 +16,7 @@ export type AiToolName =
   | 'create_class'
   | 'update_class'
   | 'close_class'
-  | 'assign_student_to_class'
+  | 'assign_teacher_to_course'
   | 'assign_student_to_course'
   | 'remove_student_from_class'
   | 'remove_student_from_course_classes'

@@ -19,6 +19,7 @@ describe('CoursesService', () => {
         findMany: jest.fn(),
         create: jest.fn(),
         delete: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       classSession: {
         createMany: jest.fn(),
@@ -26,7 +27,9 @@ describe('CoursesService', () => {
       classEnrollment: {
         deleteMany: jest.fn(),
         create: jest.fn(),
+        createMany: jest.fn().mockResolvedValue({ count: 0 }),
         findFirst: jest.fn(),
+        findMany: jest.fn().mockResolvedValue([]),
       },
       user: {
         findFirst: jest.fn(),
@@ -187,7 +190,48 @@ describe('CoursesService', () => {
       );
       expect(prisma.classSession.createMany).not.toHaveBeenCalled();
       expect(prisma.classEnrollment.create).not.toHaveBeenCalled();
-      expect(result).toEqual(expect.objectContaining({ sessions: [] }));
+      // Khóa chưa có học viên -> không auto-enroll ai.
+      expect(prisma.classEnrollment.createMany).not.toHaveBeenCalled();
+      expect(result).toEqual(
+        expect.objectContaining({ sessions: [], autoEnrolledCount: 0 }),
+      );
+    });
+
+    it('tạo lớp mới -> TỰ ĐỘNG thêm học viên đang có trong khóa vào lớp (khử trùng userId)', async () => {
+      prisma.course.findFirst.mockResolvedValue(courseMock);
+      prisma.courseClass.findFirst.mockResolvedValue(null);
+      prisma.courseClass.create.mockResolvedValue(classMock);
+      // Học viên #3 học 2 lớp trong khóa -> chỉ được thêm 1 lần vào lớp mới.
+      prisma.classEnrollment.findMany.mockResolvedValue([
+        { userId: 3 },
+        { userId: 3 },
+        { userId: 7 },
+      ]);
+      prisma.classEnrollment.createMany.mockResolvedValue({ count: 2 });
+
+      const result = await service.createClass(10, {
+        courseId: 1,
+        title: 'Evening A',
+        type: 'WEEKLY',
+      });
+
+      expect(prisma.classEnrollment.findMany).toHaveBeenCalledWith({
+        where: {
+          roleInClass: 'STUDENT',
+          courseClass: { tenantId: 10, courseId: 1 },
+        },
+        select: { userId: true },
+      });
+      expect(prisma.classEnrollment.createMany).toHaveBeenCalledWith({
+        data: [
+          { userId: 3, classId: classMock.id, roleInClass: 'STUDENT' },
+          { userId: 7, classId: classMock.id, roleInClass: 'STUDENT' },
+        ],
+        skipDuplicates: true,
+      });
+      expect(result).toEqual(
+        expect.objectContaining({ autoEnrolledCount: 2, studentCount: 2 }),
+      );
     });
 
     it('should create class sessions when provided', async () => {
@@ -482,6 +526,190 @@ describe('CoursesService', () => {
         service.updateClass(10, 5, { title: 'evening b' }),
       ).rejects.toThrow('không được trùng tên');
       expect(prisma.courseClass.update).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('assignTeacherToCourseClasses (GV cầm cả khóa)', () => {
+    beforeEach(() => {
+      prisma.course.findFirst.mockResolvedValue({
+        id: 10,
+        title: 'IELTS',
+        status: 'ACTIVE',
+      });
+    });
+
+    it('set teacherName cho TẤT CẢ lớp ACTIVE của khóa (chuẩn hóa tên)', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 5, title: 'Lớp A', teacherName: null },
+        { id: 6, title: 'Lớp B', teacherName: 'Cũ Nào Đó' },
+      ]);
+      prisma.courseClass.updateMany.mockResolvedValue({ count: 2 });
+
+      const result = await service.assignTeacherToCourseClasses(
+        10,
+        10,
+        'hoàng anh tuấn',
+      );
+
+      expect(prisma.courseClass.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { tenantId: 10, courseId: 10, status: 'ACTIVE' },
+        }),
+      );
+      expect(prisma.courseClass.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: [5, 6] } },
+        data: { teacherName: 'Hoàng Anh Tuấn' },
+      });
+      expect(result.teacherName).toBe('Hoàng Anh Tuấn');
+      expect(result.updated).toEqual([
+        expect.objectContaining({ classId: 5, previousTeacherName: null }),
+        expect.objectContaining({
+          classId: 6,
+          previousTeacherName: 'Cũ Nào Đó',
+        }),
+      ]);
+    });
+
+    it('khóa 0 lớp ACTIVE -> COURSE_HAS_NO_ACTIVE_CLASS, không update gì', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.assignTeacherToCourseClasses(10, 10, 'Hoàng Anh'),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+        }),
+      });
+      expect(prisma.courseClass.updateMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('enrollStudentToAllActiveClasses (ghi danh cả khóa)', () => {
+    const activeCourse = {
+      id: 10,
+      title: 'IELTS',
+      courseCode: 'IELTS',
+      status: 'ACTIVE',
+    };
+    const student = { id: 1, tenantId: 10, role: 'STUDENT', fullName: 'An' };
+
+    beforeEach(() => {
+      prisma.classEnrollment.findMany = jest.fn();
+      prisma.course.findFirst.mockResolvedValue(activeCourse);
+      prisma.user.findFirst.mockResolvedValue(student);
+    });
+
+    it('ghi đủ N lớp ACTIVE (chỉ query lớp ACTIVE của khóa)', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 5, title: 'Lớp A', classCode: 'A', type: 'WEEKLY' },
+        { id: 6, title: 'Lớp B', classCode: 'B', type: 'WEEKLY' },
+      ]);
+      prisma.classEnrollment.findMany.mockResolvedValue([]);
+      // addStudentToClass nội bộ: findOneClass + check trùng + create.
+      prisma.courseClass.findFirst
+        .mockResolvedValueOnce({ id: 5, status: 'ACTIVE', title: 'Lớp A' })
+        .mockResolvedValueOnce({ id: 6, status: 'ACTIVE', title: 'Lớp B' });
+      prisma.classEnrollment.findFirst.mockResolvedValue(null);
+      prisma.classEnrollment.create
+        .mockResolvedValueOnce({ id: 100, roleInClass: 'STUDENT' })
+        .mockResolvedValueOnce({ id: 101, roleInClass: 'STUDENT' });
+
+      const result = await service.enrollStudentToAllActiveClasses(10, 10, 1);
+
+      expect(prisma.courseClass.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: { tenantId: 10, courseId: 10, status: 'ACTIVE' },
+        }),
+      );
+      expect(prisma.classEnrollment.create).toHaveBeenCalledTimes(2);
+      expect(result.enrolled).toHaveLength(2);
+      expect(result.skippedExisting).toHaveLength(0);
+      expect(result.totalActiveClasses).toBe(2);
+      expect(result.id).toBe(100);
+    });
+
+    it('skip lớp học viên đã có sẵn, vẫn ghi lớp còn lại', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 5, title: 'Lớp A' },
+        { id: 6, title: 'Lớp B' },
+      ]);
+      // Đã có mặt ở lớp 5.
+      prisma.classEnrollment.findMany.mockResolvedValue([{ classId: 5 }]);
+      prisma.courseClass.findFirst.mockResolvedValue({
+        id: 6,
+        status: 'ACTIVE',
+        title: 'Lớp B',
+      });
+      prisma.classEnrollment.findFirst.mockResolvedValue(null);
+      prisma.classEnrollment.create.mockResolvedValue({
+        id: 101,
+        roleInClass: 'STUDENT',
+      });
+
+      const result = await service.enrollStudentToAllActiveClasses(10, 10, 1);
+
+      expect(prisma.classEnrollment.create).toHaveBeenCalledTimes(1);
+      expect(result.enrolled.map((cls: any) => cls.classId)).toEqual([6]);
+      expect(result.skippedExisting.map((cls: any) => cls.classId)).toEqual([
+        5,
+      ]);
+    });
+
+    it('đã có mặt ở TẤT CẢ lớp ACTIVE -> STUDENT_ALREADY_ASSIGNED_TO_COURSE', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([
+        { id: 5, title: 'Lớp A' },
+        { id: 6, title: 'Lớp B' },
+      ]);
+      prisma.classEnrollment.findMany.mockResolvedValue([
+        { classId: 5 },
+        { classId: 6 },
+      ]);
+
+      await expect(
+        service.enrollStudentToAllActiveClasses(10, 10, 1),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'STUDENT_ALREADY_ASSIGNED_TO_COURSE',
+        }),
+      });
+      expect(prisma.classEnrollment.create).not.toHaveBeenCalled();
+    });
+
+    it('khóa 0 lớp ACTIVE -> COURSE_HAS_NO_ACTIVE_CLASS (không auto-tạo lớp default)', async () => {
+      prisma.courseClass.findMany.mockResolvedValue([]);
+
+      await expect(
+        service.enrollStudentToAllActiveClasses(10, 10, 1),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({
+          code: 'COURSE_HAS_NO_ACTIVE_CLASS',
+        }),
+      });
+      expect(prisma.courseClass.create).not.toHaveBeenCalled();
+    });
+
+    it('khóa không ACTIVE -> COURSE_NOT_ACTIVE', async () => {
+      prisma.course.findFirst.mockResolvedValue({
+        ...activeCourse,
+        status: 'CLOSED',
+      });
+
+      await expect(
+        service.enrollStudentToAllActiveClasses(10, 10, 1),
+      ).rejects.toMatchObject({
+        response: expect.objectContaining({ code: 'COURSE_NOT_ACTIVE' }),
+      });
+    });
+
+    it('user không phải học viên (roleInClass STUDENT) -> BadRequest', async () => {
+      prisma.user.findFirst.mockResolvedValue({
+        ...student,
+        role: 'TEACHER',
+      });
+
+      await expect(
+        service.enrollStudentToAllActiveClasses(10, 10, 1),
+      ).rejects.toThrow(BadRequestException);
     });
   });
 });

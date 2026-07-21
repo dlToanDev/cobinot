@@ -232,11 +232,12 @@ export class AgentRunnerService {
     args: Record<string, unknown>,
   ): string {
     if (toolName === 'assign_student_to_course') {
-      // Ghi danh khóa thực chất là ghi ClassEnrollment vào một lớp trong
-      // khóa — nói rõ trong summary để user không tưởng có enrollment cấp khóa.
-      return `Ghi danh học viên #${args.userId ?? '?'} vào khóa học #${
+      const who = Array.isArray(args.userIds)
+        ? `${(args.userIds as unknown[]).length} học viên`
+        : `học viên #${args.userId ?? '?'}`;
+      return `Ghi danh ${who} vào khóa học #${
         args.courseId ?? '?'
-      } (vào lớp trong khóa)`;
+      } (tất cả lớp đang hoạt động)`;
     }
 
     if (toolName === 'create_course') {
@@ -260,9 +261,10 @@ export class AgentRunnerService {
       create_class: 'Tạo lớp học mới',
       update_class: 'Cập nhật lớp học',
       close_class: 'Đóng lớp học',
-      assign_student_to_class: 'Thêm học viên vào lớp',
+      assign_teacher_to_course:
+        'Gán giáo viên phụ trách khóa học (tất cả lớp đang hoạt động)',
       assign_student_to_course:
-        'Ghi danh học viên vào khóa học (vào lớp trong khóa)',
+        'Ghi danh học viên vào khóa học (tất cả lớp đang hoạt động)',
       remove_student_from_class: 'Xóa học viên khỏi lớp',
       remove_student_from_course_classes:
         'Xóa học viên khỏi các lớp trong khóa',

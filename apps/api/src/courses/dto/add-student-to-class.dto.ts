@@ -24,6 +24,10 @@ export class AddStudentToClassDto {
   joinedAt?: string;
 
   @IsOptional()
+  @IsDateString({}, { message: 'Ngày kết thúc không đúng định dạng' })
+  endedAt?: string;
+
+  @IsOptional()
   @IsDateString({}, { message: 'Ngày hết hạn học không đúng định dạng' })
   expireDate?: string;
 

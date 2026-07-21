@@ -20,8 +20,10 @@ export default function EnrollmentDetailPage() {
   const [course, setCourse] = useState<any>(null);
   const [enrollments, setEnrollments] = useState<any[]>([]);
   const [students, setStudents] = useState<any[]>([]);
+  const [activeClasses, setActiveClasses] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [notice, setNotice] = useState('');
 
   const [showAdd, setShowAdd] = useState(false);
   const [editingEnrollment, setEditingEnrollment] = useState<any>(null);
@@ -41,15 +43,22 @@ export default function EnrollmentDetailPage() {
     setLoading(true);
     setError('');
     try {
-      const [courseRes, enrollmentsRes, studentsRes] = await Promise.all([
-        apiClient.get(`/courses/${courseId}`),
-        apiClient.get('/enrollments', { params: { courseId } }),
-        apiClient.get('/students'),
-      ]);
+      const [courseRes, enrollmentsRes, studentsRes, classesRes] =
+        await Promise.all([
+          apiClient.get(`/courses/${courseId}`),
+          apiClient.get('/enrollments', { params: { courseId } }),
+          apiClient.get('/students'),
+          apiClient.get(`/courses/${courseId}/classes`),
+        ]);
 
       setCourse(courseRes.data);
       setEnrollments(enrollmentsRes.data);
       setStudents(studentsRes.data);
+      setActiveClasses(
+        (Array.isArray(classesRes.data) ? classesRes.data : []).filter(
+          (cls: any) => String(cls.status) === 'ACTIVE',
+        ),
+      );
     } catch (err: any) {
       setError(err.response?.data?.message || 'Không thể tải chi tiết lớp học');
     } finally {
@@ -115,13 +124,16 @@ export default function EnrollmentDetailPage() {
   const handleCreate = async (e: React.FormEvent) => {
     e.preventDefault();
     setError('');
+    setNotice('');
 
     if (selectedStudentIds.length === 0) {
-      setError('Vui lòng chọn ít nhất một người để thêm vào lớp');
+      setError('Vui lòng chọn ít nhất một người để ghi danh vào khóa');
       return;
     }
 
     try {
+      // Mỗi request ghi danh 1 học viên vào TẤT CẢ lớp ACTIVE của khóa;
+      // response per-class { enrolled[], skippedExisting[] }.
       const results = await Promise.allSettled(
         selectedStudentIds.map((studentId) =>
           apiClient.post('/enrollments', {
@@ -135,15 +147,26 @@ export default function EnrollmentDetailPage() {
       );
 
       const failedCount = results.filter((result) => result.status === 'rejected').length;
+      const enrolledClassCount = results.reduce((sum, result) => {
+        if (result.status !== 'fulfilled') return sum;
+        const enrolled = (result.value?.data as any)?.enrolled;
+        return sum + (Array.isArray(enrolled) ? enrolled.length : 0);
+      }, 0);
       if (failedCount > 0) {
-        setError(`Đã thêm ${results.length - failedCount}/${results.length} người. Một số người bị lỗi hoặc đã ở trong lớp.`);
+        setError(
+          `Đã ghi danh ${results.length - failedCount}/${results.length} người. Một số người bị lỗi hoặc đã có mặt ở tất cả lớp của khóa.`,
+        );
+      } else {
+        setNotice(
+          `Đã ghi danh ${results.length} học viên vào khóa — tạo ${enrolledClassCount} lượt vào lớp (tất cả lớp đang hoạt động).`,
+        );
       }
 
       setShowAdd(false);
       setSelectedStudentIds([]);
       await fetchData();
     } catch (err: any) {
-      const msg = err.response?.data?.message || 'Lỗi thêm thành viên vào lớp';
+      const msg = err.response?.data?.message || 'Lỗi ghi danh học viên vào khóa';
       setError(Array.isArray(msg) ? msg[0] : msg);
     }
   };
@@ -208,13 +231,19 @@ export default function EnrollmentDetailPage() {
             disabled={!course}
             className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl shadow-md shadow-indigo-200 transition duration-200 disabled:opacity-50"
           >
-            Thêm Vào Lớp
+            Ghi Danh Vào Khóa
           </button>
         </div>
 
         {error && (
           <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-xl text-red-700 text-sm">
             {error}
+          </div>
+        )}
+
+        {notice && (
+          <div className="mb-6 p-4 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-700 text-sm">
+            {notice}
           </div>
         )}
 
@@ -235,7 +264,7 @@ export default function EnrollmentDetailPage() {
 
             {enrollments.length === 0 ? (
               <div className="p-10 text-center text-slate-400 font-medium">
-                Lớp này chưa có thành viên. Bấm “Thêm Vào Lớp” để bắt đầu.
+                Khóa này chưa có thành viên. Bấm “Ghi Danh Vào Khóa” — học viên sẽ được thêm vào tất cả lớp đang hoạt động.
               </div>
             ) : (
               <div className="overflow-x-auto">
@@ -244,6 +273,7 @@ export default function EnrollmentDetailPage() {
                     <tr className="border-b border-slate-200 bg-white">
                       <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Thành viên</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Liên hệ</th>
+                      <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Lớp</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Vai trò</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Ngày tham gia</th>
                       <th className="px-6 py-4 text-xs font-semibold uppercase text-slate-500">Ngày kết thúc</th>
@@ -257,6 +287,9 @@ export default function EnrollmentDetailPage() {
                         <td className="px-6 py-4 text-sm text-slate-700">
                           <div className="font-medium">{enrollment.user.phone || '—'}</div>
                           <div className="text-xs text-slate-500">{enrollment.user.email || 'Không có email'}</div>
+                        </td>
+                        <td className="px-6 py-4 text-sm text-slate-700 font-medium">
+                          {enrollment.className || `#${enrollment.classId || '—'}`}
                         </td>
                         <td className="px-6 py-4">
                           <span className="inline-flex h-8 items-center px-3 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200 text-xs font-bold">
@@ -293,8 +326,8 @@ export default function EnrollmentDetailPage() {
 
       {showAdd && (
         <MemberModal
-          title="Thêm thành viên vào lớp"
-          submitLabel={`Thêm ${selectedStudentIds.length > 0 ? `(${selectedStudentIds.length})` : ''}`}
+          title="Ghi danh học viên vào khóa"
+          submitLabel={`Ghi danh ${selectedStudentIds.length > 0 ? `(${selectedStudentIds.length})` : ''}`}
           onSubmit={handleCreate}
           onClose={() => setShowAdd(false)}
           roleInCourse={roleInCourse}
@@ -304,6 +337,32 @@ export default function EnrollmentDetailPage() {
           endDate={endDate}
           setEndDate={setEndDate}
         >
+          <div className={activeClasses.length ? 'p-3 bg-indigo-50/60 border border-indigo-100 rounded-xl' : 'p-3 bg-amber-50 border border-amber-200 rounded-xl'}>
+            {activeClasses.length ? (
+              <>
+                <div className="text-xs font-bold text-indigo-700 mb-1.5">
+                  Học viên sẽ được thêm vào TẤT CẢ {activeClasses.length} lớp đang hoạt động của khóa:
+                </div>
+                <ul className="space-y-0.5 text-xs text-slate-700 font-medium">
+                  {activeClasses.map((cls: any) => (
+                    <li key={cls.id}>
+                      • {cls.title || cls.classCode || `Lớp #${cls.id}`}
+                      {cls.classCode && cls.title ? (
+                        <span className="text-slate-400 font-mono"> ({cls.classCode})</span>
+                      ) : null}
+                    </li>
+                  ))}
+                </ul>
+                <div className="mt-1.5 text-[11px] text-slate-500">
+                  Lớp mở thêm sau này trong khóa sẽ TỰ ĐỘNG có toàn bộ học viên của khóa.
+                </div>
+              </>
+            ) : (
+              <div className="text-xs font-semibold text-amber-800">
+                Khóa này chưa có lớp đang hoạt động — cần tạo lớp trước khi ghi danh học viên.
+              </div>
+            )}
+          </div>
           <div>
             <div className="flex items-center justify-between gap-3 mb-1.5">
               <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider">Chọn thành viên *</label>

@@ -240,35 +240,113 @@ function StudentResultBlock({
     ? (record.classes as Record<string, unknown>[])
     : [];
 
+  // Gom lớp theo KHÓA cho dễ đọc (10 lớp rải chip lẫn lộn rất rối); bỏ mã lớp
+  // dài khỏi chip — đưa vào tooltip, nhận diện bằng tên lớp + loại + khóa.
+  type CourseGroup = {
+    courseId: number;
+    courseName: string;
+    classes: Record<string, unknown>[];
+  };
+  const courseGroups: CourseGroup[] = [];
+  const groupByCourse = new Map<string, CourseGroup>();
+  for (const cls of classes) {
+    const courseId = Number(cls.courseId) || 0;
+    const courseName = String(
+      cls.courseName || (courseId ? `Khóa #${courseId}` : "Khóa khác"),
+    );
+    const key = courseId ? String(courseId) : courseName;
+    let group = groupByCourse.get(key);
+    if (!group) {
+      group = { courseId, courseName, classes: [] };
+      groupByCourse.set(key, group);
+      courseGroups.push(group);
+    }
+    group.classes.push(cls);
+  }
+
   return (
     <ResultCardShell title={name} id={idValue}>
       <KeyValueRows entries={entries} />
       {classes.length > 0 && (
         <div className="mt-2 border-t border-zinc-100 pt-2">
           <div className="mb-1.5 text-[11px] font-medium text-zinc-500">
-            Lớp đang tham gia ({classes.length})
+            Khóa học & lớp đang tham gia{" "}
+            <span className="font-normal text-zinc-400">
+              ({courseGroups.length} khóa · {classes.length} lớp)
+            </span>
           </div>
-          <div className="flex flex-wrap gap-1.5">
-            {classes.map((c, idx) => {
-              const className = String(c.className || c.name || "Chưa có tên");
-              const classId = c.classId || c.id;
-              const classCode = c.classCode || c.code;
-              return (
-                <LinkChip
-                  key={`student-class-${String(classId ?? idx)}`}
-                  label={className}
-                  meta={classCode ? String(classCode) : undefined}
-                  onClick={
-                    onSelect && classId
-                      ? () =>
-                          onSelect(
-                            `Xem chi tiết lớp học ${className} #${String(classId)}`,
+          <div className="space-y-1.5">
+            {courseGroups.map((group) => (
+              <div
+                key={`student-course-${group.courseId || group.courseName}`}
+                className="rounded-xl border border-zinc-100 bg-zinc-50/60 px-2.5 py-2"
+              >
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    disabled={!onSelect || !group.courseId}
+                    onClick={() =>
+                      onSelect?.(
+                        `Xem chi tiết khóa học ${group.courseName} #${group.courseId}`,
+                      )
+                    }
+                    className="min-w-0 truncate text-left text-xs font-semibold text-zinc-800 enabled:cursor-pointer enabled:hover:text-indigo-600"
+                  >
+                    {group.courseName}
+                  </button>
+                  <span className="shrink-0 rounded-md bg-white px-1.5 py-0.5 text-[10px] font-medium text-zinc-500 ring-1 ring-inset ring-zinc-200">
+                    {group.classes.length} lớp
+                  </span>
+                </div>
+                <div className="flex flex-wrap gap-1.5">
+                  {group.classes.map((c, idx) => {
+                    const className = String(
+                      c.className || c.name || "Chưa có tên",
+                    );
+                    const classId = Number(c.classId || c.id) || 0;
+                    const classCode = c.classCode || c.code;
+                    const classType =
+                      typeof c.classType === "string" ? c.classType : null;
+                    const closed =
+                      String(c.classStatus || "").toUpperCase() === "CLOSED";
+                    return (
+                      <button
+                        key={`student-class-${classId || idx}`}
+                        type="button"
+                        disabled={!onSelect || !classId}
+                        title={classCode ? String(classCode) : undefined}
+                        onClick={() =>
+                          onSelect?.(
+                            `Xem chi tiết lớp học ${className} #${classId}`,
                           )
-                      : undefined
-                  }
-                />
-              );
-            })}
+                        }
+                        className={`inline-flex max-w-full min-w-0 items-center gap-1.5 rounded-lg border bg-white px-2 py-1 text-left text-xs transition enabled:cursor-pointer enabled:hover:border-indigo-200 enabled:hover:text-indigo-700 ${
+                          closed
+                            ? "border-zinc-200 text-zinc-400"
+                            : "border-zinc-200 text-zinc-700"
+                        }`}
+                      >
+                        <span className="truncate">{className}</span>
+                        {classType === "EXAM_PRACTICE" ? (
+                          <span className="shrink-0 rounded bg-violet-50 px-1 py-px text-[9px] font-medium text-violet-600 ring-1 ring-inset ring-violet-200">
+                            Luyện đề
+                          </span>
+                        ) : classType === "WEEKLY" ? (
+                          <span className="shrink-0 rounded bg-sky-50 px-1 py-px text-[9px] font-medium text-sky-600 ring-1 ring-inset ring-sky-200">
+                            Theo tuần
+                          </span>
+                        ) : null}
+                        {closed && (
+                          <span className="shrink-0 rounded bg-zinc-100 px-1 py-px text-[9px] font-medium text-zinc-500">
+                            Đã đóng
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            ))}
           </div>
         </div>
       )}
@@ -339,7 +417,32 @@ function ClassResultBlock({
       value: `${startDate || "?"} – ${endDate || "?"}`,
     });
   }
+  pushIf(entries, "Ngày tạo", record.createdAt, "createdAt");
   pushIf(entries, "Mô tả", record.description, "description");
+
+  const sessions = Array.isArray(record.sessions)
+    ? (record.sessions as Record<string, unknown>[]).filter(isRecord)
+    : [];
+  const formatDayOfWeek = (value: unknown) => {
+    const day = Number(value);
+    if (!Number.isFinite(day)) return "";
+    if (day === 0) return "Chủ nhật";
+    if (day >= 2 && day <= 7) return `Thứ ${day}`;
+    return "";
+  };
+  const formatSessionLine = (session: Record<string, unknown>) => {
+    const parts = [
+      formatDayOfWeek(session.dayOfWeek),
+      session.sessionDate
+        ? formatFieldValue("sessionDate", session.sessionDate)
+        : "",
+      session.startTime || session.endTime
+        ? [session.startTime, session.endTime].filter(Boolean).join(" – ")
+        : "",
+      session.room ? `phòng ${String(session.room)}` : "",
+    ].filter(Boolean);
+    return parts.join(" · ") || String(session.title || "Buổi học");
+  };
 
   return (
     <ResultCardShell
@@ -356,6 +459,31 @@ function ClassResultBlock({
       }
     >
       <KeyValueRows entries={entries} />
+      {sessions.length > 0 && (
+        <div className="mt-2 border-t border-zinc-100 pt-2">
+          <div className="mb-1.5 text-[11px] font-medium text-zinc-500">
+            Lịch học ({sessions.length} buổi)
+          </div>
+          <ul className="space-y-1">
+            {sessions.map((session, index) => (
+              <li
+                key={`class-session-${String(session.id ?? index)}`}
+                className="flex items-center gap-2 rounded-lg bg-zinc-50/70 px-2.5 py-1.5 text-xs text-zinc-700"
+              >
+                <span className="h-1 w-1 shrink-0 rounded-full bg-zinc-400" />
+                <span className="min-w-0 flex-1">
+                  {formatSessionLine(session)}
+                  {typeof session.title === "string" && session.title && (
+                    <span className="ml-1 text-zinc-400">
+                      ({session.title})
+                    </span>
+                  )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       {students.length > 0 && (
         <div className="mt-2 border-t border-zinc-100 pt-2">
           <div className="mb-1.5 text-[11px] font-medium text-zinc-500">
@@ -421,6 +549,7 @@ function CourseResultBlock({
   if (studentCount > 0) {
     entries.push({ label: "Số học viên", value: String(studentCount) });
   }
+  pushIf(entries, "Ngày tạo", record.createdAt, "createdAt");
   pushIf(entries, "Mô tả", record.description, "description");
 
   return (
@@ -481,31 +610,130 @@ function CourseResultBlock({
   );
 }
 
+// ---- Gán giáo viên phụ trách khóa --------------------------------------------
+
+export function TeacherAssignResultBlock({
+  data,
+  onSelect,
+}: {
+  data: unknown;
+  onSelect?: (msg: string) => void;
+}) {
+  if (!isRecord(data)) return <GenericResultBlock data={data} />;
+  const course = isRecord(data.course) ? data.course : null;
+  const courseName = String(
+    course?.title || data.courseName || `#${data.courseId ?? "?"}`,
+  );
+  const updated = Array.isArray(data.updated)
+    ? data.updated.filter(isRecord)
+    : [];
+
+  const entries: KVEntry[] = [
+    { label: "Giáo viên", value: String(data.teacherName || "Chưa rõ") },
+    { label: "Khóa học", value: courseName },
+    {
+      label: "Số lớp phụ trách",
+      value: `${updated.length} lớp đang hoạt động`,
+    },
+  ];
+
+  return (
+    <ResultCardShell
+      title={`Giáo viên ${String(data.teacherName || "")} phụ trách khóa ${courseName}`}
+    >
+      <KeyValueRows entries={entries} />
+      {updated.length > 0 && (
+        <div className="mt-2 border-t border-zinc-100 pt-2">
+          <div className="mb-1.5 text-[11px] font-medium text-zinc-500">
+            Lớp được gán ({updated.length})
+          </div>
+          <ul className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-zinc-50/60">
+            {updated.map((cls, index) => (
+              <li
+                key={`teacher-class-${index}`}
+                className="flex items-start gap-2 px-3 py-2"
+              >
+                <span className="mt-0.5 w-4 shrink-0 text-center text-[13px] font-semibold text-emerald-600">
+                  ✓
+                </span>
+                <span className="min-w-0 flex-1 text-[13px] leading-5 text-zinc-800">
+                  <button
+                    type="button"
+                    disabled={!onSelect || !Number(cls.classId)}
+                    onClick={() =>
+                      onSelect?.(
+                        `Xem chi tiết lớp học ${String(cls.classTitle || "")} #${Number(cls.classId)}`,
+                      )
+                    }
+                    className="text-left enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+                  >
+                    {String(cls.classTitle || `#${cls.classId}`)}
+                  </button>
+                  {typeof cls.previousTeacherName === "string" &&
+                    cls.previousTeacherName &&
+                    cls.previousTeacherName !== data.teacherName && (
+                      <span className="ml-1 text-xs text-zinc-500">
+                        — trước đó: {cls.previousTeacherName}
+                      </span>
+                    )}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </ResultCardShell>
+  );
+}
+
 // ---- Ghi danh ---------------------------------------------------------------
 
 export function EnrollmentResultBlock({
   data,
   title,
+  onSelect,
 }: {
   data: unknown;
   title?: string;
+  /** Click tên học viên/lớp -> xem chi tiết (gửi draft message qua chat). */
+  onSelect?: (msg: string) => void;
 }) {
   if (!isRecord(data)) return <GenericResultBlock data={data} />;
+  const classButton = (cls: Record<string, unknown>) => {
+    const label = String(cls.classTitle || `#${cls.classId}`);
+    const classId = Number(cls.classId) || 0;
+    return (
+      <button
+        type="button"
+        disabled={!onSelect || !classId}
+        onClick={() =>
+          onSelect?.(`Xem chi tiết lớp học ${label} #${classId}`)
+        }
+        className="text-left enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+      >
+        {label}
+      </button>
+    );
+  };
 
-  // Kết quả ghi danh GỘP nhiều học viên: từng dòng ✓/⚠/✗ (partial success —
-  // người lỗi không làm hỏng người khác).
+  // Kết quả ghi danh GỘP nhiều học viên vào cả khóa: từng dòng ✓/⚠/✗
+  // (partial success — người lỗi không làm hỏng người khác).
+  // Vẫn render được kết quả cũ theo lớp (className/ALREADY_IN_CLASS) từ lịch sử.
   if (data.bulk && Array.isArray(data.items)) {
-    const className = String(data.className || data.classId || "Chưa rõ");
+    const targetName = String(
+      data.courseName || data.className || data.courseId || "Chưa rõ",
+    );
+    const targetKind = data.courseName || !data.className ? "Khóa" : "Lớp";
     const items = data.items.filter(isRecord);
     const successCount = Number(
       data.successCount ??
         items.filter((item) => item.status === "SUCCESS").length,
     );
     return (
-      <ResultCardShell title={title || "Kết quả thêm học viên vào lớp"}>
+      <ResultCardShell title={title || "Kết quả ghi danh vào khóa"}>
         <p className="px-0.5 pb-1 text-xs leading-5 text-zinc-500">
-          Lớp {className}: {successCount}/{items.length} học viên được thêm
-          thành công.
+          {targetKind} {targetName}: {successCount}/{items.length} học viên
+          được ghi danh thành công.
         </p>
         <ul className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-zinc-50/60">
           {items.map((item, index) => {
@@ -513,24 +741,38 @@ export function EnrollmentResultBlock({
             const name = String(
               item.studentName || `Học viên #${item.userId}`,
             );
+            const isSkipped =
+              status === "ALREADY_IN_COURSE" || status === "ALREADY_IN_CLASS";
             const tone =
               status === "SUCCESS"
                 ? "text-emerald-600"
-                : status === "ALREADY_IN_CLASS"
+                : isSkipped
                   ? "text-amber-600"
                   : "text-red-600";
-            const glyph =
-              status === "SUCCESS"
-                ? "✓"
-                : status === "ALREADY_IN_CLASS"
-                  ? "⚠"
-                  : "✗";
+            const glyph = status === "SUCCESS" ? "✓" : isSkipped ? "⚠" : "✗";
+            const enrolledClasses = Array.isArray(item.enrolled)
+              ? item.enrolled
+                  .filter(isRecord)
+                  .map((cls) => String(cls.classTitle || `#${cls.classId}`))
+              : [];
+            const skippedClasses = Array.isArray(item.skippedExisting)
+              ? item.skippedExisting
+                  .filter(isRecord)
+                  .map((cls) => String(cls.classTitle || `#${cls.classId}`))
+              : [];
             const note =
               status === "SUCCESS"
-                ? "Đã thêm vào lớp"
-                : status === "ALREADY_IN_CLASS"
-                  ? "Đã có trong lớp từ trước"
-                  : String(item.message || "Lỗi không xác định");
+                ? enrolledClasses.length
+                  ? `Đã thêm vào ${enrolledClasses.length} lớp: ${enrolledClasses.join(", ")}` +
+                    (skippedClasses.length
+                      ? ` · đã có sẵn: ${skippedClasses.join(", ")}`
+                      : "")
+                  : "Đã ghi danh"
+                : status === "ALREADY_IN_COURSE"
+                  ? "Đã có trong tất cả lớp của khóa từ trước"
+                  : status === "ALREADY_IN_CLASS"
+                    ? "Đã có trong lớp từ trước"
+                    : String(item.message || "Lỗi không xác định");
             return (
               <li key={index} className="flex items-start gap-2 px-3 py-2">
                 <span
@@ -539,7 +781,18 @@ export function EnrollmentResultBlock({
                   {glyph}
                 </span>
                 <span className="min-w-0 flex-1 text-[13px] leading-5 text-zinc-800">
-                  {name}
+                  <button
+                    type="button"
+                    disabled={!onSelect || !Number(item.userId)}
+                    onClick={() =>
+                      onSelect?.(
+                        `Xem chi tiết học viên ${name} #${Number(item.userId)}`,
+                      )
+                    }
+                    className="text-left enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+                  >
+                    {name}
+                  </button>
                   <span className="ml-1 text-xs text-zinc-500">— {note}</span>
                 </span>
               </li>
@@ -557,29 +810,94 @@ export function EnrollmentResultBlock({
     user?.fullName || user?.name || data.userId || "Chưa rõ",
   );
   const targetName = String(
-    courseClass?.title ||
-      course?.title ||
+    course?.title ||
       course?.name ||
-      data.classId ||
+      courseClass?.title ||
       data.courseId ||
+      data.classId ||
       "Chưa rõ",
   );
   const role = data.roleInClass || data.roleInCourse || "STUDENT";
   const joinedAt = data.joinedAt || data.createdAt;
 
+  const studentId = Number(user?.id ?? data.userId ?? data.studentId) || 0;
   const entries: KVEntry[] = [
-    { label: "Học viên", value: studentName },
-    { label: courseClass ? "Lớp học" : "Khóa học", value: targetName },
+    {
+      label: "Học viên",
+      value: (
+        <button
+          type="button"
+          disabled={!onSelect || !studentId}
+          onClick={() =>
+            onSelect?.(`Xem chi tiết học viên ${studentName} #${studentId}`)
+          }
+          className="text-left enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+        >
+          {studentName}
+        </button>
+      ),
+    },
+    {
+      label: course || !courseClass ? "Khóa học" : "Lớp học",
+      value: targetName,
+    },
     { label: "Vai trò", value: formatFieldValue("roleInClass", role) },
   ];
   pushIf(entries, "Ngày ghi danh", joinedAt, "joinedAt");
 
+  // Kết quả mới: liệt kê per-class (Đã thêm / Đã có sẵn).
+  const enrolled = Array.isArray(data.enrolled)
+    ? data.enrolled.filter(isRecord)
+    : [];
+  const skippedExisting = Array.isArray(data.skippedExisting)
+    ? data.skippedExisting.filter(isRecord)
+    : [];
+
   return (
     <ResultCardShell
       title={title || "Thông tin ghi danh"}
-      id={data.id !== undefined ? String(data.id) : undefined}
+      id={data.id !== undefined && data.id !== null ? String(data.id) : undefined}
     >
       <KeyValueRows entries={entries} />
+      {(enrolled.length > 0 || skippedExisting.length > 0) && (
+        <div className="mt-2 border-t border-zinc-100 pt-2">
+          <div className="mb-1.5 text-[11px] font-medium text-zinc-500">
+            Lớp đã ghi danh ({enrolled.length + skippedExisting.length})
+          </div>
+          <ul className="divide-y divide-zinc-100 rounded-xl border border-zinc-200 bg-zinc-50/60">
+            {enrolled.map((cls, index) => (
+              <li
+                key={`enrolled-${index}`}
+                className="flex items-start gap-2 px-3 py-2"
+              >
+                <span className="mt-0.5 w-4 shrink-0 text-center text-[13px] font-semibold text-emerald-600">
+                  ✓
+                </span>
+                <span className="min-w-0 flex-1 text-[13px] leading-5 text-zinc-800">
+                  {classButton(cls)}
+                  <span className="ml-1 text-xs text-zinc-500">— Đã thêm</span>
+                </span>
+              </li>
+            ))}
+            {skippedExisting.map((cls, index) => (
+              <li
+                key={`skipped-${index}`}
+                className="flex items-start gap-2 px-3 py-2"
+              >
+                <span className="mt-0.5 w-4 shrink-0 text-center text-[13px] font-semibold text-amber-600">
+                  ⚠
+                </span>
+                <span className="min-w-0 flex-1 text-[13px] leading-5 text-zinc-800">
+                  {classButton(cls)}
+                  <span className="ml-1 text-xs text-zinc-500">
+                    — Đã có sẵn từ trước
+                  </span>
+                </span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </ResultCardShell>
   );
 }
@@ -688,10 +1006,13 @@ export function StudentTableBlock({
   title,
   message,
   students,
+  onSelect,
 }: {
   title?: string;
   message?: string;
   students: StudentTableRow[];
+  /** Click tên học viên -> xem chi tiết (gửi draft message qua chat). */
+  onSelect?: (msg: string) => void;
 }) {
   const rows = Array.isArray(students) ? students : [];
   const [page, setPage] = React.useState(0);
@@ -750,9 +1071,18 @@ export function StudentTableBlock({
                 </td>
                 <td className="px-3 py-2.5">
                   <div className="flex items-center gap-1.5">
-                    <span className="font-medium text-zinc-900">
+                    <button
+                      type="button"
+                      disabled={!onSelect || !row.id}
+                      onClick={() =>
+                        onSelect?.(
+                          `Xem chi tiết học viên ${row.fullName} #${row.id}`,
+                        )
+                      }
+                      className="text-left font-medium text-zinc-900 enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+                    >
                       {row.fullName}
-                    </span>
+                    </button>
                     {row.roleInClass && row.roleInClass !== "STUDENT" && (
                       <span className="whitespace-nowrap rounded-full bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-inset ring-amber-200">
                         {row.roleInClass}
@@ -838,10 +1168,13 @@ export function ClassTableBlock({
   title,
   message,
   classes,
+  onSelect,
 }: {
   title?: string;
   message?: string;
   classes: ClassTableRow[];
+  /** Click tên lớp -> xem chi tiết lớp (gửi draft message qua chat). */
+  onSelect?: (msg: string) => void;
 }) {
   const rows = Array.isArray(classes) ? classes : [];
   const [page, setPage] = React.useState(0);
@@ -897,7 +1230,16 @@ export function ClassTableBlock({
                   {safePage * TABLE_PAGE_SIZE + index + 1}
                 </td>
                 <td className="px-3 py-2.5">
-                  <div className="font-medium text-zinc-900">{row.title}</div>
+                  <button
+                    type="button"
+                    disabled={!onSelect || !row.id}
+                    onClick={() =>
+                      onSelect?.(`Xem chi tiết lớp học ${row.title} #${row.id}`)
+                    }
+                    className="text-left font-medium text-zinc-900 enabled:cursor-pointer enabled:underline-offset-2 enabled:hover:text-indigo-600 enabled:hover:underline"
+                  >
+                    {row.title}
+                  </button>
                   {row.classCode && (
                     <div className="mt-0.5 max-w-52 truncate font-mono text-[10px] uppercase tracking-wide text-zinc-400">
                       {row.classCode}

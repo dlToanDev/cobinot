@@ -16,7 +16,6 @@ describe('EnrollmentsController', () => {
   const actor: ActorPayload = {
     userId: 1,
     tenantId: 1,
-    email: 'admin@tenant1.com',
     role: 'ADMIN',
   };
 

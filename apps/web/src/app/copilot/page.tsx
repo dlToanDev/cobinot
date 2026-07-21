@@ -26,6 +26,7 @@ import Navbar from "../../components/Navbar";
 import EditablePreviewCard from "./EditablePreviewCard";
 import StudentCreateForm from "./StudentCreateForm";
 import CourseCreateForm from "./CourseCreateForm";
+import MarkdownMessage from "./MarkdownMessage";
 import {
   CopilotCandidateList,
   CopilotClarificationCard,
@@ -46,6 +47,7 @@ import {
   EnrollmentResultBlock,
   ProfileResultBlocks,
   StudentTableBlock,
+  TeacherAssignResultBlock,
   formatFieldLabel,
 } from "./ResultBlocks";
 
@@ -905,11 +907,11 @@ export default function CopilotPage() {
     if (entity === "course" && intent === "create_class") {
       return `Chọn khóa học ${option.label} #${option.id} để tạo lớp`;
     }
-    if (entity === "student" && intent === "assign_student_to_class") {
-      return `Chọn học viên ${option.label} #${option.id} để thêm vào lớp`;
+    if (entity === "student" && intent === "assign_student_to_course") {
+      return `Chọn học viên ${option.label} #${option.id} để ghi danh vào khóa`;
     }
-    if (entity === "class" && intent === "assign_student_to_class") {
-      return `Chọn lớp học ${option.label} #${option.id} để thêm học viên`;
+    if (entity === "class" && intent === "assign_student_to_course") {
+      return `Chọn lớp học ${option.label} #${option.id} để xác định khóa ghi danh`;
     }
     if (entity === "course") {
       return `Chọn khóa học số ${index + 1}`;
@@ -1110,6 +1112,7 @@ export default function CopilotPage() {
               typeof data.message === "string" ? data.message : undefined
             }
             students={Array.isArray(data.students) ? data.students : []}
+            onSelect={(msg) => void applySuggestionDraft(msg)}
           />,
           data.suggestions,
         );
@@ -1123,6 +1126,7 @@ export default function CopilotPage() {
               typeof data.message === "string" ? data.message : undefined
             }
             classes={Array.isArray(data.classes) ? data.classes : []}
+            onSelect={(msg) => void applySuggestionDraft(msg)}
           />,
           data.suggestions,
         );
@@ -1208,12 +1212,13 @@ export default function CopilotPage() {
       if (data.type === "tool_result") {
         const isEnrollmentResult =
           data.tool_name === "assign_student_to_course" ||
+          // Lịch sử session cũ vẫn còn tool_result assign_student_to_class.
           data.tool_name === "assign_student_to_class" ||
           data.tool_name === "update_student_class_role" ||
           data.tool_name === "remove_student_from_class";
         const enrollmentTitle =
           data.tool_name === "assign_student_to_course"
-            ? "Thông tin ghi danh vào lớp trong khóa"
+            ? "Thông tin ghi danh vào khóa (tất cả lớp đang hoạt động)"
             : data.tool_name === "assign_student_to_class"
               ? "Thông tin thêm vào lớp"
               : "Thông tin lớp học";
@@ -1227,10 +1232,16 @@ export default function CopilotPage() {
             {data.tool_name === "delete_students" ||
             data.tool_name === "delete_courses" ? (
               <DeleteResultBlock data={data.result || {}} />
+            ) : data.tool_name === "assign_teacher_to_course" ? (
+              <TeacherAssignResultBlock
+                data={data.result || {}}
+                onSelect={(msg) => void applySuggestionDraft(msg)}
+              />
             ) : isEnrollmentResult ? (
               <EnrollmentResultBlock
                 data={data.result || {}}
                 title={enrollmentTitle}
+                onSelect={(msg) => void applySuggestionDraft(msg)}
               />
             ) : (
               <ProfileResultBlocks
@@ -1262,16 +1273,18 @@ export default function CopilotPage() {
       }
 
       return withSuggestions(
-        <p className="whitespace-pre-wrap text-sm leading-6 text-zinc-800">
-          {data.message || content}
-        </p>,
+        <MarkdownMessage
+          content={String(data.message || content)}
+          onSelect={(msg) => void applySuggestionDraft(msg)}
+        />,
         data.suggestions,
       );
     } catch {
       return (
-        <p className="whitespace-pre-wrap text-sm leading-6 text-zinc-800">
-          {content}
-        </p>
+        <MarkdownMessage
+          content={content}
+          onSelect={(msg) => void applySuggestionDraft(msg)}
+        />
       );
     }
   };
